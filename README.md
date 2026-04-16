@@ -52,23 +52,23 @@ cp -r agent-callstack/.claude/skills/call ~/.claude/skills/
 
 ## Quick Start
 
-Once installed, Claude Code can use `/call` directly:
+Once installed, Claude Code can use `/call` directly.
 
 ```
-You: "Implement the auth module, then write tests for it"
+You: "/call Implement the auth module, then /call write tests for it"
 
 Claude: I'll handle this in two calls to keep my context clean.
 
-[Bash: python3 .claude/skills/call/callstack.py --task "Implement JWT auth in src/auth.py"]
-→ returns: "Created src/auth.py with login/logout/refresh endpoints..."
+[call - invoke (MCP): task="Implement JWT auth in src/auth.py"]
+→ {"status": "complete", "result": "Created src/auth.py with login/logout/refresh endpoints..."}
 
-[Bash: python3 .claude/skills/call/callstack.py --task "Write tests for src/auth.py"]
-→ returns: "Created tests/test_auth.py, 12 tests, all passing..."
+[call - invoke (MCP): task="Write tests for src/auth.py"]
+→ {"status": "complete", "result": "Created tests/test_auth.py, 12 tests, all passing..."}
 ```
 
 Each forked session sees the full conversation so far (knew what patterns you discussed, what files exist, what your preferences are) but its intermediate work — the 50 tool calls, the failed attempts, the debugging — never entered the parent's context.
 
-This is unlike subagents that do not see the full conversation context so far and so all context needs to be explicitly generated and passed in. This is suitable for independent tasks, but many workflow steps benefit from having fuller context.
+This is unlike subagents that do not see the full conversation context so far and so all context needs to be explicitly generated and passed in. This is suitable for independent tasks, but most workflow steps benefit from having session context.
 
 ## Example: Customer Support Refund
 
@@ -138,21 +138,57 @@ A validates all 6 expected values: PASS
 
 Each parallel branch independently supports the full CALL/YIELD/RETURN protocol — a branch can delegate further, pause for user input, or return, without blocking its siblings.
 
-See [docs/2026-04-15-execution-tree.md](docs/2026-04-15-execution-tree.md) for the design of the execution tree that enables this.
-
 ## How It Works
 
-Claude Code stores each conversation as a JSONL session file on disk. That file *is* the context. agent-callstack exploits this directly.
+Claude Code stores each conversation as a JSONL session file on disk.
 
-When you `/call`, `callstack.py` finds the parent's session file (a `PreToolUse` hook writes PID→session mappings to facilitate this), copies it to a new clone-id UUID, and spawns `claude --resume <clone-id> --print <task>`. The child Claude Code process wakes up with the parent's full message history plus the new task appended. It doesn't know it's a fork. It just continues the conversation.
+### Session fork
+
+When you `/call`, `callstack.py` discovers the parent's session file (via `CLAUDE_SESSION_ID` env var or by finding the most recently modified session JSONL) and spawns a forked child:
+
+```
+claude --resume <session-id> --fork-session \
+       --output-format stream-json --input-format stream-json \
+       --permission-prompt-tool stdio
+```
+
+`--fork-session` creates an independent copy of the session — the child wakes up with the parent's full message history plus the new task appended. It doesn't know it's a fork. It just continues the conversation.
+
+### Bidirectional JSON protocol
+
+The parent and child communicate over stdin/stdout using NDJSON (newline-delimited JSON). This enables two critical capabilities:
+
+**Permission control** — When the child requests permission to use a tool (Bash, file writes, etc.), the request arrives as a structured message:
+
+```json
+{"type": "control_request", "request_id": "req_...", "request": {"subtype": "can_use_tool", "tool_name": "Bash", "input": {...}}}
+```
+
+The runtime intercepts this and responds programmatically — no human in the loop for forked sessions:
+
+```json
+{"type": "control_response", "response": {"subtype": "success", "request_id": "req_...", "response": {"behavior": "allow", "updatedInput": {...}}}}
+```
+
+**User input (YIELD)** — When a child needs information only the user can provide (e.g., an MFA code), it outputs `---YIELD---`. The runtime serializes the execution tree to a `.call_tree` sidecar file, exits, and returns the question as JSON:
+
+```json
+{"status": "yield", "question": "Enter the 6-digit MFA code", "session_id": "abc-123"}
+```
+
+The parent asks the user, then calls `invoke_resume(resume_session="abc-123", user_reply="847291")`. The runtime reloads the tree from disk and continues from exactly where it paused.
+
+### Three control markers
 
 The child runs, does its work, and outputs one of three markers:
 
-- `---RETURN---` — done. `callstack.py` captures the result, deletes the clone, saves a delta JSONL to `call_traces/` for forensics, and hands the compact result back to the parent.
-- `---CALL---` — the child wants to delegate further. The runtime adds a child node to the execution tree and forks again from this child's session. Same mechanism, one level deeper.
-- `---YIELD---` — the child needs user input (e.g., an MFA code). `callstack.py` serializes the entire execution tree to a `.call_tree` sidecar file, exits, and returns the question to the parent. When the user answers, `--resume-session` reloads the tree and continues from exactly where it paused.
+- `---RETURN---` — done. The runtime captures the result, saves a trace to `call_traces/`, and hands the compact result back to the parent as JSON.
+- `---CALL---` — the child wants to delegate further. The runtime adds a child node to the execution tree and forks again. Same mechanism, one level deeper (up to depth 5).
+- `---YIELD---` — needs user input. The tree is persisted to disk so the session can be resumed later.
 
-The runtime manages an **execution tree** rather than a linear stack. Each node tracks its status (pending, running, complete, yielded, error), its children, and its result. For parallel tasks (`--tasks`), sibling nodes run concurrently via threads, each with its own recursive execution loop. When all siblings complete (or yield), results are collected and returned. This naturally supports nested parallelism — a branch can itself fan out into parallel sub-branches.
+### Execution tree
+
+The runtime manages an **execution tree** rather than a linear stack. Each node tracks its status (pending, running, complete, yielded, error), its children, and its result. For parallel tasks (`invoke_parallel`), sibling nodes run concurrently via `ThreadPoolExecutor`, each with its own recursive execution loop. When all siblings complete (or yield), results are collected and returned. This naturally supports nested parallelism — a branch can itself fan out into parallel sub-branches.
 
 ## Credits
 
