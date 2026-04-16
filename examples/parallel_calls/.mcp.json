@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "parallel-tasks-backend": {
+      "command": "python3",
+      "args": ["mcp_server.py"],
+      "cwd": "/Users/amolk/work/call-agents/examples/parallel_calls"
+    }
+  }
+}

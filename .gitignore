@@ -1,0 +1,14 @@
+# Runtime state written by hooks
+**/.claude/sessions/
+
+# Call agent traces (generated at runtime)
+**/call_traces/
+
+# User-specific settings
+**/settings.local.json
+
+# Python
+__pycache__/
+*.pyc
+.DS_Store
+docs/
