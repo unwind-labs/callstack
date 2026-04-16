@@ -63,8 +63,14 @@ mode.
 
 Output is always JSON. On completion:
 ```json
-{"status": "complete", "result": "...", "duration": 12.3}
+{"status": "complete", "result": "...", "duration": 12.3, "session_log": "/path/to/session.jsonl", "session_log_start_line": 42}
 ```
+
+The `session_log` field contains the file path of the forked session's JSONL log.
+The forked session file includes the parent's history followed by the child's new work.
+`session_log_start_line` is the 1-based line number where the child's additions begin —
+lines before that are inherited parent context. If the compact result omits details
+you need, read the session log starting from `session_log_start_line`.
 
 On yield (needs user input):
 ```json

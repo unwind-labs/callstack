@@ -830,6 +830,13 @@ def _run_node(node: TreeNode, source_session_file: Path, args, tree: ExecutionTr
     print(f"[callstack] Node {node.id[:8]} forking from {source_session_id[:8]}... (depth={depth})",
           file=sys.stderr)
 
+    # Count parent lines before forking so callers know where the child's work starts
+    try:
+        with open(source_session_file, 'r') as f:
+            node.parent_lines = sum(1 for _ in f)
+    except OSError:
+        node.parent_lines = 0
+
     # --- First invocation (--fork-session creates an independent copy) ---
     start = time.time()
     try:
@@ -1006,6 +1013,8 @@ def run_tree(args, session_file: Path, session_id: str, call_depth: int) -> str:
                     "result": node.result,
                     "error": node.error,
                     "duration": round(node.duration, 1),
+                    "session_log": node.clone_path,
+                    "session_log_start_line": node.parent_lines + 1,
                 }
                 if node.status == "yielded":
                     leaf = _find_yielded_leaf(node)
@@ -1025,6 +1034,8 @@ def run_tree(args, session_file: Path, session_id: str, call_depth: int) -> str:
             "result": node.result,
             "error": node.error,
             "duration": round(node.duration, 2),
+            "session_log": node.clone_path,
+            "session_log_start_line": node.parent_lines + 1,
         })
     else:
         return json.dumps([
@@ -1034,6 +1045,8 @@ def run_tree(args, session_file: Path, session_id: str, call_depth: int) -> str:
                 "result": n.result,
                 "error": n.error,
                 "duration": round(n.duration, 1),
+                "session_log": n.clone_path,
+                "session_log_start_line": n.parent_lines + 1,
             }
             for i, n in enumerate(tree.nodes)
         ], indent=2)
