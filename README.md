@@ -91,19 +91,19 @@ Orchestrator (interactive session with user)
   │    ├── verify_customer_identity tool      (inline)
   │    ├── get_customer tool                  (inline)
   │    ├── send_mfa_code tool                 (inline)
-  │    └── ---YIELD--- "Enter MFA code"       (ask user)
+  │    └── op: yield   "Enter MFA code"       (ask user)
   │         user: "847291"
   │    └── validate_mfa_code tool             (inline)
-  │    └── ---RETURN--- "Authenticated, session created"
+  │    └── op: return  "Authenticated, session created"
   │
   ├─ /call lookup-order                     27.0s
-  │    └── ---RETURN--- "2 items eligible, within return window"
+  │    └── op: return  "2 items eligible, within return window"
   │
   └─ /call process-refund                    9.2s + 24.6s
-       └── ---YIELD--- "Item condition? (unopened/opened/damaged)"
+       └── op: yield   "Item condition? (unopened/opened/damaged)"
             user: "damaged"
        └── calculate_refund, process_payment, send_email
-       └── ---RETURN--- "Refund $82.48, txn_ref_88291"
+       └── op: return  "Refund $82.48, txn_ref_88291"
 ```
 
 ## Example: Parallel Calls with Nested Forks
@@ -136,7 +136,7 @@ A calls {B, C, D} in parallel via --tasks
 A validates all 6 expected values: PASS
 ```
 
-Each parallel branch independently supports the full CALL/YIELD/RETURN protocol — a branch can delegate further, pause for user input, or return, without blocking its siblings.
+Each parallel branch independently supports the full `call`/`yield`/`return` protocol — a branch can delegate further, pause for user input, or return, without blocking its siblings.
 
 ## How It Works
 
@@ -170,7 +170,7 @@ The runtime intercepts this and responds programmatically — no human in the lo
 {"type": "control_response", "response": {"subtype": "success", "request_id": "req_...", "response": {"behavior": "allow", "updatedInput": {...}}}}
 ```
 
-**User input (YIELD)** — When a child needs information only the user can provide (e.g., an MFA code), it outputs `---YIELD---`. The runtime serializes the execution tree to a `.call_tree` sidecar file, exits, and returns the question as JSON:
+**User input (yield)** — When a child needs information only the user can provide (e.g., an MFA code), it emits a `{"op": "yield", "question": "..."}` envelope in a fenced ` ```json ` block as its final output. The runtime serializes the execution tree to a `.call_tree` sidecar file, exits, and returns the question as JSON:
 
 ```json
 {"status": "yield", "question": "Enter the 6-digit MFA code", "session_id": "abc-123"}
@@ -178,13 +178,13 @@ The runtime intercepts this and responds programmatically — no human in the lo
 
 The parent asks the user, then calls `invoke_resume(resume_session="abc-123", user_reply="847291")`. The runtime reloads the tree from disk and continues from exactly where it paused.
 
-### Three control markers
+### Three control operations
 
-The child runs, does its work, and outputs one of three markers:
+The child runs, does its work, and emits exactly one JSON envelope wrapped in a fenced ` ```json ` code block as its final output. The `op` field selects one of three operations:
 
-- `---RETURN---` — done. The runtime captures the result, saves a trace to `call_traces/`, and hands the compact result back to the parent as JSON.
-- `---CALL---` — the child wants to delegate further. The runtime adds a child node to the execution tree and forks again. Same mechanism, one level deeper (up to depth 5).
-- `---YIELD---` — needs user input. The tree is persisted to disk so the session can be resumed later.
+- `{"op": "return", "result": ..., "summary": ..., "next": ...}` — done. The runtime captures the result, saves a trace to `call_traces/`, and hands the compact result back to the parent as JSON. `summary` and `next` are optional.
+- `{"op": "call", "task": "..."}` — the child wants to delegate further. The runtime adds a child node to the execution tree and forks again. Same mechanism, one level deeper (up to depth 5).
+- `{"op": "yield", "question": "..."}` — needs user input. The tree is persisted to disk so the session can be resumed later.
 
 ### Execution tree
 

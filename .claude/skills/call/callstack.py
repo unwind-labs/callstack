@@ -34,26 +34,94 @@ def _format_error(error_msg: str, partial_output: Optional[str] = None, context:
         "context": context
     }, indent=2)
 
+import re
+
+_FENCED_JSON_RE = re.compile(r"```json\s*\n(.*?)\n```", re.DOTALL)
+
+
+def _extract_last_json_block(output: str) -> Optional[dict]:
+    """Return the last JSON object in `output`, parsed as a dict, or None.
+
+    Preference order:
+    1. Last ```json fenced code block that parses.
+    2. Fallback: last balanced {...} substring that parses.
+    """
+    for match in reversed(list(_FENCED_JSON_RE.finditer(output))):
+        try:
+            obj = json.loads(match.group(1))
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            continue
+
+    # Fallback: scan from the end for balanced {...} spans.
+    end = len(output)
+    while True:
+        close = output.rfind("}", 0, end)
+        if close == -1:
+            return None
+        depth = 0
+        open_idx = -1
+        for i in range(close, -1, -1):
+            c = output[i]
+            if c == "}":
+                depth += 1
+            elif c == "{":
+                depth -= 1
+                if depth == 0:
+                    open_idx = i
+                    break
+        if open_idx == -1:
+            return None
+        candidate = output[open_idx:close + 1]
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+        end = open_idx
+
+
+def _stringify_child_result(result) -> str:
+    """Coerce a child's return value to a string for the parent's resume reply.
+
+    Children may return any JSON value (dict, list, str, number, None). The
+    resume prompt is plain text, so non-string values are JSON-encoded.
+    """
+    if result is None:
+        return ""
+    if isinstance(result, str):
+        return result
+    return json.dumps(result, ensure_ascii=False)
+
+
 def parse_agent_output(output: str) -> dict:
-    """Parse the three control instructions: CALL, YIELD, RETURN."""
-    if "---CALL---" in output:
-        parts = output.split("---CALL---", 1)
-        task = parts[1].strip() if len(parts) > 1 else ""
-        return {"status": "call", "task": task}
-    if "---YIELD---" in output:
-        parts = output.split("---YIELD---", 1)
-        question = parts[1].strip() if len(parts) > 1 else ""
-        return {"status": "yield", "question": question}
-    if "---RETURN---" in output:
-        parts = output.split("---RETURN---", 1)
-        result = parts[1].strip() if len(parts) > 1 else output
-        suggested_next = None
-        # Extract NEXT: suggestion from end of result
-        next_parts = result.rsplit("\nNEXT:", 1)
-        if len(next_parts) == 2:
-            result = next_parts[0].strip()
-            suggested_next = next_parts[1].strip()
-        return {"status": "complete", "result": result, "suggested_next": suggested_next}
+    """Parse the child's JSON control envelope.
+
+    The child emits one of three operations as a fenced ```json block:
+        {"op": "call",   "task": "..."}
+        {"op": "yield",  "question": "..."}
+        {"op": "return", "result": "...", "summary": "...", "next": "..."}
+
+    Returns a dict with a `status` key (`call` / `yield` / `complete`) for
+    the runtime to branch on. Missing or unparseable envelope → `complete`.
+    """
+    envelope = _extract_last_json_block(output)
+    if envelope is None:
+        return {"status": "complete"}
+    op = envelope.get("op")
+    if op == "call":
+        return {"status": "call", "task": envelope.get("task", "")}
+    if op == "yield":
+        return {"status": "yield", "question": envelope.get("question", "")}
+    if op == "return":
+        return {
+            "status": "complete",
+            "result": envelope.get("result"),
+            "summary": envelope.get("summary"),
+            "suggested_next": envelope.get("next"),
+        }
     return {"status": "complete"}
 
 # ---------------------------------------------------------------------------
@@ -66,37 +134,45 @@ SYSTEM_INSTRUCTION = """\
 You are running in a forked session — a child process that inherited the full context of \
 your parent agent. Execute the task below.
 
-You have three control instructions:
+End your turn by emitting EXACTLY ONE JSON envelope wrapped in a fenced \
+```json code block. That envelope is how you communicate back to the \
+runtime. Any other fenced JSON earlier in your response is ignored; only \
+the last one is parsed. Pick exactly one of three operations:
 
----CALL---
-<what to accomplish>
-Hand off work to a child process. Use CALL when the task ahead is \
-multi-step, may involve its own chain of calls or user interaction, \
-and you want only the result back — not the intermediate work. \
-The child inherits your full context. Its execution trace is \
-discarded; only its RETURN value comes back to you. \
-Do your own work first, then CALL when you reach a point requiring \
-a child. Don't CALL simple things you can do in one or two tool calls.
+1) CALL — hand off work to a child process.
+```json
+{"op": "call", "task": "<what to accomplish>"}
+```
+Use CALL when the task ahead is multi-step, may involve its own chain of \
+calls or user interaction, and you want only the result back — not the \
+intermediate work. The child inherits your full context. Its execution \
+trace is discarded; only its return value comes back to you. Do your own \
+work first, then CALL when you reach a point requiring a child. Don't \
+CALL simple things you can do in one or two tool calls.
 
----YIELD---
-<question for user>
-Pause for user input. Only when you MUST have information that only \
-the user can provide (e.g., MFA codes, passwords, confirmations). \
-Do not guess. Stop after the YIELD marker.
+2) YIELD — pause for user input.
+```json
+{"op": "yield", "question": "<question for user>"}
+```
+Only when you MUST have information that only the user can provide (e.g. \
+MFA codes, passwords, confirmations). Do not guess.
 
----RETURN---
-<your result>
-
-NEXT: <suggested next task or action>
-
-Return from this task. This is your final output. Structure the \
-result however is appropriate for the task.
-
-You have the parent's full context. Write your summary with the next \
-step in mind — include details the next task will need. End with \
-NEXT: followed by your suggestion for what should happen next. This \
-is advisory — the parent decides — but it aligns your summary toward \
-what matters.
+3) RETURN — finish and hand results to the parent.
+```json
+{"op": "return", "result": "...", "summary": "...", "next": "..."}
+```
+- `result` — the deliverable/answer for the parent. Structure it however \
+is appropriate for the task.
+- `summary` — COMPACT brain-dump of everything the parent needs to \
+execute upcoming tasks: sub-calls made and their outcomes, key decisions \
+and assumptions, side effects (files touched, commands run, external \
+state changed), dead ends not worth retrying. Optimize for tokens — \
+terse bullets or prose, no filler. The parent should NOT need to read \
+your session log. Omit this field or set null if there is genuinely \
+nothing beyond `result` worth carrying forward.
+- `next` — advisory one-line suggestion for what should happen next. \
+Optional. The parent has broader context and decides; this just aligns \
+your summary toward what matters.
 """
 
 # ---------------------------------------------------------------------------
@@ -117,6 +193,7 @@ class TreeNode:
     yield_source: Optional[str] = None  # self.id if direct yield, child.id if blocked on child
     error: Optional[str] = None
     suggested_next: Optional[str] = None
+    summary: Optional[str] = None
     duration: float = 0.0
     children: list = field(default_factory=list)
 
@@ -133,6 +210,7 @@ class TreeNode:
             "yield_source": self.yield_source,
             "error": self.error,
             "suggested_next": self.suggested_next,
+            "summary": self.summary,
             "duration": self.duration,
             "children": [c.to_dict() for c in self.children],
         }
@@ -152,6 +230,7 @@ class TreeNode:
             yield_source=d.get("yield_source"),
             error=d.get("error"),
             suggested_next=d.get("suggested_next"),
+            summary=d.get("summary"),
             duration=d.get("duration", 0.0),
             children=children,
         )
@@ -907,6 +986,7 @@ def _run_node(node: TreeNode, source_session_file: Path, args, tree: ExecutionTr
             node.status = "complete"
             node.result = parsed.get("result", output)
             node.suggested_next = parsed.get("suggested_next")
+            node.summary = parsed.get("summary")
             return
 
         elif parsed["status"] == "yield":
@@ -950,7 +1030,7 @@ def _run_node(node: TreeNode, source_session_file: Path, args, tree: ExecutionTr
                     resume_mode=True,
                     resume_reply=(
                         "Your child completed. Here is the result:\n\n"
-                        + (child.result or "")
+                        + _stringify_child_result(child.result)
                     ),
                 )
             except Exception as e:
@@ -1033,6 +1113,7 @@ def run_tree(args, session_file: Path, session_id: str, call_depth: int) -> str:
                     "index": i,
                     "task": node.task[:100],
                     "result": node.result,
+                    "summary": node.summary,
                     "error": node.error,
                     "suggested_next": node.suggested_next,
                     "duration": round(node.duration, 1),
@@ -1055,6 +1136,7 @@ def run_tree(args, session_file: Path, session_id: str, call_depth: int) -> str:
         return json.dumps({
             "status": node.status,
             "result": node.result,
+            "summary": node.summary,
             "error": node.error,
             "suggested_next": node.suggested_next,
             "duration": round(node.duration, 2),
@@ -1067,6 +1149,7 @@ def run_tree(args, session_file: Path, session_id: str, call_depth: int) -> str:
                 "index": i,
                 "task": n.task[:100],
                 "result": n.result,
+                "summary": n.summary,
                 "error": n.error,
                 "suggested_next": n.suggested_next,
                 "duration": round(n.duration, 1),
@@ -1117,6 +1200,8 @@ def _resume_node(node: TreeNode, reply: str, args, tree: ExecutionTree, trace_di
         if parsed["status"] == "complete":
             node.status = "complete"
             node.result = parsed.get("result", output)
+            node.suggested_next = parsed.get("suggested_next")
+            node.summary = parsed.get("summary")
             node.yield_question = None
             node.yield_source = None
             return
@@ -1160,7 +1245,7 @@ def _resume_node(node: TreeNode, reply: str, args, tree: ExecutionTree, trace_di
                     resume_mode=True,
                     resume_reply=(
                         "Your child completed. Here is the result:\n\n"
-                        + (child.result or "")
+                        + _stringify_child_result(child.result)
                     ),
                 )
             except Exception as e:
@@ -1267,6 +1352,8 @@ def run_resume(args) -> str:
         return json.dumps({
             "status": node.status,
             "result": node.result,
+            "summary": node.summary,
+            "suggested_next": node.suggested_next,
             "error": node.error,
             "duration": round(node.duration, 2),
         })
@@ -1309,6 +1396,8 @@ def run_resume(args) -> str:
         return json.dumps({
             "status": node.status,
             "result": node.result,
+            "summary": node.summary,
+            "suggested_next": node.suggested_next,
             "error": node.error,
             "duration": round(node.duration, 2),
         })
@@ -1318,6 +1407,8 @@ def run_resume(args) -> str:
                 "index": i,
                 "task": n.task[:100],
                 "result": n.result,
+                "summary": n.summary,
+                "suggested_next": n.suggested_next,
                 "error": n.error,
                 "duration": round(n.duration, 1),
             }

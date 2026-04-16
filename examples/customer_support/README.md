@@ -29,23 +29,23 @@ Orchestrator
   │    ├── verify_customer_identity              (inline)
   │    ├── get_customer                          (inline)
   │    ├── send_mfa_code                         (inline)
-  │    └── ---YIELD--- "Enter MFA code"
+  │    └── op: yield   "Enter MFA code"
   │         user: "847291"
   │    └── validate_mfa_code                     (inline)
-  │    └── ---RETURN--- "Authenticated, session created"
+  │    └── op: return  "Authenticated, session created"
   │
   ├─ /call lookup-order                        27.0s
   │    ├── get_order, get_shipping_status         (inline)
   │    ├── check_refund_eligibility               (inline)
-  │    └── ---RETURN--- "2 items eligible, within return window"
+  │    └── op: return  "2 items eligible, within return window"
   │
   └─ /call process-refund                      9.2s + 24.6s
-       └── ---YIELD--- "Item condition?"
+       └── op: yield   "Item condition?"
             user: "damaged"
        ├── calculate_refund                       (inline)
        ├── process_refund_payment                 (inline)
        ├── send_confirmation_email                (inline)
-       └── ---RETURN--- "Refund $82.48, txn_ref_88291"
+       └── op: return  "Refund $82.48, txn_ref_88291"
 ```
 
 Three `/call` invocations. Each one forks the parent's full session context (so the child knows the entire conversation history), does its work, and returns a compact result. The parent never sees the 46 intermediate tool calls.

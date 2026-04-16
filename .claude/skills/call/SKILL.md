@@ -60,16 +60,31 @@ ThreadPoolExecutor which has lower overhead.
 
 The CALL/YIELD/RETURN protocol is always active. Any task can CALL children,
 YIELD for user input, or RETURN a result — including tasks within parallel
-mode.
+mode. Children declare which operation via a JSON envelope in a fenced
+` ```json ` code block as their final output (see "The three control
+instructions" below).
 
-Output is always JSON. On completion:
+The runtime's stdout is always JSON. On completion:
 ```json
-{"status": "complete", "result": "...", "suggested_next": "Run the test suite to verify", "duration": 12.3, "session_log": "/path/to/session.jsonl", "session_log_start_line": 42}
+{
+  "status": "complete",
+  "result": "...",
+  "summary": "Compacted brain-dump of what happened — decisions, sub-calls, side effects",
+  "suggested_next": "Run the test suite to verify",
+  "duration": 12.3,
+  "session_log": "/path/to/session.jsonl",
+  "session_log_start_line": 42
+}
 ```
 
-- `suggested_next` — the child's advisory suggestion for what should happen next.
-  This is not binding — the parent has broader context and decides — but it aligns
-  the child's summary toward what matters for the next step.
+- `result` — the deliverable/answer.
+- `summary` — compact brain-dump the parent can rely on instead of reading
+  the child's session log: sub-calls made and outcomes, key decisions,
+  assumptions, side effects, dead ends. Optimized for tokens. May be `null`
+  when the child has nothing worth carrying beyond `result`.
+- `suggested_next` — the child's advisory suggestion for what should happen
+  next. Not binding — the parent has broader context and decides — but it
+  aligns the child's summary toward what matters for the next step.
 - `session_log` — file path to the forked session's JSONL log.
 - `session_log_start_line` — 1-based line where the child's additions begin.
   The session log starts with `## Starting Task [<id>]` at this point.
@@ -133,17 +148,48 @@ The session ID is discovered automatically. Priority:
 
 ## The three control instructions
 
-Forked sessions have three instructions for communicating with the runtime:
+Forked sessions communicate with the runtime by emitting exactly one JSON
+envelope wrapped in a fenced ` ```json ` code block as their final output.
+Only the last such block is parsed; earlier JSON in the response is
+ignored. Three operations, selected via the `op` field:
 
 **CALL** — hand off work to a child. The child inherits full context.
-**YIELD** — pause for user input.
-**RETURN** — return result to caller.
+````
+```json
+{"op": "call", "task": "<what to accomplish>"}
+```
+````
 
-The runtime manages an **execution tree**. When a forked session outputs CALL,
-a child node is added and a new session is spawned. When the child completes,
-the parent is resumed with the result. In parallel mode (`--tasks`), each
-branch independently supports CALL/YIELD/RETURN — a branch can delegate to
-sub-agents or pause for user input without blocking siblings.
+**YIELD** — pause for user input.
+````
+```json
+{"op": "yield", "question": "<question for the user>"}
+```
+````
+
+**RETURN** — return result to caller.
+````
+```json
+{
+  "op": "return",
+  "result": "...",
+  "summary": "...",
+  "next": "..."
+}
+```
+````
+
+In `return`, `summary` is the compacted brain-dump the parent receives as
+`summary` in the stdout envelope, and `next` surfaces as `suggested_next`.
+Both are optional — omit or `null` when there's nothing worth adding
+beyond `result`.
+
+The runtime manages an **execution tree**. When a forked session emits
+`{"op": "call", ...}`, a child node is added and a new session is spawned.
+When the child completes, the parent is resumed with the result. In
+parallel mode (`--tasks`), each branch independently supports all three
+operations — a branch can delegate to sub-agents or pause for user input
+without blocking siblings.
 
 ## Critical rules
 

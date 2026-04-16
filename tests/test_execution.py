@@ -20,6 +20,12 @@ from callstack import (
 )
 
 
+def _envelope(op: str, **fields) -> str:
+    """Wrap a control envelope in a fenced ```json block."""
+    payload = {"op": op, **fields}
+    return "```json\n" + json.dumps(payload) + "\n```"
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -61,7 +67,7 @@ class TestRunNode:
     @patch("callstack.resolve_session_file")
     @patch("callstack.write_trace")
     def test_complete(self, mock_trace, mock_resolve, mock_invoke, tmp_path):
-        mock_invoke.return_value = ("---RETURN---\nDone!", "forked-id")
+        mock_invoke.return_value = (_envelope("return", result="Done!"), "forked-id")
         mock_resolve.return_value = tmp_path / "forked.jsonl"
 
         node = TreeNode(id="n1", task="do stuff")
@@ -81,7 +87,7 @@ class TestRunNode:
     @patch("callstack.resolve_session_file")
     @patch("callstack.write_trace")
     def test_yield(self, mock_trace, mock_resolve, mock_invoke, tmp_path):
-        mock_invoke.return_value = ("---YIELD---\nWhat is your code?", "forked-id")
+        mock_invoke.return_value = (_envelope("yield", question="What is your code?"), "forked-id")
         mock_resolve.return_value = tmp_path / "forked.jsonl"
 
         node = TreeNode(id="n1", task="auth")
@@ -98,7 +104,7 @@ class TestRunNode:
     @patch("callstack.resolve_session_file")
     @patch("callstack.write_trace")
     def test_call_then_complete(self, mock_trace, mock_resolve, mock_invoke, tmp_path):
-        """Agent issues ---CALL---, child completes, parent resumes and returns."""
+        """Agent issues op=call, child completes, parent resumes and returns."""
         clone_path = tmp_path / "clone.jsonl"
         clone_path.write_text("")
         mock_resolve.return_value = clone_path
@@ -107,9 +113,9 @@ class TestRunNode:
         # Second call: child returns
         # Third call: parent resumes with child result and returns
         mock_invoke.side_effect = [
-            ("---CALL---\nSub-task", "parent-fork"),    # parent's first invocation
-            ("---RETURN---\nChild done", "child-fork"),  # child invocation
-            ("---RETURN---\nAll done", None),             # parent resume
+            (_envelope("call", task="Sub-task"), "parent-fork"),       # parent's first invocation
+            (_envelope("return", result="Child done"), "child-fork"),  # child invocation
+            (_envelope("return", result="All done"), None),            # parent resume
         ]
 
         node = TreeNode(id="n1", task="big task")
@@ -163,8 +169,8 @@ class TestRunNode:
         mock_resolve.return_value = clone_path
 
         mock_invoke.side_effect = [
-            ("---CALL---\nNeed MFA", "parent-fork"),
-            ("---YIELD---\nEnter MFA code", "child-fork"),
+            (_envelope("call", task="Need MFA"), "parent-fork"),
+            (_envelope("yield", question="Enter MFA code"), "child-fork"),
         ]
 
         node = TreeNode(id="n1", task="auth flow")
@@ -190,7 +196,7 @@ class TestResumeNode:
     @patch("callstack.invoke_streaming")
     @patch("callstack.write_trace")
     def test_resume_completes(self, mock_trace, mock_invoke, tmp_path):
-        mock_invoke.return_value = ("---RETURN---\nResumed result", None)
+        mock_invoke.return_value = (_envelope("return", result="Resumed result"), None)
 
         node = TreeNode(
             id="n1", task="auth", session_id="sess-1",
@@ -209,7 +215,7 @@ class TestResumeNode:
     @patch("callstack.invoke_streaming")
     @patch("callstack.write_trace")
     def test_resume_yields_again(self, mock_trace, mock_invoke, tmp_path):
-        mock_invoke.return_value = ("---YIELD---\nNow enter password", None)
+        mock_invoke.return_value = (_envelope("yield", question="Now enter password"), None)
 
         node = TreeNode(
             id="n1", task="auth", session_id="sess-1",
@@ -235,7 +241,7 @@ class TestUnwindCompletedNodes:
     @patch("callstack.write_trace")
     def test_parent_unblocked_when_child_completes(self, mock_trace, mock_invoke, tmp_path):
         """Parent was yielded waiting on child. Child is now complete. Unwind resumes parent."""
-        mock_invoke.return_value = ("---RETURN---\nParent done", None)
+        mock_invoke.return_value = (_envelope("return", result="Parent done"), None)
 
         child = TreeNode(
             id="c1", task="sub", status="complete", result="child result",
@@ -267,7 +273,7 @@ class TestRunTree:
     @patch("callstack.resolve_session_file")
     @patch("callstack.write_trace")
     def test_single_task(self, mock_trace, mock_resolve, mock_invoke, tmp_path):
-        mock_invoke.return_value = ("---RETURN---\nResult", "fork-1")
+        mock_invoke.return_value = (_envelope("return", result="Result"), "fork-1")
         mock_resolve.return_value = tmp_path / "fork.jsonl"
 
         session_file = tmp_path / "session.jsonl"
@@ -282,7 +288,7 @@ class TestRunTree:
     @patch("callstack.resolve_session_file")
     @patch("callstack.write_trace")
     def test_parallel_tasks(self, mock_trace, mock_resolve, mock_invoke, tmp_path):
-        mock_invoke.return_value = ("---RETURN---\nDone", "fork-1")
+        mock_invoke.return_value = (_envelope("return", result="Done"), "fork-1")
         mock_resolve.return_value = tmp_path / "fork.jsonl"
 
         session_file = tmp_path / "session.jsonl"
@@ -300,7 +306,7 @@ class TestRunTree:
     def test_single_task_yield(self, mock_trace, mock_resolve, mock_invoke, tmp_path):
         clone_path = tmp_path / "clone.jsonl"
         clone_path.write_text("")
-        mock_invoke.return_value = ("---YIELD---\nNeed input", "fork-1")
+        mock_invoke.return_value = (_envelope("yield", question="Need input"), "fork-1")
         mock_resolve.return_value = clone_path
 
         session_file = tmp_path / "session.jsonl"
@@ -326,7 +332,7 @@ class TestRunResume:
         clone = tmp_path / "clone.jsonl"
         clone.write_text("")
         mock_resolve.return_value = clone
-        mock_invoke.return_value = ("---RETURN---\nFinal", None)
+        mock_invoke.return_value = (_envelope("return", result="Final"), None)
 
         args = _make_args(
             resume_session="clone",
@@ -359,7 +365,7 @@ class TestRunResume:
         _save_tree(tree, clone)
 
         mock_resolve.return_value = clone
-        mock_invoke.return_value = ("---RETURN---\nAuthenticated", None)
+        mock_invoke.return_value = (_envelope("return", result="Authenticated"), None)
 
         args = _make_args(
             resume_session="clone",

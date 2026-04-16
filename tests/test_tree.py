@@ -84,6 +84,19 @@ class TestTreeNodeSerialization:
         node = TreeNode.from_dict(minimal)
         assert node.suggested_next is None
 
+    def test_round_trip_preserves_summary(self):
+        node = TreeNode(
+            id="sm", task="task", status="complete",
+            result="done", summary="Touched auth.py; chose JWT",
+        )
+        restored = TreeNode.from_dict(node.to_dict())
+        assert restored.summary == "Touched auth.py; chose JWT"
+
+    def test_summary_defaults_to_none(self):
+        minimal = {"id": "m", "task": "t"}
+        node = TreeNode.from_dict(minimal)
+        assert node.summary is None
+
     def test_defaults_for_missing_keys(self):
         """from_dict should handle minimal dicts (only id + task required in practice)."""
         minimal = {"id": "m", "task": "t"}
