@@ -13,6 +13,7 @@ value comes back. Your context stays clean.
 
 ## When to use
 
+- Any task likely to take more than a minute — offload it to keep your context clean
 - Complex sub-tasks that benefit from your full conversation history
 - Work that would pollute your context with intermediate steps
 - Nested workflows where sub-tasks may themselves need to call further
@@ -63,14 +64,16 @@ mode.
 
 Output is always JSON. On completion:
 ```json
-{"status": "complete", "result": "...", "duration": 12.3, "session_log": "/path/to/session.jsonl", "session_log_start_line": 42}
+{"status": "complete", "result": "...", "suggested_next": "Run the test suite to verify", "duration": 12.3, "session_log": "/path/to/session.jsonl", "session_log_start_line": 42}
 ```
 
-The `session_log` field contains the file path of the forked session's JSONL log.
-The forked session file includes the parent's history followed by the child's new work.
-`session_log_start_line` is the 1-based line number where the child's additions begin —
-lines before that are inherited parent context. If the compact result omits details
-you need, read the session log starting from `session_log_start_line`.
+- `suggested_next` — the child's advisory suggestion for what should happen next.
+  This is not binding — the parent has broader context and decides — but it aligns
+  the child's summary toward what matters for the next step.
+- `session_log` — file path to the forked session's JSONL log.
+- `session_log_start_line` — 1-based line where the child's additions begin.
+  The session log starts with `## Starting Task [<id>]` at this point.
+  Lines before it are inherited parent context.
 
 On yield (needs user input):
 ```json

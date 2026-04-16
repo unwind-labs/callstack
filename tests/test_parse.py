@@ -32,6 +32,35 @@ class TestParseAgentOutput:
         result = parse_agent_output(output)
         assert result["status"] == "complete"
 
+    # --- RETURN with NEXT: ---
+
+    def test_return_with_next_suggestion(self):
+        output = "---RETURN---\nCreated auth module\nNEXT: Run the test suite"
+        result = parse_agent_output(output)
+        assert result["status"] == "complete"
+        assert result["result"] == "Created auth module"
+        assert result["suggested_next"] == "Run the test suite"
+
+    def test_return_without_next_has_none(self):
+        output = "---RETURN---\nJust a plain result"
+        result = parse_agent_output(output)
+        assert result["status"] == "complete"
+        assert result["result"] == "Just a plain result"
+        assert result["suggested_next"] is None
+
+    def test_return_with_multiline_result_and_next(self):
+        output = "---RETURN---\nLine 1\nLine 2\nNEXT: Do the next thing"
+        result = parse_agent_output(output)
+        assert result["status"] == "complete"
+        assert result["result"] == "Line 1\nLine 2"
+        assert result["suggested_next"] == "Do the next thing"
+
+    def test_return_next_only_matches_last_occurrence(self):
+        output = "---RETURN---\nResult mentions NEXT: in text\nNEXT: actual suggestion"
+        result = parse_agent_output(output)
+        assert result["status"] == "complete"
+        assert result["suggested_next"] == "actual suggestion"
+
     # --- YIELD ---
 
     def test_yield_extracts_question(self):

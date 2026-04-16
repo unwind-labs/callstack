@@ -71,6 +71,19 @@ class TestTreeNodeSerialization:
         assert restored.yield_source == "x"
         assert restored.duration == 3.14
 
+    def test_round_trip_preserves_suggested_next(self):
+        node = TreeNode(
+            id="sn", task="task", status="complete",
+            result="done", suggested_next="Run tests next",
+        )
+        restored = TreeNode.from_dict(node.to_dict())
+        assert restored.suggested_next == "Run tests next"
+
+    def test_suggested_next_defaults_to_none(self):
+        minimal = {"id": "m", "task": "t"}
+        node = TreeNode.from_dict(minimal)
+        assert node.suggested_next is None
+
     def test_defaults_for_missing_keys(self):
         """from_dict should handle minimal dicts (only id + task required in practice)."""
         minimal = {"id": "m", "task": "t"}

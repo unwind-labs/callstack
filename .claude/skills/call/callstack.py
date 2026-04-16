@@ -47,7 +47,13 @@ def parse_agent_output(output: str) -> dict:
     if "---RETURN---" in output:
         parts = output.split("---RETURN---", 1)
         result = parts[1].strip() if len(parts) > 1 else output
-        return {"status": "complete", "result": result}
+        suggested_next = None
+        # Extract NEXT: suggestion from end of result
+        next_parts = result.rsplit("\nNEXT:", 1)
+        if len(next_parts) == 2:
+            result = next_parts[0].strip()
+            suggested_next = next_parts[1].strip()
+        return {"status": "complete", "result": result, "suggested_next": suggested_next}
     return {"status": "complete"}
 
 # ---------------------------------------------------------------------------
@@ -80,8 +86,17 @@ Do not guess. Stop after the YIELD marker.
 
 ---RETURN---
 <your result>
+
+NEXT: <suggested next task or action>
+
 Return from this task. This is your final output. Structure the \
 result however is appropriate for the task.
+
+You have the parent's full context. Write your summary with the next \
+step in mind — include details the next task will need. End with \
+NEXT: followed by your suggestion for what should happen next. This \
+is advisory — the parent decides — but it aligns your summary toward \
+what matters.
 """
 
 # ---------------------------------------------------------------------------
@@ -101,6 +116,7 @@ class TreeNode:
     yield_question: Optional[str] = None
     yield_source: Optional[str] = None  # self.id if direct yield, child.id if blocked on child
     error: Optional[str] = None
+    suggested_next: Optional[str] = None
     duration: float = 0.0
     children: list = field(default_factory=list)
 
@@ -116,6 +132,7 @@ class TreeNode:
             "yield_question": self.yield_question,
             "yield_source": self.yield_source,
             "error": self.error,
+            "suggested_next": self.suggested_next,
             "duration": self.duration,
             "children": [c.to_dict() for c in self.children],
         }
@@ -134,6 +151,7 @@ class TreeNode:
             yield_question=d.get("yield_question"),
             yield_source=d.get("yield_source"),
             error=d.get("error"),
+            suggested_next=d.get("suggested_next"),
             duration=d.get("duration", 0.0),
             children=children,
         )
@@ -715,6 +733,7 @@ def invoke_streaming(
     resume_mode: bool = False,
     resume_reply: Optional[str] = None,
     permission_handler: Optional[Callable] = None,
+    task_id: Optional[str] = None,
 ) -> Tuple[str, Optional[str]]:
     """
     Invoke a Claude session using the stream-json protocol.
@@ -726,7 +745,8 @@ def invoke_streaming(
         prompt = resume_reply or "Continue your task."
         fork = False  # Resume the existing session, don't fork again
     else:
-        prompt = SYSTEM_INSTRUCTION + "\n\n## Task\n\n" + task
+        tag = f" [{task_id}]" if task_id else ""
+        prompt = SYSTEM_INSTRUCTION + f"\n\n## Starting Task{tag}\n\n" + task
         fork = True  # Fork to create an independent copy
 
     env_vars = {
@@ -850,6 +870,7 @@ def _run_node(node: TreeNode, source_session_file: Path, args, tree: ExecutionTr
             permission_mode=args.permission_mode,
             call_depth=depth,
             max_depth=args.max_depth,
+            task_id=node.id,
         )
         node.session_id = forked_id
         # Resolve clone_path for child CALLs and YIELD persistence
@@ -885,6 +906,7 @@ def _run_node(node: TreeNode, source_session_file: Path, args, tree: ExecutionTr
         if parsed["status"] == "complete":
             node.status = "complete"
             node.result = parsed.get("result", output)
+            node.suggested_next = parsed.get("suggested_next")
             return
 
         elif parsed["status"] == "yield":
@@ -1012,6 +1034,7 @@ def run_tree(args, session_file: Path, session_id: str, call_depth: int) -> str:
                     "task": node.task[:100],
                     "result": node.result,
                     "error": node.error,
+                    "suggested_next": node.suggested_next,
                     "duration": round(node.duration, 1),
                     "session_log": node.clone_path,
                     "session_log_start_line": node.parent_lines + 1,
@@ -1033,6 +1056,7 @@ def run_tree(args, session_file: Path, session_id: str, call_depth: int) -> str:
             "status": node.status,
             "result": node.result,
             "error": node.error,
+            "suggested_next": node.suggested_next,
             "duration": round(node.duration, 2),
             "session_log": node.clone_path,
             "session_log_start_line": node.parent_lines + 1,
@@ -1044,6 +1068,7 @@ def run_tree(args, session_file: Path, session_id: str, call_depth: int) -> str:
                 "task": n.task[:100],
                 "result": n.result,
                 "error": n.error,
+                "suggested_next": n.suggested_next,
                 "duration": round(n.duration, 1),
                 "session_log": n.clone_path,
                 "session_log_start_line": n.parent_lines + 1,
