@@ -54,33 +54,25 @@ def _extract_last_json_block(output: str) -> Optional[dict]:
         except json.JSONDecodeError:
             continue
 
-    # Fallback: scan from the end for balanced {...} spans.
-    end = len(output)
-    while True:
-        close = output.rfind("}", 0, end)
-        if close == -1:
-            return None
-        depth = 0
-        open_idx = -1
-        for i in range(close, -1, -1):
-            c = output[i]
-            if c == "}":
-                depth += 1
-            elif c == "{":
-                depth -= 1
-                if depth == 0:
-                    open_idx = i
-                    break
-        if open_idx == -1:
-            return None
-        candidate = output[open_idx:close + 1]
+    # Fallback: scan forward for the last object that `raw_decode` accepts.
+    # Using the JSON tokenizer (not hand-rolled brace counting) correctly
+    # handles `{` / `}` inside string literals and escape sequences.
+    decoder = json.JSONDecoder()
+    last: Optional[dict] = None
+    i = 0
+    n = len(output)
+    while i < n:
+        j = output.find("{", i)
+        if j == -1:
+            break
         try:
-            obj = json.loads(candidate)
+            obj, end_idx = decoder.raw_decode(output, j)
             if isinstance(obj, dict):
-                return obj
+                last = obj
+            i = end_idx
         except json.JSONDecodeError:
-            pass
-        end = open_idx
+            i = j + 1
+    return last
 
 
 def _stringify_child_result(result) -> str:
@@ -1289,7 +1281,8 @@ def _unwind_completed_nodes(tree: ExecutionTree, args, trace_dir: Path):
                 clone_path = Path(node.clone_path)
                 _resume_node(
                     node,
-                    "Your child completed. Here is the result:\n\n" + (blocked_child.result or ""),
+                    "Your child completed. Here is the result:\n\n"
+                    + _stringify_child_result(blocked_child.result),
                     args, tree, trace_dir,
                 )
                 changed = True
@@ -1356,6 +1349,8 @@ def run_resume(args) -> str:
             "suggested_next": node.suggested_next,
             "error": node.error,
             "duration": round(node.duration, 2),
+            "session_log": node.clone_path,
+            "session_log_start_line": node.parent_lines + 1,
         })
 
     # Tree exists — find the yielded node and resume it
@@ -1400,6 +1395,8 @@ def run_resume(args) -> str:
             "suggested_next": node.suggested_next,
             "error": node.error,
             "duration": round(node.duration, 2),
+            "session_log": node.clone_path,
+            "session_log_start_line": node.parent_lines + 1,
         })
     else:
         return json.dumps([
@@ -1411,6 +1408,8 @@ def run_resume(args) -> str:
                 "suggested_next": n.suggested_next,
                 "error": n.error,
                 "duration": round(n.duration, 1),
+                "session_log": n.clone_path,
+                "session_log_start_line": n.parent_lines + 1,
             }
             for i, n in enumerate(tree.nodes)
         ], indent=2)
@@ -1464,6 +1463,11 @@ def main():
     parser.add_argument(
         "--user-reply", type=str, default=None,
         help="The user's reply to inject when resuming (required with --resume-session)"
+    )
+    parser.add_argument(
+        "--parent-lines", type=int, default=0,
+        help="Line count of the parent session file when the clone was forked "
+             "(used by the backward-compat resume path when no .call_tree sidecar exists)"
     )
 
 
