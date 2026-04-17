@@ -8,7 +8,6 @@ Two concerns, each owned by one class:
 from __future__ import annotations
 
 import json
-import time
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -30,15 +29,32 @@ class TraceWriter:
         session_id: str,
         result: str,
         duration: float,
+        api_request_id: str,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read_tokens: int,
+        cache_creation_tokens: int,
+        started_at_utc: str,
+        ended_at_utc: str,
+        seed: Optional[int] = None,
         error: Optional[str] = None,
     ) -> None:
         entry = {
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+            "timestamp": started_at_utc,
+            "ended_at": ended_at_utc,
             "call_depth": depth,
             "session_id": session_id,
+            "api_request_id": api_request_id,
             "task": task[:200],
             "duration_seconds": round(duration, 2),
             "result_length": len(result),
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_read_tokens": cache_read_tokens,
+                "cache_creation_tokens": cache_creation_tokens,
+            },
+            "seed": seed,
             "error": error,
         }
         with open(self._file, "a") as f:

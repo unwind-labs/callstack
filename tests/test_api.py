@@ -128,7 +128,12 @@ class TestCallMany:
             tail = prompt.rsplit("\n\n", 1)[-1]
             for key, body in responses.items():
                 if key in tail:
-                    return TurnResult(text=body, session_id=key, duration=0.0)
+                    return TurnResult(
+                        text=body, session_id=key, duration=0.0,
+                        api_request_id="", input_tokens=0, output_tokens=0,
+                        cache_read_tokens=0, cache_creation_tokens=0,
+                        total_cost_usd=0.0,
+                    )
             raise AssertionError(prompt[:80])
         ch = ScriptedChannel().respond_with(respond).respond_with(respond)
         caller = _make_caller(tmp_path, parent_file, ch)

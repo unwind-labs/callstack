@@ -144,7 +144,12 @@ class TestParallel:
             if body is None:
                 raise AssertionError(f"unrecognized task tail: {tail!r}")
             sid = "alpha-fork" if "ALPHA" in tail else "bravo-fork"
-            return TurnResult(text=body, session_id=sid, duration=0.0)
+            return TurnResult(
+                text=body, session_id=sid, duration=0.0,
+                api_request_id="", input_tokens=0, output_tokens=0,
+                cache_read_tokens=0, cache_creation_tokens=0,
+                total_cost_usd=0.0,
+            )
         ch = ScriptedChannel().respond_with(respond).respond_with(respond)
         driver = _make_driver(tmp_path, ch)
 
@@ -237,3 +242,82 @@ class TestResume:
         assert child.status == "complete"
         assert root.status == "complete"
         assert root.result == "all done"
+
+
+# ---------- paper-v1 instrumentation ----------
+
+class TestInstrumentation:
+
+    def test_max_context_tokens_seen_tracks_peak(self, tmp_path, parent_session):
+        """Node.max_context_tokens_seen should track the max input_tokens across turns."""
+        def respond(src, prompt, fork):
+            # Return increasing then decreasing input_tokens to verify we keep the peak.
+            sequence = [1000, 5000, 3000]
+            idx = len(ch.log) - 1  # log has already been appended before respond runs
+            toks = sequence[min(idx, len(sequence) - 1)]
+            if idx == 0:
+                body = _envelope("call", task="sub")
+                sid = "parent-fork"
+            elif idx == 1:
+                body = _envelope("return", result="sub-done")
+                sid = "child-fork"
+            else:
+                body = _envelope("return", result="all done")
+                sid = "parent-fork"
+            return TurnResult(
+                text=body, session_id=sid, duration=0.0,
+                api_request_id=f"req_{idx}",
+                input_tokens=toks, output_tokens=100,
+                cache_read_tokens=0, cache_creation_tokens=0,
+                total_cost_usd=0.0,
+            )
+        ch = ScriptedChannel().respond_with(respond).respond_with(respond).respond_with(respond)
+        driver = _make_driver(tmp_path, ch)
+
+        tree = driver.run(parent_session, ["main"])
+        root = tree.nodes[0]
+        # Root saw 1000 on first turn, then 3000 on resume (after child returned).
+        # Peak across both is 3000.
+        assert root.max_context_tokens_seen == 3000
+        # Child saw 5000 on its single turn.
+        assert root.children[0].max_context_tokens_seen == 5000
+
+    def test_tree_schema_version_in_snapshot(self, tmp_path, parent_session):
+        ch = ScriptedChannel().respond(_envelope("yield", question="?"), "child-fork")
+        driver = _make_driver(tmp_path, ch)
+        project = tmp_path / "_no_real_projects" / "p"
+        project.mkdir(parents=True)
+        (project / "child-fork.jsonl").write_text("")
+        tree = driver.run(parent_session, ["t"])
+        assert tree.to_dict()["schema_version"] == "2"
+
+    def test_tree_from_dict_rejects_wrong_schema(self):
+        with pytest.raises(ValueError, match="schema_version"):
+            Tree.from_dict({
+                "schema_version": "1",
+                "root_session_id": "x", "root_session_file": "/tmp/x",
+                "base_depth": 0, "nodes": [],
+            })
+
+    def test_tree_from_dict_rejects_missing_schema(self):
+        with pytest.raises(ValueError, match="schema_version"):
+            Tree.from_dict({
+                "root_session_id": "x", "root_session_file": "/tmp/x",
+                "base_depth": 0, "nodes": [],
+            })
+
+    def test_driver_seed_forwards_to_trace(self, tmp_path, parent_session):
+        ch = ScriptedChannel().respond(_envelope("return", result="ok"), "f")
+        driver = Driver(
+            channel=ch,
+            locator=SessionLocator(projects_dir=tmp_path / "_no_real_projects"),
+            trace=TraceWriter(tmp_path / "traces"),
+            store=TreeStore(),
+            cwd=str(tmp_path),
+            timeout=10,
+            max_depth=5,
+            seed=7,
+        )
+        driver.run(parent_session, ["t"])
+        entry = json.loads((tmp_path / "traces" / "call_trace.jsonl").read_text().strip().split("\n")[0])
+        assert entry["seed"] == 7

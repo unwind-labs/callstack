@@ -28,6 +28,15 @@ class TurnResult:
     text: str
     session_id: str
     duration: float
+    # Usage + reproducibility fields. Populated from the stream-json `result`
+    # message by ClaudeChannel; ScriptedChannel passes "" / 0 / 0.0 for these
+    # since the test harness doesn't simulate a real provider response.
+    api_request_id: str
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_creation_tokens: int
+    total_cost_usd: float
 
 
 class TurnTimeout(Exception):
@@ -131,11 +140,12 @@ class ClaudeChannel:
 
         text_parts: list[str] = []
         session_id: Optional[str] = None
+        result_meta: dict = {}
 
         try:
             self._handshake(stdin, log)
             self._send_user_message(stdin, prompt, log)
-            session_id = self._read_until_result(stdin, stdout, text_parts, log)
+            session_id = self._read_until_result(stdin, stdout, text_parts, log, result_meta)
         finally:
             cancel.set()
             try: stdin.close()
@@ -156,7 +166,17 @@ class ClaudeChannel:
                 f"(returncode={proc.returncode}, log={log_path})"
             )
 
-        return TurnResult(text=text, session_id=session_id, duration=time.time() - start)
+        return TurnResult(
+            text=text,
+            session_id=session_id,
+            duration=time.time() - start,
+            api_request_id=result_meta.get("api_request_id", ""),
+            input_tokens=result_meta.get("input_tokens", 0),
+            output_tokens=result_meta.get("output_tokens", 0),
+            cache_read_tokens=result_meta.get("cache_read_tokens", 0),
+            cache_creation_tokens=result_meta.get("cache_creation_tokens", 0),
+            total_cost_usd=result_meta.get("total_cost_usd", 0.0),
+        )
 
     # ---- private helpers ----
 
@@ -198,9 +218,14 @@ class ClaudeChannel:
             "parent_tool_use_id": None,
         })
 
-    def _read_until_result(self, stdin, stdout, text_parts: list, log) -> Optional[str]:
+    def _read_until_result(self, stdin, stdout, text_parts: list, log,
+                            result_meta: dict) -> Optional[str]:
         """Read NDJSON lines, collecting assistant text and answering permission
-        requests, until a `result` message arrives or stdout closes."""
+        requests, until a `result` message arrives or stdout closes.
+
+        `result_meta` is populated with the `result` message's usage counters
+        and `uuid` (Anthropic request-id) so the caller can build a complete
+        TurnResult without re-parsing."""
         session_id: Optional[str] = None
         while True:
             # readline (not iter) — the iterator's read-ahead delays delivery and hangs.
@@ -235,6 +260,13 @@ class ClaudeChannel:
                 session_id = msg.get("session_id")
                 if not text_parts and msg.get("result"):
                     text_parts.append(msg["result"])
+                usage = msg.get("usage") or {}
+                result_meta["api_request_id"] = msg.get("uuid", "")
+                result_meta["input_tokens"] = usage.get("input_tokens", 0)
+                result_meta["output_tokens"] = usage.get("output_tokens", 0)
+                result_meta["cache_read_tokens"] = usage.get("cache_read_input_tokens", 0)
+                result_meta["cache_creation_tokens"] = usage.get("cache_creation_input_tokens", 0)
+                result_meta["total_cost_usd"] = msg.get("total_cost_usd", 0.0)
                 return session_id
 
     def _answer_control_request(self, stdin, msg: dict) -> None:
@@ -301,4 +333,8 @@ class ScriptedChannel:
         if callable(nxt):
             return nxt(source_session_id, prompt, fork)
         text, session_id = nxt
-        return TurnResult(text=text, session_id=session_id, duration=0.0)
+        return TurnResult(
+            text=text, session_id=session_id, duration=0.0,
+            api_request_id="", input_tokens=0, output_tokens=0,
+            cache_read_tokens=0, cache_creation_tokens=0, total_cost_usd=0.0,
+        )

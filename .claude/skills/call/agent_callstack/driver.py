@@ -13,11 +13,19 @@ whole subtree pauses; `Driver.resume(reply)` continues it.
 from __future__ import annotations
 
 import concurrent.futures as cf
+import datetime as dt
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+
+
+def _utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+CALL_TREE_SCHEMA_VERSION = "2"
 
 from . import state as st
 from .channel import Channel, TurnTimeout
@@ -37,6 +45,10 @@ class Node:
     parent_lines: int = 0
     duration: float = 0.0
     children: list["Node"] = field(default_factory=list)
+    # Peak `input_tokens` seen on this frame across all its turns. Updated
+    # by the driver after each TurnResult — enables Fig-2-style parent-context
+    # growth plots without re-parsing the trace JSONL.
+    max_context_tokens_seen: int = 0
 
     # ---- denormalized for serialization / public API ----
     session_id: Optional[str] = None
@@ -69,6 +81,7 @@ class Node:
             "id": self.id, "task": self.task,
             "state": _state_to_dict(self.state),
             "parent_lines": self.parent_lines, "duration": self.duration,
+            "max_context_tokens_seen": self.max_context_tokens_seen,
             "session_id": self.session_id, "clone_path": self.clone_path,
             "result": self.result, "summary": self.summary,
             "suggested_next": self.suggested_next, "error": self.error,
@@ -82,6 +95,7 @@ class Node:
             state=_state_from_dict(d["state"]),
             parent_lines=d.get("parent_lines", 0),
             duration=d.get("duration", 0.0),
+            max_context_tokens_seen=d["max_context_tokens_seen"],
             session_id=d.get("session_id"), clone_path=d.get("clone_path"),
             result=d.get("result"), summary=d.get("summary"),
             suggested_next=d.get("suggested_next"), error=d.get("error"),
@@ -98,6 +112,7 @@ class Tree:
 
     def to_dict(self) -> dict:
         return {
+            "schema_version": CALL_TREE_SCHEMA_VERSION,
             "root_session_id": self.root_session.session_id,
             "root_session_file": str(self.root_session.file),
             "base_depth": self.base_depth,
@@ -106,6 +121,13 @@ class Tree:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Tree":
+        schema = d.get("schema_version")
+        if schema != CALL_TREE_SCHEMA_VERSION:
+            raise ValueError(
+                f".call_tree schema_version={schema!r} is not supported; "
+                f"expected {CALL_TREE_SCHEMA_VERSION!r}. Snapshots written "
+                f"before paper-v1-rc1 (schema v1) cannot be resumed."
+            )
         return cls(
             root_session=SessionRef(session_id=d["root_session_id"],
                                     file=Path(d["root_session_file"])),
@@ -144,6 +166,10 @@ class Driver:
     cwd: Optional[str] = None
     timeout: int = 300
     max_depth: int = 5
+    # Opaque label recorded into traces for pass^k trial grouping. Does NOT
+    # produce deterministic provider output — the Anthropic API has no seed
+    # parameter as of 2026-04. See agent_callstack.call() docstring.
+    seed: Optional[int] = None
 
     # ---- entry points ----
 
@@ -318,6 +344,7 @@ class Driver:
     def _run_turn(self, effect: st.RunTurn, node: Node,
                   depth: int, parent_file: Path) -> st.Event:
         t0 = time.time()
+        started_at = _utc_now()
         try:
             result = self.channel.run_turn(
                 effect.source_session_id, effect.prompt,
@@ -325,25 +352,48 @@ class Driver:
             )
         except TurnTimeout as e:
             node.duration += time.time() - t0
-            self.trace.write(depth=depth, task=node.task,
-                             session_id=node.session_id or "unknown",
-                             result=e.partial, duration=node.duration, error=str(e))
+            self.trace.write(
+                depth=depth, task=node.task,
+                session_id=node.session_id or "unknown",
+                result=e.partial, duration=node.duration,
+                api_request_id="", input_tokens=0, output_tokens=0,
+                cache_read_tokens=0, cache_creation_tokens=0,
+                started_at_utc=started_at, ended_at_utc=_utc_now(),
+                seed=self.seed, error=str(e),
+            )
             return st.TurnFailed(error=str(e), partial=e.partial)
         except Exception as e:
             node.duration += time.time() - t0
-            self.trace.write(depth=depth, task=node.task,
-                             session_id=node.session_id or "unknown",
-                             result="", duration=node.duration, error=str(e))
+            self.trace.write(
+                depth=depth, task=node.task,
+                session_id=node.session_id or "unknown",
+                result="", duration=node.duration,
+                api_request_id="", input_tokens=0, output_tokens=0,
+                cache_read_tokens=0, cache_creation_tokens=0,
+                started_at_utc=started_at, ended_at_utc=_utc_now(),
+                seed=self.seed, error=str(e),
+            )
             return st.TurnFailed(error=f"Invocation failed: {e}")
 
         node.duration += result.duration or (time.time() - t0)
+        if result.input_tokens > node.max_context_tokens_seen:
+            node.max_context_tokens_seen = result.input_tokens
         # Resolve the clone path right after the fork completes.
         if effect.fork:
             resolved = self.locator.resolve(result.session_id, cwd=self.cwd)
             if resolved is not None:
                 node.clone_path = str(resolved)
-        self.trace.write(depth=depth, task=node.task, session_id=result.session_id,
-                         result=result.text, duration=node.duration)
+        self.trace.write(
+            depth=depth, task=node.task, session_id=result.session_id,
+            result=result.text, duration=node.duration,
+            api_request_id=result.api_request_id,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            cache_read_tokens=result.cache_read_tokens,
+            cache_creation_tokens=result.cache_creation_tokens,
+            started_at_utc=started_at, ended_at_utc=_utc_now(),
+            seed=self.seed,
+        )
         return st.TurnCompleted(envelope=parse_envelope(result.text),
                                 session_id=result.session_id)
 

@@ -99,6 +99,7 @@ class Caller:
         max_depth: int = 5,
         timeout: int = 300,
         trace_dir: Optional[Path] = None,
+        seed: Optional[int] = None,
     ):
         self._explicit_session = session
         self._cwd = cwd
@@ -108,6 +109,7 @@ class Caller:
         self._max_depth = max_depth
         self._timeout = timeout
         self._trace_dir = trace_dir
+        self._seed = seed
 
     def call(self, task: str) -> Result:
         results = self._invoke([task])
@@ -163,6 +165,7 @@ class Caller:
             cwd=cwd,
             timeout=self._timeout,
             max_depth=self._max_depth,
+            seed=self._seed,
         )
 
 
@@ -178,23 +181,32 @@ def _shared() -> Caller:
     return _default
 
 
-def call(task: str, *, timeout: Optional[int] = None) -> Result:
+def call(task: str, *, seed: Optional[int] = None,
+         timeout: Optional[int] = None) -> Result:
     """Fork a child agent on `task`. Returns the child's `Result`. Raises
-    `CallYielded` if the agent paused for input, `CallFailed` on error."""
-    if timeout is not None:
-        return Caller(timeout=timeout).call(task)
+    `CallYielded` if the agent paused for input, `CallFailed` on error.
+
+    seed: opaque integer recorded into traces for downstream trial grouping
+        (e.g., pass^k disaggregation). Does NOT produce deterministic provider
+        output — the Anthropic API has no seed parameter as of 2026-04. Use
+        this to label trials, not to expect bitwise reproducibility.
+    """
+    if timeout is not None or seed is not None:
+        return Caller(timeout=timeout or 300, seed=seed).call(task)
     return _shared().call(task)
 
 
-def call_many(tasks: Sequence[str], *, timeout: Optional[int] = None) -> MultiResult:
-    if timeout is not None:
-        return Caller(timeout=timeout).call_many(tasks)
+def call_many(tasks: Sequence[str], *, seed: Optional[int] = None,
+              timeout: Optional[int] = None) -> MultiResult:
+    if timeout is not None or seed is not None:
+        return Caller(timeout=timeout or 300, seed=seed).call_many(tasks)
     return _shared().call_many(tasks)
 
 
-def resume(token: YieldToken, reply: str, *, timeout: Optional[int] = None) -> Result:
-    if timeout is not None:
-        return Caller(timeout=timeout).resume(token, reply)
+def resume(token: YieldToken, reply: str, *, seed: Optional[int] = None,
+           timeout: Optional[int] = None) -> Result:
+    if timeout is not None or seed is not None:
+        return Caller(timeout=timeout or 300, seed=seed).resume(token, reply)
     return _shared().resume(token, reply)
 
 
