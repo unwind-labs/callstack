@@ -248,6 +248,23 @@ class TestResume:
 
 class TestInstrumentation:
 
+    def test_max_context_tokens_seen_includes_cache_reads(self, tmp_path, parent_session):
+        """Effective context = input_tokens + cache_read_tokens. A turn with
+        5 uncached input tokens and 20000 cache-read tokens must report peak
+        of 20005, not 5 — cache reads are still IN the model's context."""
+        def respond(_src, _prompt, _fork):
+            return TurnResult(
+                text=_envelope("return", result="ok"),
+                session_id="f", duration=0.0,
+                api_request_id="req", input_tokens=5, output_tokens=1,
+                cache_read_tokens=20000, cache_creation_tokens=100,
+                total_cost_usd=0.0,
+            )
+        ch = ScriptedChannel().respond_with(respond)
+        driver = _make_driver(tmp_path, ch)
+        tree = driver.run(parent_session, ["t"])
+        assert tree.nodes[0].max_context_tokens_seen == 20005
+
     def test_max_context_tokens_seen_tracks_peak(self, tmp_path, parent_session):
         """Node.max_context_tokens_seen should track the max input_tokens across turns."""
         def respond(src, prompt, fork):

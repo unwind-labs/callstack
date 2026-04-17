@@ -45,9 +45,11 @@ class Node:
     parent_lines: int = 0
     duration: float = 0.0
     children: list["Node"] = field(default_factory=list)
-    # Peak `input_tokens` seen on this frame across all its turns. Updated
-    # by the driver after each TurnResult — enables Fig-2-style parent-context
-    # growth plots without re-parsing the trace JSONL.
+    # Peak effective context size (input_tokens + cache_read_tokens) seen on
+    # this frame across all its turns. Cache reads are counted because they
+    # *are* in the model's context on that turn — the input/cache_read split
+    # is pricing metadata, not a context-size distinction. Fig 2's
+    # parent-context growth plot reads this field directly.
     max_context_tokens_seen: int = 0
 
     # ---- denormalized for serialization / public API ----
@@ -376,8 +378,12 @@ class Driver:
             return st.TurnFailed(error=f"Invocation failed: {e}")
 
         node.duration += result.duration or (time.time() - t0)
-        if result.input_tokens > node.max_context_tokens_seen:
-            node.max_context_tokens_seen = result.input_tokens
+        # Peak effective context = uncached input + cache reads. Both are
+        # tokens the model reasoned from this turn; the split is pricing,
+        # not context size. Fig 2 plots this quantity.
+        effective_context = result.input_tokens + result.cache_read_tokens
+        if effective_context > node.max_context_tokens_seen:
+            node.max_context_tokens_seen = effective_context
         # Resolve the clone path right after the fork completes.
         if effect.fork:
             resolved = self.locator.resolve(result.session_id, cwd=self.cwd)
