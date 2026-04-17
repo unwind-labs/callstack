@@ -144,7 +144,7 @@ Claude Code stores each conversation as a JSONL session file on disk.
 
 ### Session fork
 
-When you `/call`, `callstack.py` discovers the parent's session file (via `CLAUDE_SESSION_ID` env var or by finding the most recently modified session JSONL) and spawns a forked child:
+When you `/call`, the runtime (the `agent_callstack` package) discovers the parent's session file (via `CLAUDE_SESSION_ID` env var or by finding the most recently modified session JSONL) and spawns a forked child:
 
 ```
 claude --resume <session-id> --fork-session \
@@ -188,7 +188,21 @@ The child runs, does its work, and emits exactly one JSON envelope wrapped in a 
 
 ### Execution tree
 
-The runtime manages an **execution tree** rather than a linear stack. Each node tracks its status (pending, running, complete, yielded, error), its children, and its result. For parallel tasks (`invoke_parallel`), sibling nodes run concurrently via `ThreadPoolExecutor`, each with its own recursive execution loop. When all siblings complete (or yield), results are collected and returned. This naturally supports nested parallelism — a branch can itself fan out into parallel sub-branches.
+The runtime manages an **execution tree** rather than a linear stack. Each node holds an immutable state value (`Pending`, `AwaitingTurn`, `AwaitingChild`, `AwaitingUser`, `Done`, `Failed`); transitions are computed by a pure `step(state, event) -> (new_state, [effects])` function in `agent_callstack.state`. The driver in `agent_callstack.driver` performs the effects (subprocess turns, child spawns) and feeds the resulting events back. For parallel tasks (`invoke_parallel`), sibling root nodes run concurrently via `ThreadPoolExecutor`. When a node yields, the entire subtree is snapshotted to a `.call_tree` sidecar; resume reloads it and re-enters the loop with `UserReplied`.
+
+### Package layout
+
+```
+.claude/skills/call/agent_callstack/
+  __init__.py    Public API: call, call_many, resume, Caller, Result
+  state.py       Pure state machine: discriminated unions + step()
+  driver.py      Effect runner: ties channel + state + tree together
+  channel.py     Claude CLI subprocess + NDJSON protocol (the only seam)
+  protocol.py    SYSTEM_INSTRUCTION + envelope parser
+  session.py     SessionLocator: ~/.claude/projects discovery
+  trace.py       TraceWriter (JSONL) + TreeStore (sidecar snapshots)
+  analysis.py    SessionAnalyzer: post-execution structured inspection
+```
 
 ## Credits
 

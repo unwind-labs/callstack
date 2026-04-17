@@ -1,262 +1,130 @@
-"""Tests for session discovery, trace writing, and tree persistence."""
+"""Tests for SessionLocator: discovery + resolution against Claude's project layout."""
+from __future__ import annotations
 
 import json
 import os
-import time
+from pathlib import Path
 
 import pytest
 
-from callstack import (
-    ExecutionTree,
-    TreeNode,
-    discover_session,
-    resolve_session_file,
-    find_active_session_by_mtime,
-    write_trace,
-    _save_tree,
-    _load_tree,
-    _extract_cwd_from_session,
-    get_cwd_project_dir,
-    PROJECTS_DIR,
-)
+from agent_callstack.session import SessionLocator, count_lines
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-@pytest.fixture()
-def fake_projects_dir(tmp_path, monkeypatch):
-    """Redirect PROJECTS_DIR and CLAUDE_DIR to a temp directory."""
-    projects = tmp_path / "projects"
-    projects.mkdir()
-    monkeypatch.setattr("callstack.PROJECTS_DIR", projects)
-    monkeypatch.setattr("callstack.CLAUDE_DIR", tmp_path)
-    return projects
+@pytest.fixture
+def projects(tmp_path) -> Path:
+    p = tmp_path / "projects"
+    p.mkdir()
+    return p
 
 
-def _write_session(directory, session_id, content=None):
-    """Create a fake .jsonl session file."""
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{session_id}.jsonl"
-    path.write_text(content or '{"type":"message"}\n')
-    return path
+def _make_session(project_dir: Path, name: str, *, cwd: str = "/tmp") -> Path:
+    project_dir.mkdir(parents=True, exist_ok=True)
+    f = project_dir / f"{name}.jsonl"
+    f.write_text(json.dumps({"cwd": cwd, "type": "user"}) + "\n")
+    return f
 
 
-# ---------------------------------------------------------------------------
-# _extract_cwd_from_session
-# ---------------------------------------------------------------------------
+class TestResolve:
 
-class TestExtractCwdFromSession:
+    def test_resolve_finds_in_any_project_dir(self, projects):
+        f = _make_session(projects / "proj-a", "abc123")
+        loc = SessionLocator(projects_dir=projects)
+        assert loc.resolve("abc123") == f
 
-    def test_extracts_cwd(self, tmp_path):
-        session = tmp_path / "test.jsonl"
-        session.write_text('{"cwd": "/tmp"}\n{"type":"msg"}\n')
-        assert _extract_cwd_from_session(session) == "/tmp"
+    def test_resolve_returns_none_when_missing(self, projects):
+        loc = SessionLocator(projects_dir=projects)
+        assert loc.resolve("nothing") is None
 
-    def test_skips_lines_without_cwd(self, tmp_path):
-        session = tmp_path / "test.jsonl"
-        session.write_text('{"type":"msg"}\n{"cwd": "/tmp"}\n')
-        assert _extract_cwd_from_session(session) == "/tmp"
-
-    def test_returns_none_for_nonexistent_dir(self, tmp_path):
-        session = tmp_path / "test.jsonl"
-        session.write_text('{"cwd": "/nonexistent/path/xyz123"}\n')
-        assert _extract_cwd_from_session(session) is None
-
-    def test_returns_none_for_missing_file(self, tmp_path):
-        assert _extract_cwd_from_session(tmp_path / "nope.jsonl") is None
-
-    def test_handles_invalid_json(self, tmp_path):
-        session = tmp_path / "test.jsonl"
-        session.write_text('not json\n{"cwd": "/tmp"}\n')
-        assert _extract_cwd_from_session(session) == "/tmp"
+    def test_resolve_prefers_cwd_matching_project(self, tmp_path, projects):
+        cwd = str(tmp_path / "myproj")
+        encoded = cwd.replace("/", "-")
+        f = _make_session(projects / encoded, "shared", cwd=cwd)
+        # Also a different project dir with the same uuid
+        _make_session(projects / "other", "shared")
+        loc = SessionLocator(projects_dir=projects)
+        # cwd match wins
+        assert loc.resolve("shared", cwd=cwd) == f
 
 
-# ---------------------------------------------------------------------------
-# resolve_session_file
-# ---------------------------------------------------------------------------
+class TestLocate:
 
-class TestResolveSessionFile:
+    def test_explicit_uuid(self, projects):
+        f = _make_session(projects / "p", "explicit-id")
+        loc = SessionLocator(projects_dir=projects)
+        ref = loc.locate(explicit="explicit-id")
+        assert ref.session_id == "explicit-id"
+        assert ref.file == f
 
-    def test_finds_in_project_dir(self, fake_projects_dir, monkeypatch):
-        proj = fake_projects_dir / "-Users-test-project"
-        path = _write_session(proj, "abc-123")
-        # Monkeypatch get_cwd_project_dir to return our fake project
-        monkeypatch.setattr("callstack.get_cwd_project_dir", lambda: proj)
-        result = resolve_session_file("abc-123")
-        assert result == path
+    def test_explicit_file_path(self, projects):
+        f = _make_session(projects / "p", "from-path")
+        loc = SessionLocator(projects_dir=projects)
+        ref = loc.locate(explicit=str(f))
+        assert ref.file == f
+        assert ref.session_id == "from-path"
 
-    def test_searches_all_projects(self, fake_projects_dir, monkeypatch):
-        proj = fake_projects_dir / "-Users-other-project"
-        path = _write_session(proj, "def-456")
-        monkeypatch.setattr("callstack.get_cwd_project_dir", lambda: None)
-        result = resolve_session_file("def-456")
-        assert result == path
+    def test_explicit_missing_raises(self, projects):
+        loc = SessionLocator(projects_dir=projects)
+        with pytest.raises(RuntimeError, match="not found"):
+            loc.locate(explicit="ghost")
 
-    def test_returns_none_when_missing(self, fake_projects_dir, monkeypatch):
-        monkeypatch.setattr("callstack.get_cwd_project_dir", lambda: None)
-        assert resolve_session_file("nonexistent") is None
-
-
-# ---------------------------------------------------------------------------
-# find_active_session_by_mtime
-# ---------------------------------------------------------------------------
-
-class TestFindActiveSessionByMtime:
-
-    def test_returns_most_recent(self, fake_projects_dir):
-        proj = fake_projects_dir / "-test"
-        proj.mkdir()
-        old = _write_session(proj, "old-sess")
-        time.sleep(0.05)
-        new = _write_session(proj, "new-sess")
-        result = find_active_session_by_mtime(proj)
-        assert result is not None
-        assert result[1] == "new-sess"
-
-    def test_returns_none_when_empty(self, fake_projects_dir):
-        proj = fake_projects_dir / "-empty"
-        proj.mkdir()
-        assert find_active_session_by_mtime(proj) is None
-
-
-# ---------------------------------------------------------------------------
-# discover_session
-# ---------------------------------------------------------------------------
-
-class TestDiscoverSession:
-
-    def test_explicit_file_path(self, tmp_path):
-        path = _write_session(tmp_path, "explicit")
-        session_file, session_id = discover_session(explicit_session_id=str(path))
-        assert session_file == path
-        assert session_id == "explicit"
-
-    def test_explicit_uuid(self, fake_projects_dir, monkeypatch):
-        proj = fake_projects_dir / "-test"
-        path = _write_session(proj, "uuid-123")
-        session_file, session_id = discover_session(explicit_session_id="uuid-123")
-        assert session_file == path
-        assert session_id == "uuid-123"
-
-    def test_explicit_uuid_not_found_raises(self, fake_projects_dir):
-        with pytest.raises(RuntimeError, match="no matching session file"):
-            discover_session(explicit_session_id="nonexistent-uuid")
-
-    def test_env_var_file_path(self, tmp_path, monkeypatch, fake_projects_dir):
-        path = _write_session(tmp_path, "env-sess")
-        monkeypatch.setenv("CALLSTACK_PARENT_SESSION", str(path))
-        # Clear other env vars to avoid interference
+    def test_env_var_path_used_when_no_explicit(self, projects, monkeypatch):
+        f = _make_session(projects / "p", "env-id")
+        loc = SessionLocator(projects_dir=projects)
+        monkeypatch.setenv("CALLSTACK_PARENT_SESSION", str(f))
         monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
-        session_file, session_id = discover_session()
-        assert session_file == path
-        assert session_id == "env-sess"
+        ref = loc.locate()
+        assert ref.file == f
 
-    def test_env_var_uuid(self, fake_projects_dir, monkeypatch):
-        proj = fake_projects_dir / "-test"
-        _write_session(proj, "env-uuid")
+    def test_env_var_uuid_used_when_no_explicit(self, projects, monkeypatch):
+        _make_session(projects / "p", "uuid-env")
+        loc = SessionLocator(projects_dir=projects)
         monkeypatch.delenv("CALLSTACK_PARENT_SESSION", raising=False)
-        monkeypatch.setenv("CLAUDE_SESSION_ID", "env-uuid")
-        session_file, session_id = discover_session()
-        assert session_id == "env-uuid"
+        monkeypatch.setenv("CLAUDE_SESSION_ID", "uuid-env")
+        ref = loc.locate()
+        assert ref.session_id == "uuid-env"
 
-    def test_mtime_fallback(self, fake_projects_dir, monkeypatch):
+    def test_mtime_fallback_picks_most_recent(self, projects, monkeypatch):
+        old = _make_session(projects / "p", "old")
+        new = _make_session(projects / "p", "new")
+        os.utime(old, (1000, 1000))
+        os.utime(new, (2000, 2000))
         monkeypatch.delenv("CALLSTACK_PARENT_SESSION", raising=False)
         monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
-        proj = fake_projects_dir / "-test"
-        _write_session(proj, "mtime-sess")
-        monkeypatch.setattr("callstack.get_cwd_project_dir", lambda: proj)
-        session_file, session_id = discover_session()
-        assert session_id == "mtime-sess"
+        loc = SessionLocator(projects_dir=projects)
+        ref = loc.locate()
+        assert ref.session_id == "new"
 
-    def test_no_session_raises(self, fake_projects_dir, monkeypatch):
+    def test_no_session_anywhere_raises(self, projects, monkeypatch):
         monkeypatch.delenv("CALLSTACK_PARENT_SESSION", raising=False)
         monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
-        monkeypatch.setattr("callstack.get_cwd_project_dir", lambda: None)
+        loc = SessionLocator(projects_dir=projects)
         with pytest.raises(RuntimeError, match="Could not discover"):
-            discover_session()
+            loc.locate()
 
 
-# ---------------------------------------------------------------------------
-# write_trace
-# ---------------------------------------------------------------------------
+class TestSessionRefCwd:
 
-class TestWriteTrace:
+    def test_extracts_cwd_from_first_message(self, tmp_path):
+        from agent_callstack.session import SessionRef
+        f = tmp_path / "s.jsonl"
+        f.write_text(json.dumps({"cwd": str(tmp_path), "type": "user"}) + "\n")
+        ref = SessionRef(session_id="s", file=f)
+        assert ref.cwd == str(tmp_path)
 
-    def test_creates_trace_file(self, tmp_path):
-        trace_dir = tmp_path / "traces"
-        write_trace(trace_dir, 1, "do stuff", "sess-1", "result", 2.5)
-        trace_file = trace_dir / "call_trace.jsonl"
-        assert trace_file.exists()
-        entry = json.loads(trace_file.read_text().strip())
-        assert entry["call_depth"] == 1
-        assert entry["task"] == "do stuff"
-        assert entry["session_id"] == "sess-1"
-        assert entry["duration_seconds"] == 2.5
-        assert entry["error"] is None
-
-    def test_appends_multiple_entries(self, tmp_path):
-        trace_dir = tmp_path / "traces"
-        write_trace(trace_dir, 1, "t1", "s1", "r1", 1.0)
-        write_trace(trace_dir, 2, "t2", "s2", "r2", 2.0)
-        lines = (trace_dir / "call_trace.jsonl").read_text().strip().split("\n")
-        assert len(lines) == 2
-
-    def test_records_error(self, tmp_path):
-        trace_dir = tmp_path / "traces"
-        write_trace(trace_dir, 1, "t", "s", "r", 1.0, error="boom")
-        entry = json.loads((trace_dir / "call_trace.jsonl").read_text().strip())
-        assert entry["error"] == "boom"
-
-    def test_truncates_long_task(self, tmp_path):
-        trace_dir = tmp_path / "traces"
-        long_task = "x" * 500
-        write_trace(trace_dir, 1, long_task, "s", "r", 1.0)
-        entry = json.loads((trace_dir / "call_trace.jsonl").read_text().strip())
-        assert len(entry["task"]) == 200
+    def test_returns_none_if_no_cwd(self, tmp_path):
+        from agent_callstack.session import SessionRef
+        f = tmp_path / "s.jsonl"
+        f.write_text(json.dumps({"type": "user"}) + "\n")
+        ref = SessionRef(session_id="s", file=f)
+        assert ref.cwd is None
 
 
-# ---------------------------------------------------------------------------
-# _save_tree / _load_tree
-# ---------------------------------------------------------------------------
+class TestCountLines:
 
-class TestTreePersistence:
+    def test_counts(self, tmp_path):
+        f = tmp_path / "x.jsonl"
+        f.write_text("a\nb\nc\n")
+        assert count_lines(f) == 3
 
-    def _make_tree(self):
-        return ExecutionTree(
-            root_session_id="root",
-            root_session_file="/tmp/root.jsonl",
-            call_depth_base=1,
-            nodes=[TreeNode(id="n1", task="task-1", status="yielded",
-                            yield_question="q?", yield_source="n1")],
-        )
-
-    def test_save_and_load_round_trip(self, tmp_path):
-        clone_path = tmp_path / "clone.jsonl"
-        clone_path.write_text("")
-        tree = self._make_tree()
-        _save_tree(tree, clone_path)
-
-        sidecar = tmp_path / "clone.jsonl.call_tree"
-        assert sidecar.exists()
-
-        loaded = _load_tree(clone_path)
-        assert loaded is not None
-        assert loaded.root_session_id == "root"
-        assert len(loaded.nodes) == 1
-        assert loaded.nodes[0].yield_question == "q?"
-
-    def test_load_deletes_sidecar(self, tmp_path):
-        clone_path = tmp_path / "clone.jsonl"
-        clone_path.write_text("")
-        _save_tree(self._make_tree(), clone_path)
-        sidecar = tmp_path / "clone.jsonl.call_tree"
-        assert sidecar.exists()
-        _load_tree(clone_path)
-        assert not sidecar.exists()
-
-    def test_load_returns_none_when_no_sidecar(self, tmp_path):
-        clone_path = tmp_path / "clone.jsonl"
-        clone_path.write_text("")
-        assert _load_tree(clone_path) is None
+    def test_missing_file_returns_zero(self, tmp_path):
+        assert count_lines(tmp_path / "ghost") == 0
