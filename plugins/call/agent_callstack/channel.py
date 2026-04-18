@@ -23,6 +23,21 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Protocol, Union
 
 
+# Global concurrency cap for concurrent claude subprocess invocations.
+# Each ClaudeChannel.run_turn() spawns a short-lived `claude` subprocess
+# (one turn per spawn), so this bounds the number of *active* claude
+# processes system-wide — not the number of in-flight logical calls.
+# The recursive callstack can logically have many thousands of pending
+# turns; the semaphore ensures only N of them are physically running at
+# once. Set via env `CALLSTACK_MAX_CONCURRENT_FORKS` (default 8).
+#
+# Each `claude` process consumes ~0.5-2 GB RSS, so on a typical 16-64 GB
+# machine the safe ceiling is 8-30. Default 8 is conservative; bump for
+# larger machines or reduce for tight memory conditions.
+_MAX_CONCURRENT_FORKS = int(os.environ.get("CALLSTACK_MAX_CONCURRENT_FORKS", "8"))
+_FORK_SEMAPHORE = threading.BoundedSemaphore(value=_MAX_CONCURRENT_FORKS)
+
+
 @dataclass(frozen=True)
 class TurnResult:
     text: str
@@ -107,12 +122,31 @@ class ClaudeChannel:
               f"cwd={effective_cwd}, log={log_path})", file=sys.stderr)
 
         start = time.time()
+        # Gate Popen behind the global semaphore so system-wide concurrent
+        # claude-subprocess count stays bounded even under deep recursive
+        # callstacks. We hold the slot for the duration of the turn
+        # (including the subprocess wait below); release on all exit paths.
+        _sem_wait_start = time.time()
+        _FORK_SEMAPHORE.acquire()
+        _sem_wait = time.time() - _sem_wait_start
+        if _sem_wait > 0.5:
+            log.write(f"semaphore-wait: {_sem_wait:.2f}s "
+                      f"(cap={_MAX_CONCURRENT_FORKS})\n")
+            log.flush()
+        _released = False
+        def _release_slot():
+            nonlocal _released
+            if not _released:
+                _FORK_SEMAPHORE.release()
+                _released = True
+
         try:
             proc = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, cwd=effective_cwd, env=env,
             )
         except Exception as e:
+            _release_slot()
             log.close()
             raise RuntimeError(f"Failed to start claude CLI: {e}") from e
 
@@ -156,6 +190,7 @@ class ClaudeChannel:
                 proc.kill(); proc.wait()
             log.write(f"Process exited with code {proc.returncode}\n")
             log.close()
+            _release_slot()
 
         text = "".join(text_parts)
         if timed_out.is_set():

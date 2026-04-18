@@ -1,0 +1,13 @@
+{
+  "name": "agent-callstack",
+  "owner": {
+    "name": "Amol Kelkar"
+  },
+  "plugins": [
+    {
+      "name": "call",
+      "source": "./plugins/call",
+      "description": "Fork a sub-agent that inherits full conversation context, executes a task, and returns only the result."
+    }
+  ]
+}
