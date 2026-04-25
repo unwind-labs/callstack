@@ -78,6 +78,7 @@ class Channel(Protocol):
         fork: bool,
         cwd: Optional[str] = None,
         timeout: int = 300,
+        extra_env: Optional[dict] = None,
         on_session_id: Optional[Callable[[str], None]] = None,
     ) -> TurnResult: ...
 
@@ -110,11 +111,12 @@ class ClaudeChannel:
         fork: bool,
         cwd: Optional[str] = None,
         timeout: int = 300,
+        extra_env: Optional[dict] = None,
         on_session_id: Optional[Callable[[str], None]] = None,
     ) -> TurnResult:
         cmd = self._build_cmd(source_session_id, fork)
         effective_cwd = cwd or os.getcwd()
-        env = {**os.environ, **self._env_extra}
+        env = {**os.environ, **self._env_extra, **(extra_env or {})}
 
         log_path = f"/tmp/callstack_{source_session_id[:8]}_{uuid.uuid4().hex[:8]}.log"
         log = open(log_path, "w")
