@@ -1,0 +1,11 @@
+{
+  "name": "callstack",
+  "description": "Call stack for agents. Useful for long-horizon and deeply nested tasks. Keeps agent context small; avoids context rot and saves on tokens.",
+  "version": "0.1.1",
+  "mcpServers": {
+    "call": {
+      "command": "python3",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp_server.py"]
+    }
+  }
+}
