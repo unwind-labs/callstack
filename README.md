@@ -49,19 +49,13 @@ Forked sessions share the parent's exact token prefix, so prompt caching (~90% c
 
 ## Install
 
-Three ways, pick one.
+Two ways, pick one.
 
 **Claude Code marketplace** (recommended):
 
 ```
-/plugin marketplace add unwind-labs/marketplace
+/plugin marketplace add unwind-labs/callstack
 /plugin install callstack@unwind-labs
-```
-
-**[skills.sh](https://skills.sh)** (skill-only, no MCP server):
-
-```bash
-npx skills add unwind-labs/callstack
 ```
 
 **Manual** (clone the repo, drop the plugin into your Claude Code plugins directory):
@@ -71,7 +65,7 @@ git clone https://github.com/unwind-labs/callstack
 cp -r callstack/plugins/callstack ~/.claude/plugins/
 ```
 
-The plugin bundles the `/call` skill at `plugins/callstack/skills/call/SKILL.md` and the MCP server at `plugins/callstack/mcp_server.py` — both are wired up automatically by Claude Code's plugin loader.
+The plugin bundles the `/call` skill at `plugins/callstack/skills/call/SKILL.md`, the MCP server at `plugins/callstack/mcp_server.py`, and a SessionStart hook — all wired up automatically by Claude Code's plugin loader.
 
 ## Quick start
 
