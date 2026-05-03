@@ -1,19 +1,25 @@
-# agent-callstack
+![agent callstack](assets/callstack.gif)
 
-**A call stack for AI agents to run deeply nested workflows reliably. Includes automatic stack-based context compaction.**
+# callstack
 
-AI agents today have two options for complex work. 
+Call stacks let humans build complex software by **scoping complexity** and **scoping memory and variables**. No matter how deep execution goes, the code runs with the full context of the program, and the language runtime guarantees the call stack unwinds deterministically as functions return.
 
-- Sub-agents start blind — no parent context, so they need to receive all necessary context from the main agent. This wastes tokens
-- Main agent does everything itself — context accumulates, quality degrades, and lossy compaction throws away information the agent needed.
+No equivalent capability exists for ReAct-loop based agents — and Claude Code is a ReAct-loop based agent harness. These agents accumulate context linearly, and as the conversation grows, important early details get crowded out and the agent loses track. Subagents are available to execute side tasks in a fresh context and return results back, keeping execution detail out of the main context — but a subagent must be sent every piece of context it needs, which wastes token generation. Recently, Claude Code shipped an experimental subagent mode called [`/fork`](https://docs.claude.com/en/docs/claude-code) where forked subagents run in a forked session and inherit the parent's context. But as of today, forked agents cannot themselves fork (no deep call stacks), and no user interaction is allowed inside a forked subagent — both limits constrain real use.
 
-Neither method can handle deeply nested workflows (common in Enterprise systems) because the LLM has to maintain the call stack in-context, and it loses track.
+## Why are deep call stacks necessary?
 
-agent-callstack gives your agents a proper call stack. Each `/call` forks the parent's full session context — like `fork()` in Unix. The child session inherits everything. When it completes, only its return value and compact execution report flows back. The parent's context stays clean.
+Most real-world workflows are deep. Consider a customer-support refund: the orchestrator authenticates the customer (which itself fans out into identity verification, MFA challenge, MFA validation), looks up the order (lookup → eligibility check → return-window check), and processes the refund (condition assessment → calculation → payment → email). Each step may itself need to delegate further. Flatten the whole thing into one ReAct loop and the agent must hold every intermediate detail in context simultaneously.
 
-For instance "implement app.." (A) needs to "implement auth module" (B), which in turn need to "write JWT middleware" (C). Without callstack, the agent would perform all operations in a growing context like [SAAAAAABBBBBBBBBBBBCCCBBBBBAAAAAAAAAAAAAAAA], resulting in context rot and forced lossy context compactions along the way.
+LLMs are notoriously poor at maintaining a deep call chain and reliably unwinding as tasks finish. The longer the chain, the more likely the orchestrator forgets the original goal by the time control returns to it.
 
-What if the tasks only returned their results so the caller's context remains compact? That's what agent-callstack does.
+## What the callstack plugin delivers
+
+- **`/call` simulates a function call.** Fork the parent's session, run the task, return a compact result.
+- **Parallel forks.** Run multiple tasks simultaneously with one invocation: `/call do X, do Y, and do Z in parallel`. The user-facing surface stays `/call`; the skill picks single vs parallel internally.
+- **Calls return the result and a path to the full session JSON.** If the caller later needs a detail the child didn't include, file access reaches the full transcript without burning more context.
+- **Interactivity at any depth.** A `/call` can pause and ask the user from any frame — without paying the cost of bubbling the question through every intermediate node (which would otherwise require, and waste, an LLM turn at each level).
+- **Calls run in the parent's full context** — so the invocation is one line, not a hand-rolled context dump.
+- **Calls run in the parent's full context** — so the child understands what tasks will follow, and shapes its return payload to include what the caller will need next.
 
 ```
 Agent "implement app.."
@@ -28,29 +34,46 @@ Agent "implement app.."
 │    │    │    context: [SAAAAAABBBBBBBB░░░░]      ← inherits S+A+B
 │    │    │    (does some work)
 │    │    │    context: [SAAAAAABBBBBBBBCCC░]      ← accumulates C activities
-│    │    │    return {result + compacted CCC} = c ← return result c
-│    │    │                                        ← exit and delete forked session
-│    │    context: [SAAAAAABBBBBBBBc░░░░]     ← c added to context instead of CCC
+│    │    │    return {result c}                   ← return result c
+│    │    │                                        ← exit forked session
+│    │    context: [SAAAAAABBBBBBBBc░░░░]     ← c added instead of CCC
 │    │    (does some work)
 │    │    context: [SAAAAAABBBBBBBBcBB░░]     ← accumulates more B activities
-│    │    returns {result + compacted BBBBBBBBcBB} = b  ← return result b
+│    │    return {result b}
 │    │
-│    context: [SAAAAAAb░░░░░░░░░░░░░░░░]  ← b added to context instead of BBBBBBBBcBB
+│    context: [SAAAAAAb░░░░░░░░░░░░░░░░]  ← b added instead of BBBBBBBBcBB
 │    (does some work)                     ← continues with clean context
 ```
 
-Note that forked sessions share the parent's exact token prefix, so prompt cache (~90% cheaper token pricing) applies automatically.
+Forked sessions share the parent's exact token prefix, so prompt caching (~90% cheaper) applies automatically.
 
 ## Install
 
-```bash
-git clone https://github.com/amolk/agent-callstack
+Three ways, pick one.
 
-# Copy the /call skill into your .claude
-cp -r agent-callstack/.claude/skills/call ~/.claude/skills/
+**Claude Code marketplace** (recommended):
+
+```
+/plugin marketplace add unwind-labs/marketplace
+/plugin install callstack@unwind-labs
 ```
 
-## Quick Start
+**[skills.sh](https://skills.sh)** (skill-only, no MCP server):
+
+```bash
+npx skills add unwind-labs/callstack
+```
+
+**Manual** (clone the repo, drop the plugin into your Claude Code plugins directory):
+
+```bash
+git clone https://github.com/unwind-labs/callstack
+cp -r callstack/plugins/callstack ~/.claude/plugins/
+```
+
+The plugin bundles the `/call` skill at `plugins/callstack/skills/call/SKILL.md` and the MCP server at `plugins/callstack/mcp_server.py` — both are wired up automatically by Claude Code's plugin loader.
+
+## Quick start
 
 Once installed, Claude Code can use `/call` directly.
 
@@ -66,11 +89,24 @@ Claude: I'll handle this in two calls to keep my context clean.
 → {"status": "complete", "result": "Created tests/test_auth.py, 12 tests, all passing..."}
 ```
 
-Each forked session sees the full conversation so far (knew what patterns you discussed, what files exist, what your preferences are) but its intermediate work — the 50 tool calls, the failed attempts, the debugging — never entered the parent's context.
+For independent tasks, ask for parallel execution and the skill fans them out in a single fork:
 
-This is unlike subagents that do not see the full conversation context so far and so all context needs to be explicitly generated and passed in. This is suitable for independent tasks, but most workflow steps benefit from having session context.
+```
+You: "/call profile the API, audit the deps, and benchmark the renderer in parallel"
 
-## Example: Customer Support Refund
+Claude: Running all three concurrently.
+
+[call - invoke_parallel (MCP): tasks=["Profile the API", "Audit the deps", "Benchmark the renderer"]]
+→ [{"status": "complete", "result": "API: p99 184ms, hot path is..."},
+   {"status": "complete", "result": "Deps: 3 outdated, 1 CVE in..."},
+   {"status": "complete", "result": "Renderer: 47 fps median, dropped frames at..."}]
+```
+
+Each forked session sees the full conversation so far (knew what patterns you discussed, what files exist, what your preferences are) but its intermediate work — the 50 tool calls, the failed attempts, the debugging — never enters the parent's context.
+
+This is unlike subagents which do not see the conversation context, so all context has to be hand-rolled and passed in. Subagents are right for genuinely independent tasks; most workflow steps benefit from inherited context.
+
+## Example: customer support refund
 
 The `examples/customer_support/` directory demonstrates a complete workflow — customer authentication with MFA, order lookup, and refund processing — using skills and MCP tools.
 
@@ -106,7 +142,7 @@ Orchestrator (interactive session with user)
        └── op: return  "Refund $82.48, txn_ref_88291"
 ```
 
-## Example: Parallel Calls with Nested Forks
+## Example: parallel calls with nested forks
 
 The `examples/parallel_calls/` directory demonstrates parallel fan-out with nested parallelism — the orchestrator calls three agents simultaneously, and one of those agents itself forks into two parallel sub-agents.
 
@@ -120,16 +156,21 @@ claude
 
 ```
 A (orchestrator)
-├── B  (weather report — leaf)          ──┐
-├── C  (market brief — fork node)       ──┤ parallel
-│   ├── E  (exchange rates — leaf)  ──┐   │
-│   └── F  (news headlines — leaf)  ──┘   │ nested parallel inside C
-└── D  (stock report — leaf)            ──┘
+├── B  (weather report — leaf)               ──┐
+├── C  (market brief — fork node)            ──┤ parallel
+│   ├── E  (exchange rates — fork node)  ──┐   │
+│   │   ├── G  (JPY rate — leaf)  ──┐      │   │
+│   │   └── H  (GBP rate — leaf)  ──┘      │ nested parallel inside E
+│   └── F  (news headlines — leaf)      ──┘   │ nested parallel inside C
+└── D  (stock report — leaf)                 ──┘
 
 A calls {B, C, D} in parallel via --tasks
   B calls get_weather("Tokyo"), get_weather("London"), returns
   C calls {E, F} in parallel via --tasks (nested fork)
-    E calls get_exchange_rate("JPY"), get_exchange_rate("GBP"), returns
+    E calls {G, H} in parallel via --tasks (3-level deep nested fork)
+      G calls get_exchange_rate("JPY"), returns
+      H calls get_exchange_rate("GBP"), returns
+    E combines G+H results, returns
     F calls get_news_headline("tech"), get_news_headline("finance"), returns
   C combines E+F results, returns
   D calls get_stock_price("AAPL"), get_stock_price("GOOGL"), returns
@@ -138,7 +179,9 @@ A validates all 6 expected values: PASS
 
 Each parallel branch independently supports the full `call`/`yield`/`return` protocol — a branch can delegate further, pause for user input, or return, without blocking its siblings.
 
-## How It Works
+**This is how you compose a deep call stack out of Claude Code Skills.** Each node in the tree (B, C, D, E, F, G, H) is a Claude Code Skill defined in `examples/parallel_calls/.claude/skills/task-*/SKILL.md`. `/call` invokes them by name, and any Skill is free to itself `/call` other Skills — that's how depth grows. Skills become the "functions" in the call stack: small, named, composable units the orchestrator wires together.
+
+## How it works
 
 Claude Code stores each conversation as a JSONL session file on disk.
 
@@ -193,7 +236,7 @@ The runtime manages an **execution tree** rather than a linear stack. Each node 
 ### Package layout
 
 ```
-.claude/skills/call/agent_callstack/
+plugins/callstack/agent_callstack/
   __init__.py    Public API: call, call_many, resume, Caller, Result
   state.py       Pure state machine: discriminated unions + step()
   driver.py      Effect runner: ties channel + state + tree together
@@ -204,6 +247,48 @@ The runtime manages an **execution tree** rather than a linear stack. Each node 
   analysis.py    SessionAnalyzer: post-execution structured inspection
 ```
 
+## How is `/call` better than `/fork`?
+
+Both `/call` and Anthropic's experimental `/fork` are built on the same underlying CLI primitive — `claude --session-id <uuid> --fork-session`, which copies a named session and resumes the forked copy with the parent's full context. They are sibling runtimes on that primitive, not parent/child. Here is how they compare:
+
+| Capability   | Claude Code `/fork`                                        | callstack `/call`                                                      |
+|--------------|------------------------------------------------------------|------------------------------------------------------------------------|
+| Fork depth   | Single level — forks cannot fork                           | Arbitrary depth — full recursive call stack                            |
+| Interactivity| Background only; result returns as a message               | Interactive at every level; user can drop into any frame               |
+| Runtime mode | Interactive sessions only; disabled in non-interactive use | Works headless via `claude -p`                                         |
+| Observability| None — fork runs in a side panel                           | [unwind](https://pypi.org/project/unwind-labs/): live web UI of the call tree across all sessions |
+| Concurrency  | Implicit                                                   | `CALLSTACK_MAX_CONCURRENT_FORKS` semaphore for wide fan-out            |
+
+**Depth.** `/fork` is one level deep — a fork cannot itself fork. Real workflows nest: "implement app" calls "implement auth module" calls "write JWT middleware". `/call` is recursive (default cap 5 levels), so the whole tree runs as a proper call stack instead of being flattened into the parent.
+
+**Interactivity at every level.** A `/fork` runs in the background and returns a message when done. A `/call` can pause mid-execution with `{"op": "yield", "question": "..."}` and ask the user — at any depth. Auth flows that need an MFA code, refund flows that need a damage assessment, deployments that need a confirmation: the user drops into the exact frame that needs them, then control returns to the stack.
+
+**Headless.** `/fork` is explicitly disabled in non-interactive runs and the Agent SDK. `/call` uses the same `claude --resume … --fork-session` plumbing but drives it over stdin/stdout NDJSON, so it works headless via `claude -p`. Same primitive, no harness gate.
+
+**Observability.** `/fork` runs in a side panel with no external view. unwind-labs ships [unwind](https://pypi.org/project/unwind-labs/), a Python web UI that tails `~/.claude/projects/*.jsonl` and the runtime's `call_traces/` to render a live call tree across all sessions, with each frame's conversation expandable in a side pane.
+
+**Wide fan-out under control.** Each forked `claude` subprocess takes ~0.5–2 GB RSS. A logically wide tree can spawn thousands of pending turns; a module-level semaphore bounded by `CALLSTACK_MAX_CONCURRENT_FORKS` (default 8) keeps physical concurrency under the box's RAM. Excess calls queue instead of OOMing.
+
+`/fork` validated the primitive. `/call` ships the call stack.
+
+## Configuration
+
+### Bounding concurrent `claude` processes
+
+Each forked call spawns a `claude` subprocess (~0.5–2 GB RSS per process). A deep/wide callstack can logically have thousands of pending turns; a module-level semaphore in [plugins/callstack/agent_callstack/channel.py](plugins/callstack/agent_callstack/channel.py) bounds how many run physically at once so the machine doesn't OOM.
+
+Set the cap via the `CALLSTACK_MAX_CONCURRENT_FORKS` environment variable (default `8`):
+
+```bash
+# Tight memory (e.g. 16 GB laptop)
+export CALLSTACK_MAX_CONCURRENT_FORKS=4
+
+# Larger machine (e.g. 64+ GB)
+export CALLSTACK_MAX_CONCURRENT_FORKS=24
+```
+
+Rule of thumb: keep `N × 2 GB` comfortably below total RAM. Excess logical calls queue on the semaphore instead of spawning, so correctness is unaffected — only wall-clock latency.
+
 ## Credits
 
-Concept and implementation by [Amol Kelkar](https://github.com/amolk). The core idea — function-call semantics for LLM agent orchestration (full context inheritance + automatic compaction on return) — was first designed and implemented in [Playbooks AI](https://runplaybooks.ai) (2023-2026). agent-callstack generalizes this to work with any agent harness, starting with Claude Code.
+Concept and implementation by [Amol Kelkar](https://github.com/amolk). The core idea — function-call semantics for LLM agent orchestration (full context inheritance, compact return) — was first designed and implemented in [Playbooks AI](https://runplaybooks.ai) (2023–2026). The `callstack` plugin generalizes it to any agent harness, starting with Claude Code.

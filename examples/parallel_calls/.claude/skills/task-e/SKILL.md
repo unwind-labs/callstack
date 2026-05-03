@@ -1,15 +1,18 @@
-# /task-e — Exchange Rates
+# /task-e — Exchange Rates (fork node)
 
-Look up exchange rates for JPY and GBP.
+Compile exchange rates by delegating to two sub-agents in parallel.
 
 ## Procedure
 
-1. Use `get_exchange_rate` for "JPY"
-2. Use `get_exchange_rate` for "GBP"
+Use `/call` to run both sub-tasks in parallel:
+
+> Run /task-g and /task-h in parallel.
+
+Wait for both to complete. Combine their results.
 
 ## Output
 
 Return a JSON object:
 ```json
-{"agent": "E", "JPY": {rate}, "GBP": {rate}}
+{"agent": "E", "JPY": {from G}, "GBP": {from H}}
 ```

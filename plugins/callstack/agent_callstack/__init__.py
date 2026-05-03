@@ -215,6 +215,11 @@ class Caller:
                 cwd=effective_cwd,
                 frame_key=frame_key,
                 is_nested=True,
+                # Unique per nested invocation so multiple sibling invokes
+                # from the same caller (e.g. a deep-rewrite fork running
+                # specialists, then meta-assessors, then re-author) don't
+                # share — and overwrite — one frame file.
+                instance_id=uuid.uuid4().hex[:12],
             )
         return _InvocationContext(
             invoke_id=self._invoke_id or _new_invoke_id(),
@@ -362,6 +367,12 @@ _ROOT_FRAME_KEY = "root"
 class _InvocationContext:
     """Where a Caller writes its per-invocation artifacts.
 
+    ``instance_id`` disambiguates the frame *file* when multiple nested
+    invocations share the same ``frame_key`` (i.e. the same caller node
+    issues several sibling ``invoke*`` calls). Empty string preserves the
+    legacy ``{frame_key}.yaml`` filename — used for the root frame and for
+    tests that construct the context directly without setting it.
+
     For the root (top-level) invocation `frame_key == "root"` and the Caller
     owns the full invocation directory. For a nested MCP call — detected via
     `CALLSTACK_ROOT_*` env — the Caller reuses the root's invocation directory
@@ -373,6 +384,7 @@ class _InvocationContext:
     cwd: str
     frame_key: str
     is_nested: bool
+    instance_id: str = ""
 
     @property
     def invocation_dir(self) -> Path:
@@ -395,7 +407,17 @@ class _InvocationContext:
         return self.invocation_dir / ".report.lock"
 
     def frame_path(self, key: Optional[str] = None) -> Path:
-        return self.frames_dir / f"{key or self.frame_key}.yaml"
+        # Explicit key override (used by callers that need to read a peer
+        # frame) — keep the legacy single-file filename.
+        if key is not None:
+            return self.frames_dir / f"{key}.yaml"
+        # Production nested invocations carry a unique ``instance_id`` so
+        # multiple sibling invokes from the same caller don't overwrite
+        # each other's frame. The frame's ``frame_key`` field still pins it
+        # to the caller node for grafting.
+        if self.instance_id:
+            return self.frames_dir / f"{self.frame_key}-{self.instance_id}.yaml"
+        return self.frames_dir / f"{self.frame_key}.yaml"
 
     def prefix(self, kind: str) -> str:
         return f"nested_{kind}" if self.is_nested else kind
@@ -465,14 +487,14 @@ class _LiveReporter:
 
     def _rewrite_merged_report(self, *, ended_at: str) -> None:
         frames = _load_frames(self._ctx.frames_dir)
-        root_frame = frames.get(_ROOT_FRAME_KEY)
-        if root_frame is None:
+        root_frames = frames.get(_ROOT_FRAME_KEY)
+        if not root_frames:
             # Nested wrote first and root hasn't written yet — skip; the
             # root's next progress tick will rewrite the merged report.
             return
         doc = _build_merged_report(
-            invoke_id=self._ctx.invoke_id, frames=frames, root_frame=root_frame,
-            ended_at=ended_at,
+            invoke_id=self._ctx.invoke_id, frames=frames,
+            root_frame=root_frames[0], ended_at=ended_at,
         )
         _atomic_yaml_write(self._ctx.report_path, doc)
 
@@ -543,8 +565,15 @@ def _atomic_yaml_write(path: Path, doc: Any) -> None:
 
 # ---------- frame loading + merging ----------
 
-def _load_frames(frames_dir: Path) -> dict[str, dict]:
-    out: dict[str, dict] = {}
+def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
+    """Load every frame file under ``frames_dir``, grouped by ``frame_key``.
+
+    Returns a list per key because a caller node may have issued several
+    sibling nested invocations that all share its frame_key but live in
+    distinct files (disambiguated by ``instance_id`` in the filename).
+    Frames in each list are sorted by ``started_at`` so grafting is stable.
+    """
+    out: dict[str, list[dict]] = {}
     if not frames_dir.is_dir():
         return out
     for p in frames_dir.glob("*.yaml"):
@@ -556,19 +585,21 @@ def _load_frames(frames_dir: Path) -> dict[str, dict]:
             continue
         key = d.get("frame_key")
         if isinstance(key, str):
-            out[key] = d
+            out.setdefault(key, []).append(d)
+    for key in out:
+        out[key].sort(key=lambda f: str(f.get("started_at") or ""))
     return out
 
 
-def _build_merged_report(*, invoke_id: str, frames: dict[str, dict],
+def _build_merged_report(*, invoke_id: str, frames: dict[str, list[dict]],
                          root_frame: dict, ended_at: str) -> dict:
     """Produce the report.yaml document by grafting each non-root frame's
     tree under the node (anywhere in the root's tree) whose session_id
-    matches the frame key."""
+    matches the frame key. Multiple frames may share a key (one per
+    sibling nested invocation); their nodes are concatenated under the
+    matching caller node, in started_at order."""
     root_tree = root_frame.get("tree", {})
     root_nodes = root_tree.get("nodes", []) or []
-    # Recursively splice: at each node, if a frame is keyed by that node's
-    # session_id, attach the frame's tree nodes as its children.
     nested_by_session = {k: v for k, v in frames.items() if k != _ROOT_FRAME_KEY}
     tasks = root_frame.get("tasks") or []
     merged_nodes = [
@@ -596,18 +627,21 @@ def _build_merged_report(*, invoke_id: str, frames: dict[str, dict],
 
 
 def _graft_node(node_dict: dict, input_text: str, *, depth: int,
-                nested_by_session: dict[str, dict]) -> dict:
+                nested_by_session: dict[str, list[dict]]) -> dict:
     """Render one Node.to_dict() into report shape, attaching nested-frame
     children whose frame key matches this node's id (preferred, set by the
-    parent Driver via CALLSTACK_FRAME_KEY) or session_id (fallback)."""
+    parent Driver via CALLSTACK_FRAME_KEY) or session_id (fallback). When
+    multiple frames share that key (sibling nested invocations from the
+    same caller), all of their nodes graft in — sorted by frame
+    ``started_at`` so order is stable."""
     sid = node_dict.get("session_id")
     nid = str(node_dict.get("id", ""))
     children_raw = list(node_dict.get("children") or [])
-    matched_frame = nested_by_session.get(nid) or (
+    matched_frames = nested_by_session.get(nid) or (
         nested_by_session.get(sid) if sid else None
-    )
-    if matched_frame is not None:
-        nested_nodes = (matched_frame.get("tree") or {}).get("nodes") or []
+    ) or []
+    for mf in matched_frames:
+        nested_nodes = (mf.get("tree") or {}).get("nodes") or []
         children_raw.extend(nested_nodes)
     children = [
         _graft_node(c, c.get("task", ""), depth=depth + 1,
@@ -695,25 +729,25 @@ def _format_log_line(ts: str, node: Node, depth: int, *, chain: list[str]) -> st
             f"{node.status:<9} task=\"{task}\"{detail}")
 
 
-def _merge_raw_nodes(frames: dict[str, dict]) -> list[dict]:
+def _merge_raw_nodes(frames: dict[str, list[dict]]) -> list[dict]:
     """Build the full merged tree in raw `Node.to_dict()` shape (full ids
     preserved), recursively grafting every nested frame under the node
     whose id or session matches the frame's key. Used for chain lookups
     that need to reach nodes living inside nested-frame sidecars."""
-    root_frame = frames.get(_ROOT_FRAME_KEY)
-    if root_frame is None:
+    root_frames = frames.get(_ROOT_FRAME_KEY)
+    if not root_frames:
         return []
     nested = {k: v for k, v in frames.items() if k != _ROOT_FRAME_KEY}
-    root_nodes = (root_frame.get("tree") or {}).get("nodes") or []
+    root_nodes = (root_frames[0].get("tree") or {}).get("nodes") or []
     return [_graft_raw(n, nested) for n in root_nodes]
 
 
-def _graft_raw(node: dict, nested: dict[str, dict]) -> dict:
+def _graft_raw(node: dict, nested: dict[str, list[dict]]) -> dict:
     nid = str(node.get("id", ""))
     sid = node.get("session_id")
     children = list(node.get("children") or [])
-    frame = nested.get(nid) or (nested.get(sid) if sid else None)
-    if frame is not None:
+    matched = nested.get(nid) or (nested.get(sid) if sid else None) or []
+    for frame in matched:
         frame_nodes = (frame.get("tree") or {}).get("nodes") or []
         children.extend(frame_nodes)
     return {**node, "children": [_graft_raw(c, nested) for c in children]}
@@ -797,7 +831,7 @@ def _write_invocation_report(
     frames = _load_frames(ctx.frames_dir)
     doc = _build_merged_report(
         invoke_id=invoke_id, frames=frames,
-        root_frame=frames[_ROOT_FRAME_KEY], ended_at=ended_at,
+        root_frame=frames[_ROOT_FRAME_KEY][0], ended_at=ended_at,
     )
     _atomic_yaml_write(ctx.report_path, doc)
     return ctx.report_path

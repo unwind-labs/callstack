@@ -1,6 +1,6 @@
 # Customer Support Refund Agent
 
-This is a working example of [agent-callstack](../../README.md) — the `/call` skill that gives LLM agents function-call semantics (full context down, compact results up).
+This is a working example of [callstack](../../README.md) — the `/call` skill that gives LLM agents function-call semantics (full context down, compact results up).
 
 ## Run it
 

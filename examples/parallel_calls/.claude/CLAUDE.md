@@ -8,7 +8,9 @@ This example demonstrates parallel fork/join with nested parallelism.
 A (orchestrator — this agent)
 ├── B  (weather report — leaf)
 ├── C  (market brief — fork node)
-│   ├── E  (exchange rates — leaf)
+│   ├── E  (exchange rates — fork node)
+│   │   ├── G  (JPY rate — leaf)
+│   │   └── H  (GBP rate — leaf)
 │   └── F  (news headlines — leaf)
 └── D  (stock report — leaf)
 ```

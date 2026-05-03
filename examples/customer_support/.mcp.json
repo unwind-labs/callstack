@@ -3,7 +3,7 @@
     "customer-support-backend": {
       "command": "python3",
       "args": ["mcp_server.py"],
-      "cwd": "/Users/amolk/work/call-agents/examples/customer_support"
+      "cwd": "/Users/amolk/work/agent-callstack/callstack/examples/customer_support"
     }
   }
 }

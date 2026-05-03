@@ -3,6 +3,7 @@
 
 # Call agent traces (generated at runtime)
 **/call_traces/
+**/.claude/callstack/
 
 # User-specific settings
 **/settings.local.json

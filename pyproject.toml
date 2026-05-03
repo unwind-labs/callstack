@@ -1,9 +1,9 @@
 [project]
-name = "agent-callstack"
-version = "0.1.0"
-description = "A call stack for AI agents to run deeply nested workflows reliably. Includes automatic stack-based context compaction."
+name = "callstack"
+version = "0.1.1"
+description = "A call stack for AI agents to run deeply nested workflows reliably."
 requires-python = ">=3.10"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = [".claude/skills/call"]
+pythonpath = ["plugins/callstack"]

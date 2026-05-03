@@ -1,0 +1,1 @@
+Use `/call` like a function call instead of using subagent (Agent tool is banned, NEVER use Agent tool). Calls run with full context so just ask what to do in one line - Do not pass any more context. Run independent tasks concurrently: `/call in parallel do this, do this other thing and yet another thing`, `/call Explore all available moves at the same time`.

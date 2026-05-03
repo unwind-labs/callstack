@@ -1,13 +1,16 @@
 {
-  "name": "agent-callstack",
+  "name": "unwind-labs",
+  "description": "Plugins for deep, interactive, observable agent call stacks on Claude Code.",
   "owner": {
-    "name": "Amol Kelkar"
+    "name": "unwind-labs",
+    "url": "https://github.com/unwind-labs"
   },
+  "repository": "https://github.com/unwind-labs/callstack",
   "plugins": [
     {
-      "name": "call",
-      "source": "./plugins/call",
-      "description": "Fork a sub-agent that inherits full conversation context, executes a task, and returns only the result."
+      "name": "callstack",
+      "source": "./plugins/callstack",
+      "description": "Call stack for agents. Useful for long-horizon and deeply nested tasks. Keeps agent context small; avoids context rot and saves on tokens."
     }
   ]
 }

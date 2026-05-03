@@ -1,7 +1,15 @@
 {
   "name": "callstack",
   "description": "Call stack for agents. Useful for long-horizon and deeply nested tasks. Keeps agent context small; avoids context rot and saves on tokens.",
-  "version": "0.1.1",
+  "version": "0.2.0",
+  "author": {
+    "name": "Amol Kelkar",
+    "url": "https://github.com/amolk"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/unwind-labs/callstack",
+  "repository": "https://github.com/unwind-labs/callstack",
+  "keywords": ["claude-code", "agents", "callstack", "fork", "mcp", "skill"],
   "mcpServers": {
     "call": {
       "command": "python3",

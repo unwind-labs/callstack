@@ -36,9 +36,9 @@ class TestResolve:
         assert loc.resolve("nothing") is None
 
     def test_resolve_prefers_cwd_matching_project(self, tmp_path, projects):
+        from agent_callstack.session import encode_project_dir
         cwd = str(tmp_path / "myproj")
-        encoded = cwd.replace("/", "-")
-        f = _make_session(projects / encoded, "shared", cwd=cwd)
+        f = _make_session(projects / encode_project_dir(cwd), "shared", cwd=cwd)
         # Also a different project dir with the same uuid
         _make_session(projects / "other", "shared")
         loc = SessionLocator(projects_dir=projects)
