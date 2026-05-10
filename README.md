@@ -76,11 +76,11 @@ You: "/call Implement the auth module, then /call write tests for it"
 
 Claude: I'll handle this in two calls to keep my context clean.
 
-[call - invoke (MCP): task="Implement JWT auth in src/auth.py"]
-→ {"status": "complete", "result": "Created src/auth.py with login/logout/refresh endpoints..."}
+[call - call (MCP): tasks=["Implement JWT auth in src/auth.py"]]
+→ {"results": [{"status": "complete", "result": "Created src/auth.py with login/logout/refresh endpoints..."}]}
 
-[call - invoke (MCP): task="Write tests for src/auth.py"]
-→ {"status": "complete", "result": "Created tests/test_auth.py, 12 tests, all passing..."}
+[call - call (MCP): tasks=["Write tests for src/auth.py"]]
+→ {"results": [{"status": "complete", "result": "Created tests/test_auth.py, 12 tests, all passing..."}]}
 ```
 
 For independent tasks, ask for parallel execution and the skill fans them out in a single fork:
@@ -90,10 +90,10 @@ You: "/call profile the API, audit the deps, and benchmark the renderer in paral
 
 Claude: Running all three concurrently.
 
-[call - invoke_parallel (MCP): tasks=["Profile the API", "Audit the deps", "Benchmark the renderer"]]
-→ [{"status": "complete", "result": "API: p99 184ms, hot path is..."},
-   {"status": "complete", "result": "Deps: 3 outdated, 1 CVE in..."},
-   {"status": "complete", "result": "Renderer: 47 fps median, dropped frames at..."}]
+[call - call (MCP): tasks=["Profile the API", "Audit the deps", "Benchmark the renderer"]]
+→ {"results": [{"status": "complete", "result": "API: p99 184ms, hot path is..."},
+              {"status": "complete", "result": "Deps: 3 outdated, 1 CVE in..."},
+              {"status": "complete", "result": "Renderer: 47 fps median, dropped frames at..."}]}
 ```
 
 Each forked session sees the full conversation so far (knew what patterns you discussed, what files exist, what your preferences are) but its intermediate work — the 50 tool calls, the failed attempts, the debugging — never enters the parent's context.
@@ -213,7 +213,7 @@ The runtime intercepts this and responds programmatically — no human in the lo
 {"status": "yield", "question": "Enter the 6-digit MFA code", "session_id": "abc-123"}
 ```
 
-The parent asks the user, then calls `invoke_resume(resume_session="abc-123", user_reply="847291")`. The runtime reloads the tree from disk and continues from exactly where it paused.
+The parent asks the user, then calls `resume(resume_session="abc-123", user_reply="847291")`. The runtime reloads the tree from disk and continues from exactly where it paused.
 
 ### Three control operations
 
@@ -225,7 +225,7 @@ The child runs, does its work, and emits exactly one JSON envelope wrapped in a 
 
 ### Execution tree
 
-The runtime manages an **execution tree** rather than a linear stack. Each node holds an immutable state value (`Pending`, `AwaitingTurn`, `AwaitingChild`, `AwaitingUser`, `Done`, `Failed`); transitions are computed by a pure `step(state, event) -> (new_state, [effects])` function in `agent_callstack.state`. The driver in `agent_callstack.driver` performs the effects (subprocess turns, child spawns) and feeds the resulting events back. For parallel tasks (`invoke_parallel`), sibling root nodes run concurrently via `ThreadPoolExecutor`. When a node yields, the entire subtree is snapshotted to a `.call_tree` sidecar; resume reloads it and re-enters the loop with `UserReplied`.
+The runtime manages an **execution tree** rather than a linear stack. Each node holds an immutable state value (`Pending`, `AwaitingTurn`, `AwaitingChild`, `AwaitingUser`, `Done`, `Failed`); transitions are computed by a pure `step(state, event) -> (new_state, [effects])` function in `agent_callstack.state`. The driver in `agent_callstack.driver` performs the effects (subprocess turns, child spawns) and feeds the resulting events back. When `call` receives multiple tasks, sibling root nodes run concurrently via `ThreadPoolExecutor`. When a node yields, the entire subtree is snapshotted to a `.call_tree` sidecar; resume reloads it and re-enters the loop with `UserReplied`.
 
 ### Package layout
 

@@ -157,7 +157,7 @@ class Caller:
         driver = self._driver_for(parent, ctx=ctx)
         started_at = _utc_now_iso()
         reporter = _LiveReporter(
-            ctx=ctx, kind=ctx.prefix("invoke_resume"),
+            ctx=ctx, kind=ctx.prefix("call_resume"),
             tasks=[n.task for n in tree.nodes], started_at=started_at,
         )
         driver.on_progress = reporter
@@ -175,7 +175,7 @@ class Caller:
         ctx = self._resolve_invocation_context(parent)
         driver = self._driver_for(parent, ctx=ctx, depth_base=depth)
         started_at = _utc_now_iso()
-        kind = ctx.prefix("invoke_parallel" if len(tasks) > 1 else "invoke")
+        kind = ctx.prefix("call")
         reporter = _LiveReporter(ctx=ctx, kind=kind, tasks=list(tasks),
                                  started_at=started_at)
         driver.on_progress = reporter

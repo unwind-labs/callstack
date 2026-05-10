@@ -1,8 +1,12 @@
 """MCP server: thin shim over agent_callstack.
 
-Exposes `invoke`, `invoke_parallel`, and `invoke_resume` as MCP tools by
-calling the runtime in-process. The previous version shelled out to
-callstack.py via subprocess.exec — that round-trip is gone.
+Exposes `call` and `resume` as MCP tools by calling the runtime in-process.
+The previous version shelled out to callstack.py via subprocess.exec — that
+round-trip is gone.
+
+`call` always takes `tasks: list[str]` (single or multiple) and always
+returns `{invoke_id, report_path, results: [...]}`. `resume` continues a
+previously yielded session.
 
 Each call generates an `invoke_id` and writes:
   - `{cwd}/.claude/callstack/log/{invoke_id}/call_trace.jsonl`  per-turn trace
@@ -91,36 +95,16 @@ def _build_caller(session: str, model: str, cwd: str, timeout: int,
 
 
 @mcp.tool()
-async def invoke(task: str, timeout: int = 300, session_id: str = "",
-                 model: str = "", cwd: str = "") -> str:
-    """Fork a sub-agent to execute `task`. The child inherits the parent's full
-    conversation context. Only the result comes back — intermediate work is
-    discarded. Use for substantial multi-step tasks, not simple commands.
+async def call(tasks: list[str], timeout: int = 300, session_id: str = "",
+               model: str = "", cwd: str = "") -> str:
+    """Fork sub-agents to execute `tasks` concurrently. Each child inherits
+    the parent's full conversation context; only results come back.
+    Always pass an array — one task or many. Tasks must be independent
+    when more than one is supplied.
 
-    Returns an envelope including `invoke_id` and `report_path`; the YAML
-    report contains the full nested call tree with inputs and outputs."""
-    invoke_id, log_dir = _invocation_identity(cwd)
-    caller = _build_caller(session_id, model, cwd, timeout, invoke_id, log_dir)
-    envelope = {"invoke_id": invoke_id, "report_path": _report_path(log_dir, invoke_id)}
-    try:
-        result = await asyncio.to_thread(caller.call, task)
-        envelope.update(_result_to_dict(result))
-    except CallYielded as y:
-        envelope.update(_result_to_dict(y))
-    except CallFailed as f:
-        envelope.update(_result_to_dict(f))
-    return json.dumps(envelope)
-
-
-@mcp.tool()
-async def invoke_parallel(tasks: list[str], timeout: int = 300, session_id: str = "",
-                          model: str = "", cwd: str = "") -> str:
-    """Fork multiple sub-agents to execute tasks concurrently. Each gets the
-    parent's full context. Results are collected when all complete. Use when
-    tasks are independent and need true parallelism.
-
-    Returns an envelope including `invoke_id` and `report_path`; all tasks
-    share one invocation and one YAML report listing the full call tree."""
+    Returns an envelope `{invoke_id, report_path, results: [...]}`; all
+    tasks share one invocation and one YAML report listing the full
+    nested call tree with inputs and outputs."""
     invoke_id, log_dir = _invocation_identity(cwd)
     caller = _build_caller(session_id, model, cwd, timeout, invoke_id, log_dir)
     multi: MultiResult = await asyncio.to_thread(caller.call_many, tasks)
@@ -132,8 +116,8 @@ async def invoke_parallel(tasks: list[str], timeout: int = 300, session_id: str 
 
 
 @mcp.tool()
-async def invoke_resume(resume_session: str, user_reply: str,
-                        timeout: int = 300, cwd: str = "") -> str:
+async def resume(resume_session: str, user_reply: str,
+                 timeout: int = 300, cwd: str = "") -> str:
     """Resume a previously yielded call session with the user's reply.
 
     Use after a call returned status 'yield' — pass back the session_id and the

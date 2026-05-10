@@ -37,7 +37,7 @@ def test_report_serializes_single_root(tmp_path):
     tree = Tree(root_session=parent, nodes=[root], base_depth=0)
 
     path = _write_invocation_report(
-        log_dir=tmp_path / "log", invoke_id="inv1", kind="invoke",
+        log_dir=tmp_path / "log", invoke_id="inv1", kind="call",
         tasks=["top task"], tree=tree, cwd="/some/cwd",
         started_at="2026-04-19T14:00:00+00:00",
         ended_at="2026-04-19T14:00:05+00:00",
@@ -46,7 +46,7 @@ def test_report_serializes_single_root(tmp_path):
     assert path == tmp_path / "log" / "inv1" / "report.yaml"
     doc = yaml.safe_load(path.read_text())
     assert doc["invoke_id"] == "inv1"
-    assert doc["kind"] == "invoke"
+    assert doc["kind"] == "call"
     assert doc["status"] == "complete"
     assert doc["cwd"] == "/some/cwd"
     assert doc["parent_session"] == "parent"
@@ -66,7 +66,7 @@ def test_report_nests_children(tmp_path):
     tree = Tree(root_session=parent, nodes=[root], base_depth=0)
 
     path = _write_invocation_report(
-        log_dir=tmp_path / "log", invoke_id="inv2", kind="invoke",
+        log_dir=tmp_path / "log", invoke_id="inv2", kind="call",
         tasks=["root task"], tree=tree, cwd="/cwd",
         started_at="s", ended_at="e",
     )
@@ -88,7 +88,7 @@ def test_report_overall_status_reflects_leaves(tmp_path):
     tree = Tree(root_session=parent, nodes=[ok, failed], base_depth=0)
 
     path = _write_invocation_report(
-        log_dir=tmp_path / "log", invoke_id="inv3", kind="invoke_parallel",
+        log_dir=tmp_path / "log", invoke_id="inv3", kind="call",
         tasks=["a", "b"], tree=tree, cwd="/cwd",
         started_at="s", ended_at="e",
     )
@@ -107,7 +107,7 @@ def test_report_writes_yaml_at_expected_path(tmp_path):
     log_dir = tmp_path / "deep" / "nested" / "log"
     assert not log_dir.exists()
     path = _write_invocation_report(
-        log_dir=log_dir, invoke_id="inv4", kind="invoke",
+        log_dir=log_dir, invoke_id="inv4", kind="call",
         tasks=["x"], tree=tree, cwd="/cwd",
         started_at="s", ended_at="e",
     )
@@ -143,7 +143,7 @@ def test_driver_progress_callback_fires_per_transition(tmp_path):
         store=TreeStore(),
         cwd=str(tmp_path), timeout=10, max_depth=5,
     )
-    reporter = _LiveReporter(ctx=ctx, kind="invoke", tasks=["do it"], started_at="s")
+    reporter = _LiveReporter(ctx=ctx, kind="call", tasks=["do it"], started_at="s")
 
     def spy(tree):
         reporter(tree)
@@ -192,7 +192,7 @@ def test_merged_report_grafts_nested_frame_under_calling_node(tmp_path):
         invoke_id="inv-merge", log_dir=log_dir, cwd="/cwd",
         frame_key=_ROOT_FRAME_KEY, is_nested=False,
     )
-    root_reporter = _LiveReporter(ctx=root_ctx, kind="invoke_parallel",
+    root_reporter = _LiveReporter(ctx=root_ctx, kind="call",
                                   tasks=["/task-b", "/task-c", "/task-d"],
                                   started_at="s")
 
@@ -207,7 +207,7 @@ def test_merged_report_grafts_nested_frame_under_calling_node(tmp_path):
         frame_key="sess-C",  # the calling session
         is_nested=True,
     )
-    nested_reporter = _LiveReporter(ctx=nested_ctx, kind="nested_invoke_parallel",
+    nested_reporter = _LiveReporter(ctx=nested_ctx, kind="nested_call",
                                     tasks=["/task-e", "/task-f"], started_at="s")
 
     # Realistic ordering: root writes at least one snapshot (so root.yaml
@@ -265,7 +265,7 @@ def test_three_level_chain_prefix(tmp_path):
         invoke_id="inv-3lvl", log_dir=log_dir, cwd="/cwd",
         frame_key=_ROOT_FRAME_KEY, is_nested=False,
     )
-    root_reporter = _LiveReporter(ctx=root_ctx, kind="invoke",
+    root_reporter = _LiveReporter(ctx=root_ctx, kind="call",
                                   tasks=["/task-c"], started_at="s")
 
     # Level-2 frame: E (caller = C)
@@ -276,7 +276,7 @@ def test_three_level_chain_prefix(tmp_path):
         invoke_id="inv-3lvl", log_dir=log_dir, cwd="/cwd",
         frame_key=c.id, is_nested=True,
     )
-    e_reporter = _LiveReporter(ctx=e_ctx, kind="nested_invoke",
+    e_reporter = _LiveReporter(ctx=e_ctx, kind="nested_call",
                                tasks=["/task-e"], started_at="s")
 
     # Level-3 frame: G (caller = E)
@@ -287,7 +287,7 @@ def test_three_level_chain_prefix(tmp_path):
         invoke_id="inv-3lvl", log_dir=log_dir, cwd="/cwd",
         frame_key=e.id, is_nested=True,
     )
-    g_reporter = _LiveReporter(ctx=g_ctx, kind="nested_invoke",
+    g_reporter = _LiveReporter(ctx=g_ctx, kind="nested_call",
                                tasks=["/task-g"], started_at="s")
 
     # Order matters for chain lookups: root and E must exist on disk
@@ -326,7 +326,7 @@ def test_merge_by_node_id_wins_over_sessions(tmp_path):
         invoke_id="inv-by-nodeid", log_dir=log_dir, cwd="/cwd",
         frame_key=_ROOT_FRAME_KEY, is_nested=False,
     )
-    root_reporter = _LiveReporter(ctx=root_ctx, kind="invoke_parallel",
+    root_reporter = _LiveReporter(ctx=root_ctx, kind="call",
                                   tasks=["/task-b", "/task-c", "/task-d"],
                                   started_at="s")
 
@@ -341,7 +341,7 @@ def test_merge_by_node_id_wins_over_sessions(tmp_path):
         frame_key=c.id,
         is_nested=True,
     )
-    nested_reporter = _LiveReporter(ctx=nested_ctx, kind="nested_invoke_parallel",
+    nested_reporter = _LiveReporter(ctx=nested_ctx, kind="nested_call",
                                     tasks=["/task-e", "/task-f"], started_at="s")
 
     root_reporter(root_tree)
@@ -411,7 +411,7 @@ def test_sibling_nested_invocations_dont_overwrite_each_others_frame(tmp_path):
         invoke_id="inv-siblings", log_dir=log_dir, cwd="/cwd",
         frame_key=_ROOT_FRAME_KEY, is_nested=False,
     )
-    root_reporter = _LiveReporter(ctx=root_ctx, kind="invoke",
+    root_reporter = _LiveReporter(ctx=root_ctx, kind="call",
                                   tasks=["/task-c"], started_at="s0")
 
     # Two sibling nested invocations from inside C, each with its own
@@ -424,7 +424,7 @@ def test_sibling_nested_invocations_dont_overwrite_each_others_frame(tmp_path):
         invoke_id="inv-siblings", log_dir=log_dir, cwd="/cwd",
         frame_key=c.id, is_nested=True, instance_id="aaa111",
     )
-    e_reporter = _LiveReporter(ctx=e_ctx, kind="nested_invoke",
+    e_reporter = _LiveReporter(ctx=e_ctx, kind="nested_call",
                                tasks=["/task-e"], started_at="s1")
 
     f = _done_node("f0000000", "/task-f", "F done", session_id="sess-F")
@@ -434,7 +434,7 @@ def test_sibling_nested_invocations_dont_overwrite_each_others_frame(tmp_path):
         invoke_id="inv-siblings", log_dir=log_dir, cwd="/cwd",
         frame_key=c.id, is_nested=True, instance_id="bbb222",
     )
-    f_reporter = _LiveReporter(ctx=f_ctx, kind="nested_invoke",
+    f_reporter = _LiveReporter(ctx=f_ctx, kind="nested_call",
                                tasks=["/task-f"], started_at="s2")
 
     root_reporter(root_tree)
@@ -467,7 +467,7 @@ def test_nested_reporter_is_noop_if_root_frame_absent(tmp_path):
         invoke_id="inv-solo-nested", log_dir=log_dir, cwd="/cwd",
         frame_key="sess-C", is_nested=True,
     )
-    reporter = _LiveReporter(ctx=ctx, kind="nested_invoke", tasks=["/task-e"],
+    reporter = _LiveReporter(ctx=ctx, kind="nested_call", tasks=["/task-e"],
                              started_at="s")
     reporter.finalize(tree)
 

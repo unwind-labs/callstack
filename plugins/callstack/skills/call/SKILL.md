@@ -16,27 +16,21 @@ When you execute a task as a call, you get back compact execution summary, resul
 
 ## Execution
 
-### Single task
-
-For a single task, use the `invoke` MCP tool:
+Use the `call` MCP tool. It always takes an array of tasks — pass one entry for a single task, multiple entries for concurrent execution. Each task gets the parent's full context.
 
 ```
-invoke(task="Implement and test the authentication module using the patterns we discussed", timeout=300)
+call(tasks=["Implement and test the authentication module using the patterns we discussed"], timeout=300)
 ```
 
-### Parallel tasks
-
-Use `invoke_parallel` MCP tool for concurrent execution:
-
 ```
-invoke_parallel(tasks=["Apply fix to A", "Apply fix to B"], timeout=300)
+call(tasks=["Apply fix to A", "Apply fix to B"], timeout=300)
 ```
 
 Don't pass extra context, just write the task command. Each task will have full context of the caller.
 
 ### Response format
 
-Each /call task returns a JSON response. There are 3 types of responses -
+`call` returns `{invoke_id, report_path, results: [...]}`. Each entry in `results` is one of 3 response types:
 
 #### Completion
 ```json
@@ -71,10 +65,10 @@ When the forked session needs a user input
 {"status": "yield", "question": "Enter the MFA code", "session_id": "abc-123", ...}
 ```
 
-Resume with the user's answer using the `invoke_resume` MCP tool:
+Resume with the user's answer using the `resume` MCP tool:
 
 ```
-invoke_resume(resume_session="abc-123", user_reply="847291", timeout=300)
+resume(resume_session="abc-123", user_reply="847291", timeout=300)
 ```
 
 ## Critical rules
