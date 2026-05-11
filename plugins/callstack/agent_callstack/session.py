@@ -129,29 +129,24 @@ class SessionLocator:
         return None
 
     def _most_recent(self, cwd: Optional[str]) -> Optional[SessionRef]:
-        """Most recently modified .jsonl across project dirs (cwd-matching first)."""
-        search: list[Path] = []
-        primary = self._project_dir_for(cwd)
-        if primary:
-            search.append(primary)
-        if self._projects_dir.is_dir():
-            for d in sorted(self._projects_dir.iterdir(),
-                            key=lambda p: p.stat().st_mtime if p.is_dir() else 0,
-                            reverse=True):
-                if d.is_dir() and d not in search:
-                    search.append(d)
+        """Most recently modified .jsonl in the cwd-matching project dir.
 
+        Scoped to one project: cross-project guessing is unsafe — the
+        most-recently-touched session in some unrelated project dir is
+        never "the caller", and conflating them produces a wrong
+        parent_session in the resulting report."""
+        primary = self._project_dir_for(cwd)
+        if not primary:
+            return None
         best: Optional[Path] = None
         best_mtime: float = 0.0
-        for d in search:
-            for f in d.glob("*.jsonl"):
-                try:
-                    m = f.stat().st_mtime
-                    if m > best_mtime:
-                        best_mtime, best = m, f
-                except OSError:
-                    continue
-
+        for f in primary.glob("*.jsonl"):
+            try:
+                m = f.stat().st_mtime
+            except OSError:
+                continue
+            if m > best_mtime:
+                best_mtime, best = m, f
         if best is None:
             return None
         return SessionRef(session_id=best.stem, file=best)

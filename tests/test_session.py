@@ -84,15 +84,48 @@ class TestLocate:
         assert ref.session_id == "uuid-env"
 
     def test_mtime_fallback_picks_most_recent(self, projects, monkeypatch):
-        old = _make_session(projects / "p", "old")
-        new = _make_session(projects / "p", "new")
+        from agent_callstack.session import encode_project_dir
+        cwd = "/some/proj"
+        proj = projects / encode_project_dir(cwd)
+        old = _make_session(proj, "old", cwd=cwd)
+        new = _make_session(proj, "new", cwd=cwd)
         os.utime(old, (1000, 1000))
         os.utime(new, (2000, 2000))
         monkeypatch.delenv("CALLSTACK_PARENT_SESSION", raising=False)
         monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
         loc = SessionLocator(projects_dir=projects)
-        ref = loc.locate()
+        ref = loc.locate(cwd=cwd)
         assert ref.session_id == "new"
+
+    def test_mtime_fallback_ignores_other_project_dirs(self, projects, monkeypatch):
+        """A newer .jsonl in an unrelated project dir must NOT be chosen as
+        the parent. Cross-project guessing is what produced wrong
+        parent_session values in real reports."""
+        from agent_callstack.session import encode_project_dir
+        cwd = "/proj/here"
+        primary = projects / encode_project_dir(cwd)
+        old = _make_session(primary, "in-cwd", cwd=cwd)
+        new = _make_session(projects / "other-proj", "elsewhere", cwd="/other")
+        os.utime(old, (1000, 1000))
+        os.utime(new, (9999, 9999))
+        monkeypatch.delenv("CALLSTACK_PARENT_SESSION", raising=False)
+        monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+        loc = SessionLocator(projects_dir=projects)
+        ref = loc.locate(cwd=cwd)
+        assert ref.session_id == "in-cwd"
+
+    def test_mtime_fallback_raises_when_primary_empty(self, projects, monkeypatch):
+        """If the cwd-matching project dir has no sessions, refuse rather
+        than reach into other projects."""
+        from agent_callstack.session import encode_project_dir
+        cwd = "/empty/proj"
+        (projects / encode_project_dir(cwd)).mkdir(parents=True)
+        _make_session(projects / "other-proj", "elsewhere", cwd="/other")
+        monkeypatch.delenv("CALLSTACK_PARENT_SESSION", raising=False)
+        monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+        loc = SessionLocator(projects_dir=projects)
+        with pytest.raises(RuntimeError, match="Could not discover"):
+            loc.locate(cwd=cwd)
 
     def test_no_session_anywhere_raises(self, projects, monkeypatch):
         monkeypatch.delenv("CALLSTACK_PARENT_SESSION", raising=False)
