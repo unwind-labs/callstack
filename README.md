@@ -20,6 +20,8 @@ LLMs are notoriously poor at maintaining a deep call chain and reliably unwindin
 - **Interactivity at any depth.** A `/call` can pause and ask the user from any frame — without paying the cost of bubbling the question through every intermediate node (which would otherwise require, and waste, an LLM turn at each level).
 - **Calls run in the parent's full context** — so the invocation is one line, not a hand-rolled context dump.
 - **Calls run in the parent's full context** — so the child understands what tasks will follow, and shapes its return payload to include what the caller will need next.
+- **Fork or fresh, your choice.** `context="fork"` (default) inherits the parent transcript via `--fork-session`. `context="fresh"` launches an isolated session — same semantics as Claude Code's built-in `Agent`/`Task` tool, but with nested calls, yield/resume, and a merged report tree on top. Subagents become a strict subset of `/call`.
+- **Cross-project calls.** Pass `cwd` (with `{PWD}` substitution for the caller's project) to run the child against a different repo. Useful for "look at the sibling repo and tell me X" without leaving the current session. Fork mode is rejected across projects (the transcript and cwd would disagree); fresh mode handles it cleanly.
 
 ```
 Agent "implement app.."
@@ -100,6 +102,30 @@ Each forked session sees the full conversation so far (knew what patterns you di
 
 This is unlike subagents which do not see the conversation context, so all context has to be hand-rolled and passed in. Subagents are right for genuinely independent tasks; most workflow steps benefit from inherited context.
 
+### Fresh sessions and cross-project calls
+
+When you do want subagent-style isolation — an independent worker that shouldn't see the parent transcript — pass `context="fresh"`:
+
+```
+You: "/call audit src/auth for OWASP top-10 issues in a fresh session"
+
+[call - call (MCP): tasks=["Audit src/auth for OWASP top-10 issues"], context="fresh"]
+→ {"results": [{"status": "complete", "result": "3 findings: ..."}]}
+```
+
+Fresh-mode children still emit `call`/`yield`/`return` envelopes, so they can themselves nest further calls, pause for user input, and contribute frames to the same merged `report.yaml`. They just don't inherit the parent's conversation — include any needed context in the task string.
+
+To run a child against a different repo, pass `cwd`. `{PWD}` resolves to the caller's project folder:
+
+```
+[call - call (MCP):
+   tasks=["List top-level files and summarize the README"],
+   context="fresh",
+   cwd="{PWD}/../sibling-repo"]
+```
+
+`context="fork"` combined with a `cwd` in a different project is rejected — the forked transcript would be tied to project A while the cwd points at project B, which is incoherent. Cross-project work must be `fresh`.
+
 ## Example: customer support refund
 
 The `examples/customer_support/` directory demonstrates a complete workflow — customer authentication with MFA, order lookup, and refund processing — using skills and MCP tools.
@@ -179,9 +205,9 @@ Each parallel branch independently supports the full `call`/`yield`/`return` pro
 
 Claude Code stores each conversation as a JSONL session file on disk.
 
-### Session fork
+### Session fork (default) and fresh sessions
 
-When you `/call`, the runtime (the `agent_callstack` package) discovers the parent's session file (via `CLAUDE_SESSION_ID` env var or by finding the most recently modified session JSONL) and spawns a forked child:
+When you `/call` with the default `context="fork"`, the runtime (the `agent_callstack` package) discovers the parent's session file (via `CLAUDE_SESSION_ID` env var or by finding the most recently modified session JSONL in the caller's project) and spawns a forked child:
 
 ```
 claude --resume <session-id> --fork-session \
@@ -190,6 +216,10 @@ claude --resume <session-id> --fork-session \
 ```
 
 `--fork-session` creates an independent copy of the session — the child wakes up with the parent's full message history plus the new task appended. It doesn't know it's a fork. It just continues the conversation.
+
+With `context="fresh"` the runtime drops `--resume` and `--fork-session`, so `claude` starts a brand-new session. Only the task string crosses the boundary. The same NDJSON protocol still drives it, so fresh children retain `call`/`yield`/`return` semantics, depth, and report grafting — just without inherited context. Nested calls *inside* a fresh child still fork from that child's session (a fresh root can grow a normal sub-tree of forks beneath it).
+
+When `cwd` is passed and resolves to a different project than the caller's, the call is tagged `fresh_cross_project` — the runtime locates the parent session in the caller's project (not the child's redirected cwd) and propagates that identity into the merged report.
 
 ### Bidirectional JSON protocol
 
