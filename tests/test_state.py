@@ -24,10 +24,24 @@ class TestStart:
         assert len(effects) == 1
         eff = effects[0]
         assert isinstance(eff, st.RunTurn)
-        assert eff.fork is True
+        assert eff.mode == "fork"
         assert eff.source_session_id == "parent-sess"
         assert "do thing" in eff.prompt
         assert "[n1]" in eff.prompt
+
+    def test_pending_with_fresh_context_emits_fresh_runturn(self):
+        node = st.Pending(parent_session_id="parent-sess", task="do thing",
+                          task_id="n1", context_mode="fresh")
+        _, effects = st.step(node, st.Start())
+        eff = effects[0]
+        assert isinstance(eff, st.RunTurn)
+        assert eff.mode == "fresh"
+
+    def test_pending_default_context_mode_is_fork(self):
+        # Backward compat: Pending without context_mode kwarg behaves as fork.
+        node = st.Pending(parent_session_id="p", task="t")
+        _, effects = st.step(node, st.Start())
+        assert effects[0].mode == "fork"
 
 
 # ---------- AwaitingTurn → terminal/intermediate ----------
@@ -97,7 +111,7 @@ class TestChildEvents:
         assert len(effects) == 1
         eff = effects[0]
         assert isinstance(eff, st.RunTurn)
-        assert eff.fork is False
+        assert eff.mode == "resume"
         assert eff.source_session_id == "sess"
         assert "Your child completed" in eff.prompt
         assert "data" in eff.prompt
@@ -131,7 +145,7 @@ class TestUserResume:
         assert len(effects) == 1
         eff = effects[0]
         assert isinstance(eff, st.RunTurn)
-        assert eff.fork is False
+        assert eff.mode == "resume"
         assert eff.source_session_id == "sess"
         assert eff.prompt == "847291"
 
@@ -178,7 +192,7 @@ class TestFullTrace:
         # 1. Start
         s, effs = st.step(s, st.Start())
         assert isinstance(s, st.AwaitingTurn)
-        assert isinstance(effs[0], st.RunTurn) and effs[0].fork
+        assert isinstance(effs[0], st.RunTurn) and effs[0].mode == "fork"
 
         # 2. Turn produces a CALL
         s, effs = st.step(s, st.TurnCompleted(envelope=Call(task="sub"),
@@ -191,7 +205,7 @@ class TestFullTrace:
         # 3. Child returns
         s, effs = st.step(s, st.ChildDone(child_id=child_id, result="42"))
         assert isinstance(s, st.AwaitingTurn)
-        assert isinstance(effs[0], st.RunTurn) and not effs[0].fork
+        assert isinstance(effs[0], st.RunTurn) and effs[0].mode == "resume"
 
         # 4. Self resumes and returns
         s, effs = st.step(s, st.TurnCompleted(envelope=Return(result="done"),

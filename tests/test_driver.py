@@ -55,7 +55,53 @@ class TestRunSingleTask:
         assert node.session_id == "child-1"
         assert node.parent_lines == 3  # parent file had 3 lines
         # The first call should be a fork.
-        assert ch.log[0][2] is True
+        assert ch.log[0][2] == "fork"
+        assert node.call_type == "fork"
+
+    def test_fresh_context_emits_fresh_mode(self, tmp_path, parent_session):
+        ch = ScriptedChannel().respond(_envelope("return", result="hi"), "child-x")
+        driver = _make_driver(tmp_path, ch)
+
+        tree = driver.run(parent_session, ["task"], context="fresh")
+        node = tree.nodes[0]
+
+        assert ch.log[0][2] == "fresh"
+        # Same project (driver.cwd is tmp_path; parent.cwd is also tmp_path
+        # because the parent JSONL is written there) → call_type is "fresh".
+        assert node.call_type == "fresh"
+        # Fresh sessions have no inherited transcript.
+        assert node.parent_lines == 0
+
+    def test_fresh_cross_project_call_type(self, tmp_path):
+        # Parent session lives in tmp_path/A; driver.cwd points at tmp_path/B.
+        proj_a = tmp_path / "A"
+        proj_b = tmp_path / "B"
+        proj_a.mkdir()
+        proj_b.mkdir()
+        parent_file = proj_a / "parent.jsonl"
+        parent_file.write_text(json.dumps({"cwd": str(proj_a), "type": "user"}) + "\n")
+        parent = SessionRef(session_id="p", file=parent_file)
+
+        ch = ScriptedChannel().respond(_envelope("return", result="ok"), "child-y")
+        driver = Driver(
+            channel=ch,
+            locator=SessionLocator(projects_dir=tmp_path / "_proj"),
+            trace=TraceWriter(tmp_path / "traces"),
+            store=TreeStore(),
+            cwd=str(proj_b),
+            timeout=10,
+        )
+
+        tree = driver.run(parent, ["task"], context="fresh")
+        node = tree.nodes[0]
+        assert ch.log[0][2] == "fresh"
+        assert node.call_type == "fresh_cross_project"
+
+    def test_invalid_context_raises(self, tmp_path, parent_session):
+        ch = ScriptedChannel()
+        driver = _make_driver(tmp_path, ch)
+        with pytest.raises(ValueError):
+            driver.run(parent_session, ["t"], context="bogus")
 
     def test_yield_pauses_tree(self, tmp_path, parent_session):
         ch = ScriptedChannel().respond(_envelope("yield", question="MFA?"), "child-1")
@@ -83,9 +129,9 @@ class TestRunSingleTask:
         assert root.result == "all done"
         assert len(root.children) == 1
         assert root.children[0].result == "sub-result"
-        # Parent's resume must be NON-fork; child's fork is True.
-        forks = [entry[2] for entry in ch.log]
-        assert forks == [True, True, False]
+        # Parent's resume must be a resume; child's first turn is a fork.
+        modes = [entry[2] for entry in ch.log]
+        assert modes == ["fork", "fork", "resume"]
 
     def test_child_yield_propagates_pause(self, tmp_path, parent_session):
         """Child yields → tree is paused; parent stays in awaiting_child."""
@@ -213,9 +259,9 @@ class TestResume:
         leaf2 = loaded.nodes[0]
         assert leaf2.status == "complete"
         assert leaf2.result == "authenticated"
-        # The resume turn must NOT be a fork.
+        # The resume turn must use mode="resume", not a new fork.
         last_call = ch.log[-1]
-        assert last_call[2] is False
+        assert last_call[2] == "resume"
         assert last_call[1] == "847291"
 
     def test_resume_unblocks_parent(self, tmp_path, parent_session):

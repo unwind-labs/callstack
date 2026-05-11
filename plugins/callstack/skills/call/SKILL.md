@@ -28,6 +28,30 @@ call(tasks=["Apply fix to A", "Apply fix to B"], timeout=300)
 
 Don't pass extra context, just write the task command. Each task will have full context of the caller.
 
+### Modes
+
+The `context` parameter controls how each task's underlying claude session is launched:
+
+- `context="fork"` (default) — child inherits the parent's full conversation via `--resume + --fork-session`. Use for "delegate a follow-up step the child already understands."
+- `context="fresh"` — brand-new isolated session. Only the task string crosses the boundary. Same semantics as Claude Code's built-in `Agent` / `Task` tool. Use when you want an independent worker that shouldn't see the parent transcript.
+
+```
+call(tasks=["Audit src/auth for OWASP top-10 issues"], context="fresh")
+```
+
+In `fresh` mode you DO need to include any context the child needs **inside the task string** — the parent conversation is not inherited.
+
+### Cross-project calls
+
+Pass `cwd` with `{PWD}` substitution to run the child in a different project folder. Only valid with `context="fresh"` (forking into another project would produce a session with a transcript tied to project A but a cwd of project B — confusing and error-prone, so it's rejected with an explicit error).
+
+```
+call(tasks=["List the top-level files and summarize the README"],
+     context="fresh", cwd="{PWD}/../sibling-repo")
+```
+
+`{PWD}` substitutes to the caller's project folder. The child's report still grafts under the caller's `report.yaml`, so the call tree stays unified.
+
 ### Response format
 
 `call` returns `{invoke_id, report_path, results: [...]}`. Each entry in `results` is one of 3 response types:
@@ -73,5 +97,6 @@ resume(resume_session="abc-123", user_reply="847291", timeout=300)
 
 ## Critical rules
 
-- **Do NOT send your context** — the forked session already has all your context, so just say what task in 1 line
+- **Do NOT send your context in `fork` mode** — the forked session already has all your context, so just say what task in 1 line. In `fresh` mode, do include any context the child needs in the task string.
 - **Forked sessions can themselves call** (up to max depth of 5)
+- **`fork` + different `cwd` is rejected** — combining `context="fork"` with a `cwd` that resolves to a different project folder returns an error. Use `context="fresh"` for cross-project work.

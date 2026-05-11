@@ -75,7 +75,7 @@ class Channel(Protocol):
         source_session_id: str,
         prompt: str,
         *,
-        fork: bool,
+        mode: str,
         cwd: Optional[str] = None,
         timeout: int = 300,
         extra_env: Optional[dict] = None,
@@ -108,21 +108,26 @@ class ClaudeChannel:
         source_session_id: str,
         prompt: str,
         *,
-        fork: bool,
+        mode: str,
         cwd: Optional[str] = None,
         timeout: int = 300,
         extra_env: Optional[dict] = None,
         on_session_id: Optional[Callable[[str], None]] = None,
     ) -> TurnResult:
-        cmd = self._build_cmd(source_session_id, fork)
+        if mode not in ("fork", "fresh", "resume"):
+            raise ValueError(f"invalid run_turn mode: {mode!r}")
+        cmd = self._build_cmd(source_session_id, mode)
         effective_cwd = cwd or os.getcwd()
         env = {**os.environ, **self._env_extra, **(extra_env or {})}
 
-        log_path = f"/tmp/callstack_{source_session_id[:8]}_{uuid.uuid4().hex[:8]}.log"
+        # `source_session_id` is empty in fresh mode — use a synthetic stem so
+        # the log filename stays meaningful and unique.
+        stem = source_session_id[:8] if source_session_id else "fresh"
+        log_path = f"/tmp/callstack_{stem}_{uuid.uuid4().hex[:8]}.log"
         log = open(log_path, "w")
         log.write(f"cmd: {' '.join(cmd)}\ncwd: {effective_cwd}\n")
         log.flush()
-        print(f"[callstack] turn (fork={fork}, source={source_session_id[:8]}..., "
+        print(f"[callstack] turn (mode={mode}, source={stem}..., "
               f"cwd={effective_cwd}, log={log_path})", file=sys.stderr)
 
         start = time.time()
@@ -222,18 +227,20 @@ class ClaudeChannel:
 
     # ---- private helpers ----
 
-    def _build_cmd(self, source_session_id: str, fork: bool) -> list[str]:
+    def _build_cmd(self, source_session_id: str, mode: str) -> list[str]:
         cmd = [
             "claude",
             "--output-format", "stream-json",
             "--input-format", "stream-json",
             "--verbose",
-            "--resume", source_session_id,
             "--permission-prompt-tool", "stdio",
             "--permission-mode", self._permission_mode,
         ]
-        if fork:
-            cmd.append("--fork-session")
+        if mode == "fork":
+            cmd.extend(["--resume", source_session_id, "--fork-session"])
+        elif mode == "resume":
+            cmd.extend(["--resume", source_session_id])
+        # mode == "fresh": no --resume, no --fork-session — brand-new session.
         if self._model:
             cmd.extend(["--model", self._model])
         return cmd
@@ -354,7 +361,7 @@ class ClaudeChannel:
 # Test channel
 # --------------------------------------------------------------------------
 
-ScriptedResponse = Callable[[str, str, bool], TurnResult]
+ScriptedResponse = Callable[[str, str, str], TurnResult]
 ScriptedEntry = Union[tuple[str, str], ScriptedResponse]
 
 
@@ -363,11 +370,11 @@ class ScriptedChannel:
     """Test channel that returns scripted text for each turn.
 
     Each entry in `responses` is either a `(text, session_id)` pair or a
-    callable invoked with `(source_session_id, prompt, fork)`. `log` records
+    callable invoked with `(source_session_id, prompt, mode)`. `log` records
     every call so tests can assert on the full sequence."""
 
     responses: list[ScriptedEntry] = field(default_factory=list)
-    log: list[tuple[str, str, bool]] = field(default_factory=list)
+    log: list[tuple[str, str, str]] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def respond(self, text: str, session_id: str = "scripted-session") -> "ScriptedChannel":
@@ -385,7 +392,7 @@ class ScriptedChannel:
         source_session_id: str,
         prompt: str,
         *,
-        fork: bool,
+        mode: str,
         cwd: Optional[str] = None,
         timeout: int = 300,
         extra_env: Optional[dict] = None,
@@ -396,12 +403,12 @@ class ScriptedChannel:
             if not self.responses:
                 raise AssertionError(
                     f"ScriptedChannel exhausted; "
-                    f"unscripted call: source={source_session_id}, fork={fork}"
+                    f"unscripted call: source={source_session_id}, mode={mode}"
                 )
-            self.log.append((source_session_id, prompt, fork))
+            self.log.append((source_session_id, prompt, mode))
             nxt = self.responses.pop(0)
         if callable(nxt):
-            result = nxt(source_session_id, prompt, fork)
+            result = nxt(source_session_id, prompt, mode)
             if on_session_id is not None and result.session_id:
                 try: on_session_id(result.session_id)
                 except Exception: pass

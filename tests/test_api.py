@@ -36,10 +36,10 @@ def _make_caller(tmp_path, parent_file, channel: ScriptedChannel) -> Caller:
     projects.mkdir(parents=True, exist_ok=True)
 
     class _Caller(Caller):
-        def _invoke(self, tasks):
+        def _invoke(self, tasks, *, context: str = "fork"):
             parent = SessionRef(session_id="parent-id", file=parent_file)
             driver = self._scripted_driver()
-            tree = driver.run(parent, tasks, base_depth=0)
+            tree = driver.run(parent, tasks, base_depth=0, context=context)
             from agent_callstack import _results_from_tree  # type: ignore
             return _results_from_tree(tree)
 

@@ -14,11 +14,12 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import datetime as dt
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional, cast
 
 
 def _utc_now() -> str:
@@ -51,6 +52,14 @@ class Node:
     # is pricing metadata, not a context-size distinction. Fig 2's
     # parent-context growth plot reads this field directly.
     max_context_tokens_seen: int = 0
+    # How this node's session was launched. Surfaced in report.yaml so the
+    # Unwind UI can render distinct icons for fork vs fresh vs cross-project.
+    #   "fork"                — `--resume <parent> --fork-session` (inherits)
+    #   "fresh"               — brand-new session in the parent's project folder
+    #   "fresh_cross_project" — brand-new session in a different project folder
+    # Nested children spawned via the agent's CALL envelope always inherit
+    # the parent node's session via fork semantics, so they're always "fork".
+    call_type: str = "fork"
 
     # ---- denormalized for serialization / public API ----
     session_id: Optional[str] = None
@@ -84,6 +93,7 @@ class Node:
             "state": _state_to_dict(self.state),
             "parent_lines": self.parent_lines, "duration": self.duration,
             "max_context_tokens_seen": self.max_context_tokens_seen,
+            "call_type": self.call_type,
             "session_id": self.session_id, "clone_path": self.clone_path,
             "result": self.result, "summary": self.summary,
             "suggested_next": self.suggested_next, "error": self.error,
@@ -98,6 +108,7 @@ class Node:
             parent_lines=d.get("parent_lines", 0),
             duration=d.get("duration", 0.0),
             max_context_tokens_seen=d["max_context_tokens_seen"],
+            call_type=d.get("call_type", "fork"),
             session_id=d.get("session_id"), clone_path=d.get("clone_path"),
             result=d.get("result"), summary=d.get("summary"),
             suggested_next=d.get("suggested_next"), error=d.get("error"),
@@ -183,9 +194,19 @@ class Driver:
 
     # ---- entry points ----
 
-    def run(self, parent: SessionRef, tasks: list[str], base_depth: int = 0) -> Tree:
-        """Execute one or more root tasks. Multiple tasks run in parallel."""
-        nodes = [self._new_node(task) for task in tasks]
+    def run(self, parent: SessionRef, tasks: list[str], base_depth: int = 0,
+            context: str = "fork") -> Tree:
+        """Execute one or more root tasks. Multiple tasks run in parallel.
+
+        context — how root tasks launch their underlying claude session:
+            "fork"  (default) — inherit the parent's transcript via
+                                `--resume + --fork-session`.
+            "fresh"           — brand-new session, no inherited context."""
+        if context not in ("fork", "fresh"):
+            raise ValueError(f"invalid context: {context!r}")
+        call_type = self._derive_call_type(context, parent)
+        nodes = [self._new_node(task, context_mode=context, call_type=call_type)
+                 for task in tasks]
         tree = Tree(root_session=parent, nodes=nodes, base_depth=base_depth)
         self._current_tree = tree
         self._notify()
@@ -210,6 +231,20 @@ class Driver:
         self._persist_if_yielded(tree)
         self._notify()
         return tree
+
+    def _derive_call_type(self, context: str, parent: SessionRef) -> str:
+        """Map (context, parent project folder, self.cwd) → call_type label."""
+        if context == "fork":
+            return "fork"
+        # context == "fresh"
+        parent_dir = parent.cwd or ""
+        own_dir = self.cwd or ""
+        try:
+            same = (parent_dir and own_dir
+                    and os.path.realpath(parent_dir) == os.path.realpath(own_dir))
+        except OSError:
+            same = False
+        return "fresh" if same or not own_dir or not parent_dir else "fresh_cross_project"
 
     def resume(self, tree: Tree, target_session_id: str, reply: str) -> Tree:
         """Resume the leaf identified by `target_session_id` with the user's reply."""
@@ -246,10 +281,13 @@ class Driver:
 
     # ---- private: tree topology helpers ----
 
-    def _new_node(self, task: str) -> Node:
+    def _new_node(self, task: str, *, context_mode: str = "fork",
+                  call_type: str = "fork") -> Node:
         nid = uuid.uuid4().hex
-        return Node(id=nid, task=task,
-                    state=st.Pending(parent_session_id="", task=task, task_id=nid[:8]))
+        cmode = cast(Literal["fork", "fresh"], context_mode)
+        return Node(id=nid, task=task, call_type=call_type,
+                    state=st.Pending(parent_session_id="", task=task,
+                                     task_id=nid[:8], context_mode=cmode))
 
     def _depth_of(self, tree: Tree, target: Node) -> int:
         def walk(n: Node, d: int) -> Optional[int]:
@@ -337,9 +375,21 @@ class Driver:
                parent_session_file: Path, depth: int) -> None:
         """Drive `node` from Pending until it terminates, yields, or its current
         child yields. May recurse to drive children synchronously."""
-        node.parent_lines = count_lines(parent_session_file)
+        # Preserve the node's pre-set context_mode (stamped at _new_node time
+        # for root nodes; defaults to "fork" for children spawned via
+        # CALL envelopes). Fresh nodes have no inherited transcript so
+        # parent_lines stays at 0.
+        prior = node.state
+        cmode: Literal["fork", "fresh"] = (
+            prior.context_mode if isinstance(prior, st.Pending) else "fork"
+        )
+        if cmode == "fresh":
+            node.parent_lines = 0
+        else:
+            node.parent_lines = count_lines(parent_session_file)
         node.state = st.Pending(parent_session_id=parent_session_id,
-                                task=node.task, task_id=node.id[:8])
+                                task=node.task, task_id=node.id[:8],
+                                context_mode=cmode)
         self._continue(node, st.Start(), depth, parent_session_file)
 
     def _continue(self, node: Node, initial_event: st.Event,
@@ -387,8 +437,13 @@ class Driver:
             # the new session id WITHOUT waiting for the full turn to finish.
             # This matters for long first turns (e.g. /task-c which then
             # spawns deeper children before returning).
+            # Both "fork" and "fresh" produce a NEW session id (reported by
+            # claude's `system init`). "resume" continues an existing one and
+            # the id is already set on the node.
+            produces_new_session = effect.mode in ("fork", "fresh")
+
             def _early_session(sid: str) -> None:
-                if not effect.fork:
+                if not produces_new_session:
                     return
                 if node.session_id == sid:
                     return
@@ -399,8 +454,11 @@ class Driver:
 
             result = self.channel.run_turn(
                 effect.source_session_id, effect.prompt,
-                fork=effect.fork, cwd=self.cwd, timeout=self.timeout,
-                extra_env={"CALLSTACK_FRAME_KEY": node.id} if effect.fork else None,
+                mode=effect.mode, cwd=self.cwd, timeout=self.timeout,
+                extra_env=(
+                    {"CALLSTACK_FRAME_KEY": node.id}
+                    if produces_new_session else None
+                ),
                 on_session_id=_early_session,
             )
         except TurnTimeout as e:
@@ -435,8 +493,11 @@ class Driver:
         effective_context = result.input_tokens + result.cache_read_tokens
         if effective_context > node.max_context_tokens_seen:
             node.max_context_tokens_seen = effective_context
-        # Resolve the clone path right after the fork completes.
-        if effect.fork:
+        # Resolve the clone path right after the new session lands (fork or
+        # fresh). For fresh + cross-project, the new session lives in the
+        # child's cwd's project dir — pass the effective cwd so the locator
+        # looks in the right place.
+        if produces_new_session:
             resolved = self.locator.resolve(result.session_id, cwd=self.cwd)
             if resolved is not None:
                 node.clone_path = str(resolved)

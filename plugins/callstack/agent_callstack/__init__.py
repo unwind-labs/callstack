@@ -136,12 +136,13 @@ class Caller:
         self._invoke_id = invoke_id
         self._seed = seed
 
-    def call(self, task: str) -> Result:
-        results = self._invoke([task])
+    def call(self, task: str, *, context: str = "fork") -> Result:
+        results = self._invoke([task], context=context)
         return _unwrap_single(results[0])
 
-    def call_many(self, tasks: Sequence[str]) -> MultiResult:
-        wrapped = [_wrap(item) for item in self._invoke(list(tasks))]
+    def call_many(self, tasks: Sequence[str], *,
+                  context: str = "fork") -> MultiResult:
+        wrapped = [_wrap(item) for item in self._invoke(list(tasks), context=context)]
         return MultiResult(results=wrapped)
 
     def resume(self, token: YieldToken, reply: str) -> Result:
@@ -167,10 +168,15 @@ class Caller:
 
     # ---- internal ----
 
-    def _invoke(self, tasks: list[str]) -> list:
+    def _invoke(self, tasks: list[str], *, context: str = "fork") -> list:
         """Run `tasks`, returning one entry per task: Result | CallYielded | CallFailed."""
         locator = SessionLocator()
-        parent = locator.locate(explicit=self._explicit_session, cwd=self._cwd)
+        # In fresh+cross-project mode, `self._cwd` points at the child's
+        # target folder, but the *parent* session lives in the caller's
+        # project folder. Locate the parent session against the env-anchored
+        # parent project, not the (possibly redirected) child cwd.
+        parent_cwd = self._parent_project_cwd()
+        parent = locator.locate(explicit=self._explicit_session, cwd=parent_cwd)
         depth = int(os.environ.get(ENV_DEPTH, "0"))
         ctx = self._resolve_invocation_context(parent)
         driver = self._driver_for(parent, ctx=ctx, depth_base=depth)
@@ -179,9 +185,28 @@ class Caller:
         reporter = _LiveReporter(ctx=ctx, kind=kind, tasks=list(tasks),
                                  started_at=started_at)
         driver.on_progress = reporter
-        tree = driver.run(parent, tasks, base_depth=depth)
+        tree = driver.run(parent, tasks, base_depth=depth, context=context)
         reporter.finalize(tree)
         return _results_from_tree(tree)
+
+    def _parent_project_cwd(self) -> Optional[str]:
+        """Project folder of the caller's session — needed for cross-project
+        fresh calls where `self._cwd` is the child's target, not the parent's
+        project. Falls back through env, explicit cwd, then os.getcwd()."""
+        env_parent = os.environ.get(ENV_PARENT_SESSION)
+        if env_parent:
+            try:
+                # ENV_PARENT_SESSION holds the parent session's JSONL path.
+                # Its parent dir is `~/.claude/projects/<encoded-cwd>/`,
+                # which we don't need to decode — SessionLocator can use any
+                # cwd to find the session; what matters is that we pick a
+                # cwd that resolves to the *caller's* project, not the
+                # redirected child cwd. The MCP server's actual os.getcwd()
+                # is reliably the caller's project folder.
+                return os.getcwd()
+            except OSError:
+                pass
+        return self._cwd or os.getcwd()
 
     def _effective_cwd(self, parent: SessionRef) -> str:
         return self._cwd or parent.cwd or os.getcwd()
@@ -272,9 +297,15 @@ def _shared() -> Caller:
 
 
 def call(task: str, *, seed: Optional[int] = None,
-         timeout: Optional[int] = None) -> Result:
+         timeout: Optional[int] = None,
+         context: str = "fork") -> Result:
     """Fork a child agent on `task`. Returns the child's `Result`. Raises
     `CallYielded` if the agent paused for input, `CallFailed` on error.
+
+    context: "fork" (default) — child inherits the parent's transcript.
+             "fresh"           — child starts a brand-new session with no
+                                 inherited context (Claude Code Agent-tool
+                                 semantics).
 
     seed: opaque integer recorded into traces for downstream trial grouping
         (e.g., pass^k disaggregation). Does NOT produce deterministic provider
@@ -282,15 +313,16 @@ def call(task: str, *, seed: Optional[int] = None,
         this to label trials, not to expect bitwise reproducibility.
     """
     if timeout is not None or seed is not None:
-        return Caller(timeout=timeout or 300, seed=seed).call(task)
-    return _shared().call(task)
+        return Caller(timeout=timeout or 300, seed=seed).call(task, context=context)
+    return _shared().call(task, context=context)
 
 
 def call_many(tasks: Sequence[str], *, seed: Optional[int] = None,
-              timeout: Optional[int] = None) -> MultiResult:
+              timeout: Optional[int] = None,
+              context: str = "fork") -> MultiResult:
     if timeout is not None or seed is not None:
-        return Caller(timeout=timeout or 300, seed=seed).call_many(tasks)
-    return _shared().call_many(tasks)
+        return Caller(timeout=timeout or 300, seed=seed).call_many(tasks, context=context)
+    return _shared().call_many(tasks, context=context)
 
 
 def resume(token: YieldToken, reply: str, *, seed: Optional[int] = None,
@@ -653,6 +685,7 @@ def _graft_node(node_dict: dict, input_text: str, *, depth: int,
         "task": node_dict.get("task"),
         "status": _status_label_from_state(node_dict.get("state")),
         "depth": depth,
+        "call_type": node_dict.get("call_type", "fork"),
         "session_id": sid,
         "clone_path": node_dict.get("clone_path"),
         "duration_seconds": round(float(node_dict.get("duration", 0.0)), 2),

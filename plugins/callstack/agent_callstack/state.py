@@ -32,6 +32,10 @@ class Pending:
     parent_session_id: str
     task: str
     task_id: Optional[str] = None
+    # How the first turn launches its underlying `claude` session:
+    #   "fork"  — `--resume <parent> --fork-session` (inherits parent transcript)
+    #   "fresh" — neither flag (brand-new session, no inherited context)
+    context_mode: Literal["fork", "fresh"] = "fork"
     kind: Literal["pending"] = "pending"
 
 
@@ -138,14 +142,15 @@ Event = Union[Start, TurnCompleted, TurnFailed, ChildDone, ChildFailed, UserRepl
 class RunTurn:
     """Run an LLM turn against the channel.
 
-    fork=True: fork the source session and run the prompt in the new session.
-               The new session id is reported back in TurnCompleted.session_id.
-    fork=False: resume `source_session_id` and inject `prompt` as the next user
-                message.
+    mode="fork":   `--resume <source> --fork-session` — inherits parent transcript,
+                   then diverges into a new session id (reported via TurnCompleted).
+    mode="fresh":  neither flag — brand-new session, no inherited context. The new
+                   session id is reported via TurnCompleted.
+    mode="resume": `--resume <source>` only — appends `prompt` to an existing session.
     """
     source_session_id: str
     prompt: str
-    fork: bool
+    mode: Literal["fork", "fresh", "resume"]
 
 
 @dataclass(frozen=True)
@@ -168,12 +173,13 @@ def step(state: State, event: Event) -> tuple[State, list[Effect]]:
     (firing the wrong event for the current state)."""
     match (state, event):
         # ---- Pending: kick off the first turn ----
-        case (Pending(parent_session_id=psid, task=task, task_id=tid), Start()):
+        case (Pending(parent_session_id=psid, task=task, task_id=tid,
+                      context_mode=cmode), Start()):
             return (
                 AwaitingTurn(session_id=None),
                 [RunTurn(source_session_id=psid,
                          prompt=starting_prompt(task, tid),
-                         fork=True)],
+                         mode=cmode)],
             )
 
         # ---- AwaitingTurn: an envelope arrived ----
@@ -200,7 +206,7 @@ def step(state: State, event: Event) -> tuple[State, list[Effect]]:
                 AwaitingTurn(session_id=sid),
                 [RunTurn(source_session_id=sid,
                          prompt=child_returned_prompt(res),
-                         fork=False)],
+                         mode="resume")],
             )
 
         case (AwaitingChild(session_id=sid, child_id=cid),
@@ -211,7 +217,7 @@ def step(state: State, event: Event) -> tuple[State, list[Effect]]:
         case (AwaitingUser(session_id=sid), UserReplied(reply=r)):
             return (
                 AwaitingTurn(session_id=sid),
-                [RunTurn(source_session_id=sid, prompt=r, fork=False)],
+                [RunTurn(source_session_id=sid, prompt=r, mode="resume")],
             )
 
     raise AssertionError(f"no transition: {type(state).__name__} <- {type(event).__name__}")

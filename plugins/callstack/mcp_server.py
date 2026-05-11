@@ -20,7 +20,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from agent_callstack import (
     Caller, CallFailed, CallYielded, MultiResult, Result, YieldToken,
@@ -94,20 +94,97 @@ def _build_caller(session: str, model: str, cwd: str, timeout: int,
     )
 
 
+def _parent_project_folder() -> str:
+    """The caller's project folder. The MCP server runs with cwd == caller's
+    project folder, so os.getcwd() is reliably the parent's project."""
+    return os.getcwd()
+
+
+def _resolve_cwd(raw: str) -> tuple[str, Optional[str]]:
+    """Expand `{PWD}` against the caller's project folder, then canonicalize.
+
+    Returns (resolved_abs_path, error_message). On success error_message is
+    None and resolved_abs_path is an absolute directory that exists. On
+    failure resolved_abs_path may be a partial expansion (for error display)
+    and error_message describes what went wrong.
+
+    Empty `raw` resolves to the caller's project folder (the default behavior
+    before this feature) — no validation needed in that case."""
+    if not raw:
+        return _parent_project_folder(), None
+    expanded = raw.replace("{PWD}", _parent_project_folder())
+    expanded = os.path.abspath(os.path.expanduser(expanded))
+    if not os.path.isdir(expanded):
+        return expanded, f"cwd '{expanded}' is not an existing directory"
+    return expanded, None
+
+
+def _same_project(a: str, b: str) -> bool:
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except OSError:
+        return False
+
+
 @mcp.tool()
 async def call(tasks: list[str], timeout: int = 300, session_id: str = "",
-               model: str = "", cwd: str = "") -> str:
-    """Fork sub-agents to execute `tasks` concurrently. Each child inherits
-    the parent's full conversation context; only results come back.
-    Always pass an array — one task or many. Tasks must be independent
-    when more than one is supplied.
+               model: str = "", cwd: str = "", context: str = "fork") -> str:
+    """Fork sub-agents to execute `tasks` concurrently. Returns an envelope
+    `{invoke_id, report_path, results: [...]}`; all tasks share one
+    invocation and one YAML report listing the full nested call tree.
 
-    Returns an envelope `{invoke_id, report_path, results: [...]}`; all
-    tasks share one invocation and one YAML report listing the full
-    nested call tree with inputs and outputs."""
-    invoke_id, log_dir = _invocation_identity(cwd)
-    caller = _build_caller(session_id, model, cwd, timeout, invoke_id, log_dir)
-    multi: MultiResult = await asyncio.to_thread(caller.call_many, tasks)
+    Always pass an array — one task or many. Tasks must be independent when
+    more than one is supplied.
+
+    context — how each task's underlying claude session is launched:
+        "fork"  (default) — child inherits the parent's full conversation
+                            context via `--resume + --fork-session`. Best
+                            for "delegate a follow-up step the child
+                            already understands."
+        "fresh"           — brand-new isolated session. Only the task
+                            string crosses the boundary (same semantics as
+                            Claude Code's built-in Agent / Task tool).
+                            Use when you want an independent worker that
+                            shouldn't see the parent transcript.
+
+    cwd — project folder to run the child in. Supports `{PWD}` substitution
+        against the caller's project folder, e.g. `"{PWD}/../sibling-repo"`
+        to run the child in an adjacent checkout. Cross-project use is
+        ONLY supported with context="fresh"; combining context="fork"
+        with a different project folder returns an error envelope."""
+    if context not in ("fork", "fresh"):
+        return json.dumps({
+            "invoke_id": "", "report_path": "",
+            "results": [{"status": "error",
+                         "error": f"invalid context: {context!r} "
+                                  f"(must be 'fork' or 'fresh')"}],
+        }, indent=2)
+    resolved_cwd, cwd_err = _resolve_cwd(cwd)
+    if cwd_err:
+        return json.dumps({
+            "invoke_id": "", "report_path": "",
+            "results": [{"status": "error", "error": cwd_err}],
+        }, indent=2)
+    parent_dir = _parent_project_folder()
+    if context == "fork" and not _same_project(resolved_cwd, parent_dir):
+        return json.dumps({
+            "invoke_id": "", "report_path": "",
+            "results": [{
+                "status": "error",
+                "error": (
+                    f"context='fork' cannot be combined with a cwd "
+                    f"different from the parent's project folder "
+                    f"(parent={parent_dir}, requested={resolved_cwd}); "
+                    f"use context='fresh' instead"),
+            }],
+        }, indent=2)
+
+    invoke_id, log_dir = _invocation_identity(resolved_cwd)
+    caller = _build_caller(session_id, model, resolved_cwd, timeout,
+                           invoke_id, log_dir)
+    multi: MultiResult = await asyncio.to_thread(
+        caller.call_many, tasks, context=context,
+    )
     return json.dumps({
         "invoke_id": invoke_id,
         "report_path": _report_path(log_dir, invoke_id),
