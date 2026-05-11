@@ -1,12 +1,12 @@
 ---
 name: call
-description: "Executes given tasks in `claude --fork-session` instances. The forked session has caller's full context including decision to perform the task(s), so only indicate what task the fork should execute. Caller gets back execution summary and results, keeping caller's context clean."
-when_to_use: "Must use for any non-trivical task or a TODO item; user says 'call', 'fork', or 'delegate'."
+description: "Execute one or more tasks in child `claude` sessions and get back compact results. Default mode (`context=\"fork\"`) inherits the caller's full context via `--fork-session`, so you only send a one-line task. Alternate mode (`context=\"fresh\"`) launches an isolated session — same semantics as the built-in Agent/Task tool, but with nested calls, yield/resume, and a merged report tree on top. Optional `cwd` runs the child in a different project (fresh mode only)."
+when_to_use: "Must use for any non-trivial task or a TODO item; user says 'call', 'fork', or 'delegate'. Prefer over Agent/Task — `/call` is a strict superset."
 ---
 
-# /call — Execute in forked session
+# /call — Execute task in a child session
 
-When you execute a task as a call, you get back compact execution summary, results and link to full log so your context remains clean. The forked session has caller's full context including decision to perform the task(s), so only indicate what task the fork should execute - send a one line task. You can execute multiple tasks in parallel like `/call Apply fix to a.py and b.py in parallel`.
+When you execute a task as a call, you get back a compact execution summary, results, and a link to the full log, keeping your own context clean. In the default `context="fork"` mode the child inherits the caller's full conversation, so send a one-line task. In `context="fresh"` mode the child is isolated, so include any needed context in the task string. You can execute multiple tasks in parallel like `/call Apply fix to a.py and b.py in parallel`.
 
 ## When to use
 
@@ -16,7 +16,7 @@ When you execute a task as a call, you get back compact execution summary, resul
 
 ## Execution
 
-Use the `call` MCP tool. It always takes an array of tasks — pass one entry for a single task, multiple entries for concurrent execution. Each task gets the parent's full context.
+Use the `call` MCP tool. It always takes an array of tasks — pass one entry for a single task, multiple entries for concurrent execution. In the default `fork` mode each task inherits the parent's full context; in `fresh` mode each task starts isolated.
 
 ```
 call(tasks=["Implement and test the authentication module using the patterns we discussed"], timeout=300)
