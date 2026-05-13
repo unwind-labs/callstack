@@ -384,3 +384,62 @@ class TestInstrumentation:
         driver.run(parent_session, ["t"])
         entry = json.loads((tmp_path / "traces" / "call_trace.jsonl").read_text().strip().split("\n")[0])
         assert entry["seed"] == 7
+
+
+# ---------- ARCH-3: deep propagate_up via _TreeIndex ----------
+
+class TestDeepPropagate:
+    """Pin correctness of the index-driven ancestor walk on a deeper chain
+    than other tests reach. Pre-ARCH-3, _propagate_up did three O(N) walks
+    per loop iteration; this test catches index-build / lookup regressions.
+
+    `_propagate_up` only runs during `resume()`, so we build a chain of N
+    CALLs ending in a YIELD at the deepest leaf, then resume — that's the
+    only path that exercises the index."""
+
+    def test_depth_10_chain_propagates_through_resume(self, tmp_path, parent_session):
+        depth = 10
+        # Going down: each ancestor emits CALL on its first turn.
+        # Leaf YIELDs (pauses the whole chain).
+        # On resume: leaf RETURNs with the reply, then each ancestor's
+        # "child returned" resume turn emits its own RETURN — bubbling
+        # back up via _propagate_up.
+        ch = ScriptedChannel()
+        for i in range(depth - 1):
+            ch.respond(_envelope("call", task=f"level-{i+1}"), f"sess-{i}")
+        # Leaf yields:
+        ch.respond(_envelope("yield", question="ok?"), f"sess-{depth-1}")
+        # After resume(): leaf returns, then ancestors return in unwind order
+        # (deepest ancestor first up to the root).
+        ch.respond(_envelope("return", result="leaf-after-resume"),
+                   f"sess-{depth-1}")
+        for i in reversed(range(depth - 1)):
+            ch.respond(_envelope("return", result=f"r{i}"), f"sess-{i}")
+
+        driver = _make_driver(tmp_path, ch, max_depth=depth + 2)
+        tree = driver.run(parent_session, ["root-task"])
+
+        # After run(): the whole chain is built but stalled on the leaf yield.
+        # Each ancestor is AwaitingChild; leaf is AwaitingUser.
+        leaf_sid = f"sess-{depth-1}"
+        leaf = tree.find_by_session(leaf_sid)
+        assert leaf is not None
+        assert leaf.state.kind == "awaiting_user"
+
+        # Resume — this triggers _propagate_up, exercising _TreeIndex over
+        # a depth-10 ancestor chain.
+        driver.resume(tree, leaf_sid, "go")
+
+        # Walk down and confirm every node landed in `done` with the
+        # right result.
+        node = tree.nodes[0]
+        for i in range(depth - 1):
+            assert node.state.kind == "done", \
+                f"level {i} stuck in {node.state.kind}"
+            assert len(node.children) == 1, \
+                f"level {i} expected 1 child, got {len(node.children)}"
+            assert node.result == f"r{i}", \
+                f"level {i} result was {node.result!r}"
+            node = node.children[0]
+        assert node.state.kind == "done"
+        assert node.result == "leaf-after-resume"

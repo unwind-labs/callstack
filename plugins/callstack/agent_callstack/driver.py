@@ -324,10 +324,14 @@ class Driver:
 
     def _propagate_up(self, tree: Tree, leaf: Node) -> None:
         """Walk up from a just-completed leaf, feeding ChildDone/ChildFailed
-        events to each ancestor that is AwaitingChild on it."""
+        events to each ancestor that is AwaitingChild on it.
+
+        Ancestor lookups go through a one-shot index built at entry so the
+        loop is O(depth) instead of O(depth · N) (ARCH-3)."""
+        index = _TreeIndex.build(tree)
         node = leaf
         while True:
-            parent = self._find_parent(tree, node)
+            parent = index.parent_of.get(id(node))
             if parent is None:
                 return
             if not isinstance(parent.state, st.AwaitingChild):
@@ -343,8 +347,8 @@ class Driver:
             else:
                 # Parent stays parked; nothing to do.
                 return
-            depth = self._depth_of(tree, parent)
-            parent_file = self._parent_file_for(tree, parent)
+            depth = index.depth_of[id(parent)]
+            parent_file = index.parent_file_of[id(parent)]
             self._continue(parent, event, depth, parent_file)
             node = parent
 
@@ -541,6 +545,45 @@ class Driver:
             )
         # Child suspended (yielded) — parent is now blocked downstream.
         return None
+
+
+# ---------- ancestor index (ARCH-3) ----------
+
+@dataclass(frozen=True)
+class _TreeIndex:
+    """One-shot ancestor index for `_propagate_up`.
+
+    Built by a single DFS over `tree.nodes`; replaces three independent
+    O(N) walks (`_find_parent`, `_depth_of`, `_parent_file_for`) per loop
+    iteration with O(1) dict lookups. Keyed by `id(Node)` because Node
+    is mutable and not hashable. Lifetime is the propagate call only;
+    don't cache on Tree (children are appended during execution and
+    invalidation would silently rot)."""
+    parent_of: dict[int, Optional[Node]]
+    depth_of: dict[int, int]
+    parent_file_of: dict[int, Path]
+
+    @classmethod
+    def build(cls, tree: "Tree") -> "_TreeIndex":
+        parent_of: dict[int, Optional[Node]] = {}
+        depth_of: dict[int, int] = {}
+        parent_file_of: dict[int, Path] = {}
+        root_file = tree.root_session.file
+        # Iterative DFS — deep linear stacks can blow Python's recursion limit.
+        stack: list[tuple[Node, Optional[Node], int, Path]] = [
+            (n, None, tree.base_depth + 1, root_file) for n in tree.nodes
+        ]
+        while stack:
+            node, parent, depth, pfile = stack.pop()
+            parent_of[id(node)] = parent
+            depth_of[id(node)] = depth
+            parent_file_of[id(node)] = pfile
+            # Children fork from this node's clone, not its grandparent's.
+            child_pfile = Path(node.clone_path) if node.clone_path else pfile
+            for c in node.children:
+                stack.append((c, node, depth + 1, child_pfile))
+        return cls(parent_of=parent_of, depth_of=depth_of,
+                   parent_file_of=parent_file_of)
 
 
 # ---------- internal serialization & helpers ----------
