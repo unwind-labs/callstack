@@ -10,6 +10,26 @@ import pytest
 from agent_callstack.session import SessionLocator, count_lines
 
 
+# Tests use stable UUID-shaped ids — SessionLocator validates session_id
+# shape before any filesystem probe (SEC-003), so placeholder strings
+# like "abc123" are rejected.
+_SID = {
+    "abc123":      "00000000-0000-0000-0000-0000000000a1",
+    "shared":      "00000000-0000-0000-0000-0000000000a2",
+    "explicit-id": "00000000-0000-0000-0000-0000000000a3",
+    "from-path":   "00000000-0000-0000-0000-0000000000a4",
+    "ghost":       "00000000-0000-0000-0000-0000000000a5",
+    "env-id":      "00000000-0000-0000-0000-0000000000a6",
+    "uuid-env":    "00000000-0000-0000-0000-0000000000a7",
+    "old":         "00000000-0000-0000-0000-0000000000a8",
+    "new":         "00000000-0000-0000-0000-0000000000a9",
+    "in-cwd":      "00000000-0000-0000-0000-0000000000b0",
+    "elsewhere":   "00000000-0000-0000-0000-0000000000b1",
+    "inside":      "00000000-0000-0000-0000-0000000000b2",
+    "nothing":     "00000000-0000-0000-0000-0000000000b3",
+}
+
+
 @pytest.fixture
 def projects(tmp_path) -> Path:
     p = tmp_path / "projects"
@@ -17,7 +37,12 @@ def projects(tmp_path) -> Path:
     return p
 
 
+def _sid(name: str) -> str:
+    return _SID.get(name, name)
+
+
 def _make_session(project_dir: Path, name: str, *, cwd: str = "/tmp") -> Path:
+    name = _sid(name)
     project_dir.mkdir(parents=True, exist_ok=True)
     f = project_dir / f"{name}.jsonl"
     f.write_text(json.dumps({"cwd": cwd, "type": "user"}) + "\n")
@@ -29,7 +54,7 @@ class TestResolve:
     def test_resolve_finds_in_any_project_dir(self, projects):
         f = _make_session(projects / "proj-a", "abc123")
         loc = SessionLocator(projects_dir=projects)
-        assert loc.resolve("abc123") == f
+        assert loc.resolve(_sid("abc123")) == f
 
     def test_resolve_returns_none_when_missing(self, projects):
         loc = SessionLocator(projects_dir=projects)
@@ -43,7 +68,7 @@ class TestResolve:
         _make_session(projects / "other", "shared")
         loc = SessionLocator(projects_dir=projects)
         # cwd match wins
-        assert loc.resolve("shared", cwd=cwd) == f
+        assert loc.resolve(_sid("shared"), cwd=cwd) == f
 
 
 class TestLocate:
@@ -51,8 +76,8 @@ class TestLocate:
     def test_explicit_uuid(self, projects):
         f = _make_session(projects / "p", "explicit-id")
         loc = SessionLocator(projects_dir=projects)
-        ref = loc.locate(explicit="explicit-id")
-        assert ref.session_id == "explicit-id"
+        ref = loc.locate(explicit=_sid("explicit-id"))
+        assert ref.session_id == _sid("explicit-id")
         assert ref.file == f
 
     def test_explicit_file_path(self, projects):
@@ -60,12 +85,12 @@ class TestLocate:
         loc = SessionLocator(projects_dir=projects)
         ref = loc.locate(explicit=str(f))
         assert ref.file == f
-        assert ref.session_id == "from-path"
+        assert ref.session_id == _sid("from-path")
 
     def test_explicit_missing_raises(self, projects):
         loc = SessionLocator(projects_dir=projects)
         with pytest.raises(RuntimeError, match="not found"):
-            loc.locate(explicit="ghost")
+            loc.locate(explicit=_sid("ghost"))
 
     def test_env_var_path_used_when_no_explicit(self, projects, monkeypatch):
         f = _make_session(projects / "p", "env-id")
@@ -79,9 +104,9 @@ class TestLocate:
         _make_session(projects / "p", "uuid-env")
         loc = SessionLocator(projects_dir=projects)
         monkeypatch.delenv("CALLSTACK_PARENT_SESSION", raising=False)
-        monkeypatch.setenv("CLAUDE_SESSION_ID", "uuid-env")
+        monkeypatch.setenv("CLAUDE_SESSION_ID", _sid("uuid-env"))
         ref = loc.locate()
-        assert ref.session_id == "uuid-env"
+        assert ref.session_id == _sid("uuid-env")
 
     def test_mtime_fallback_picks_most_recent(self, projects, monkeypatch):
         from agent_callstack.session import encode_project_dir
@@ -95,7 +120,7 @@ class TestLocate:
         monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
         loc = SessionLocator(projects_dir=projects)
         ref = loc.locate(cwd=cwd)
-        assert ref.session_id == "new"
+        assert ref.session_id == _sid("new")
 
     def test_mtime_fallback_ignores_other_project_dirs(self, projects, monkeypatch):
         """A newer .jsonl in an unrelated project dir must NOT be chosen as
@@ -112,7 +137,7 @@ class TestLocate:
         monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
         loc = SessionLocator(projects_dir=projects)
         ref = loc.locate(cwd=cwd)
-        assert ref.session_id == "in-cwd"
+        assert ref.session_id == _sid("in-cwd")
 
     def test_mtime_fallback_raises_when_primary_empty(self, projects, monkeypatch):
         """If the cwd-matching project dir has no sessions, refuse rather

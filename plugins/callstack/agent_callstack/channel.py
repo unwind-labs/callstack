@@ -54,6 +54,7 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -116,6 +117,23 @@ _MAX_IN_FLIGHT_TURNS = int(os.environ.get(
 ))
 _SPAWN_SEMAPHORE = threading.BoundedSemaphore(value=_MAX_CONCURRENT_FORKS)
 _IN_FLIGHT_SEMAPHORE = threading.BoundedSemaphore(value=_MAX_IN_FLIGHT_TURNS)
+
+# SEC-005: bound the worst-case NDJSON line and per-turn stderr drain.
+# `claude` lines are normally <100 KB; the cap exists so a malicious or
+# stuck child can't drive parent RSS without bound.
+_NDJSON_MAX_LINE = 4 * 1024 * 1024            # 4 MiB per line
+_STDERR_LOG_CAP = 16 * 1024 * 1024            # 16 MiB per turn before truncate
+
+# SEC-013: argv-input validation. `claude --permission-mode <X>` and
+# `claude --resume <UUID>` accept these from us; reject anything outside
+# the known set / UUID shape before subprocess spawn.
+_VALID_PERMISSION_MODES = frozenset({
+    "default", "acceptEdits", "plan", "bypassPermissions",
+})
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -380,6 +398,14 @@ class ClaudeChannel:
         permission_handler: Optional[PermissionHandler] = None,
         env: Optional[dict] = None,
     ):
+        # SEC-013: validate permission_mode against the known set so
+        # typos / hostile callers can't smuggle arbitrary values into
+        # the claude argv.
+        if permission_mode not in _VALID_PERMISSION_MODES:
+            raise ValueError(
+                f"invalid permission_mode {permission_mode!r}; expected one "
+                f"of {sorted(_VALID_PERMISSION_MODES)}"
+            )
         self._model = model
         self._permission_mode = permission_mode
         self._handler = permission_handler or allow_all
@@ -396,8 +422,19 @@ class ClaudeChannel:
         extra_env: Optional[dict] = None,
         on_session_id: Optional[Callable[[str], None]] = None,
     ) -> TurnResult:
+        # ARCH-11: env precedence is `os.environ < self._env_extra (set at
+        # ClaudeChannel construction) < extra_env (per-turn override)`.
+        # The driver uses `extra_env` only to inject CALLSTACK_FRAME_KEY
+        # per spawn, so right-most wins is the desired shape.
         if mode not in ("fork", "fresh", "resume"):
             raise ValueError(f"invalid run_turn mode: {mode!r}")
+        # SEC-013: when a session id is supplied (fork/resume), it must be
+        # a real UUID. `fresh` mode passes an empty string and is exempt.
+        if source_session_id and not _UUID_RE.fullmatch(source_session_id):
+            raise ValueError(
+                f"invalid source_session_id {source_session_id!r}; must be a "
+                f"UUID"
+            )
         effective_cwd = cwd or os.getcwd()
         pool = _get_pool()
 
@@ -510,7 +547,11 @@ class ClaudeChannel:
         env = {**os.environ, **self._env_extra, **(extra_env or {})}
         stem = source_session_id[:8] if source_session_id else "fresh"
         log_path = _process_log_path(stem)
-        log = open(log_path, "w")
+        # PERF-I: line-buffered (`buffering=1`) means a single newline flush
+        # per write, removing the explicit log.flush() most callers do per
+        # stderr/event line. We keep explicit flushes around critical writes
+        # (timeout, exit code) for paranoia.
+        log = open(log_path, "w", buffering=1)
         log.write(f"cmd: {' '.join(cmd)}\ncwd: {effective_cwd}\n")
         log.flush()
         print(f"[callstack] spawn (mode={mode}, source={stem}..., "
@@ -527,12 +568,29 @@ class ClaudeChannel:
         )
         # Drain stderr for the LIFETIME of the process — survives across
         # multiple pooled turns, so we don't restart on each reuse.
+        # PERF-I: with the log opened line-buffered above, each
+        # log.write that ends in '\n' flushes on its own. SEC-005: cap
+        # the total stderr bytes appended per process to defend against
+        # a malfunctioning child filling the disk.
         stderr = proc.stderr
+        bytes_written = [0]
+        capped = [False]
         def _drain():
             for line in stderr:
+                if capped[0]:
+                    continue
                 try:
+                    n = len(line)
+                    if bytes_written[0] + n > _STDERR_LOG_CAP:
+                        log.write(
+                            f"STDERR: ...stderr log capped at "
+                            f"{_STDERR_LOG_CAP} bytes; further lines "
+                            f"discarded\n"
+                        )
+                        capped[0] = True
+                        continue
                     log.write(f"STDERR: {line}")
-                    log.flush()
+                    bytes_written[0] += n
                 except (OSError, ValueError):
                     return
         threading.Thread(target=_drain, daemon=True).start()
@@ -666,10 +724,24 @@ class ClaudeChannel:
         early_id_fired = False
         while True:
             # readline (not iter) — the iterator's read-ahead delays delivery and hangs.
-            raw = stdout.readline()
+            # SEC-005: cap line size to bound peak memory under a malicious
+            # or malfunctioning child that emits an unbounded line. Truncation
+            # (no trailing newline + at-limit length) is treated as a
+            # protocol error and ends the turn.
+            raw = stdout.readline(_NDJSON_MAX_LINE)
             if not raw:
                 log.write("← EOF\n"); log.flush()
                 return session_id
+            if len(raw) == _NDJSON_MAX_LINE and not raw.endswith("\n"):
+                log.write(
+                    f"← line exceeded {_NDJSON_MAX_LINE} bytes — protocol "
+                    f"error; ending turn\n"
+                )
+                log.flush()
+                raise RuntimeError(
+                    f"claude stdout exceeded {_NDJSON_MAX_LINE}-byte NDJSON "
+                    f"line cap; aborting turn"
+                )
             raw = raw.strip()
             if not raw:
                 continue

@@ -23,7 +23,7 @@ def _envelope(op: str, **fields) -> str:
 def parent_session(tmp_path) -> SessionRef:
     f = tmp_path / "parent.jsonl"
     f.write_text("line1\nline2\nline3\n")
-    return SessionRef(session_id="parent-id", file=f)
+    return SessionRef(session_id="00000000-0000-0000-0000-0000000000d2", file=f)
 
 
 def _make_driver(tmp_path, channel: ScriptedChannel, *, max_depth: int = 5) -> Driver:
@@ -118,7 +118,7 @@ class TestRunSingleTask:
         """Parent CALLs, child returns, parent resumes and returns."""
         ch = (ScriptedChannel()
               .respond(_envelope("call", task="sub-task"), "parent-fork")
-              .respond(_envelope("return", result="sub-result"), "child-fork")
+              .respond(_envelope("return", result="sub-result"), "00000000-0000-0000-0000-0000000000d1")
               .respond(_envelope("return", result="all done"), "parent-fork"))
         driver = _make_driver(tmp_path, ch)
 
@@ -137,7 +137,7 @@ class TestRunSingleTask:
         """Child yields → tree is paused; parent stays in awaiting_child."""
         ch = (ScriptedChannel()
               .respond(_envelope("call", task="sub"), "parent-fork")
-              .respond(_envelope("yield", question="Code?"), "child-fork"))
+              .respond(_envelope("yield", question="Code?"), "00000000-0000-0000-0000-0000000000d1"))
         driver = _make_driver(tmp_path, ch)
 
         tree = driver.run(parent_session, ["main"])
@@ -232,14 +232,16 @@ class TestResume:
 
     def test_yield_persists_then_resume_completes(self, tmp_path, parent_session):
         """Driver.run yields → snapshot saved → resume continues."""
-        # Prepare a clone path the locator can resolve (must live under a
-        # project subdir, since SessionLocator iterates projects_dir/*).
-        project_dir = tmp_path / "_no_real_projects" / "fake-project"
+        # Prepare a clone path the locator can resolve. After SEC-003,
+        # resolve(cwd=...) only looks in the cwd-matching project dir,
+        # so the clone must live there.
+        from agent_callstack.session import encode_project_dir
+        project_dir = tmp_path / "_no_real_projects" / encode_project_dir(str(tmp_path))
         project_dir.mkdir(parents=True)
-        clone_path = project_dir / "child-fork.jsonl"
+        clone_path = project_dir / "00000000-0000-0000-0000-0000000000d1.jsonl"
         clone_path.write_text("")
 
-        ch = ScriptedChannel().respond(_envelope("yield", question="Code?"), "child-fork")
+        ch = ScriptedChannel().respond(_envelope("yield", question="Code?"), "00000000-0000-0000-0000-0000000000d1")
         driver = _make_driver(tmp_path, ch)
         tree = driver.run(parent_session, ["auth"])
         leaf = tree.yielded_leaves()[0]
@@ -250,11 +252,11 @@ class TestResume:
         snapshot = store.load(clone_path)
         assert snapshot is not None
         loaded = Tree.from_dict(snapshot)
-        assert loaded.yielded_leaves()[0].session_id == "child-fork"
+        assert loaded.yielded_leaves()[0].session_id == "00000000-0000-0000-0000-0000000000d1"
 
         # Resume the leaf.
-        ch.respond(_envelope("return", result="authenticated"), "child-fork")
-        driver.resume(loaded, target_session_id="child-fork", reply="847291")
+        ch.respond(_envelope("return", result="authenticated"), "00000000-0000-0000-0000-0000000000d1")
+        driver.resume(loaded, target_session_id="00000000-0000-0000-0000-0000000000d1", reply="847291")
 
         leaf2 = loaded.nodes[0]
         assert leaf2.status == "complete"
@@ -266,14 +268,15 @@ class TestResume:
 
     def test_resume_unblocks_parent(self, tmp_path, parent_session):
         """Child yields, blocking parent. After child resume, parent is unblocked."""
-        project_dir = tmp_path / "_no_real_projects" / "fake-project"
+        from agent_callstack.session import encode_project_dir
+        project_dir = tmp_path / "_no_real_projects" / encode_project_dir(str(tmp_path))
         project_dir.mkdir(parents=True, exist_ok=True)
-        (project_dir / "parent-fork.jsonl").write_text("")
-        (project_dir / "child-fork.jsonl").write_text("")
+        (project_dir / "00000000-0000-0000-0000-0000000000d4.jsonl").write_text("")
+        (project_dir / "00000000-0000-0000-0000-0000000000d1.jsonl").write_text("")
 
         ch = (ScriptedChannel()
-              .respond(_envelope("call", task="sub"), "parent-fork")
-              .respond(_envelope("yield", question="MFA?"), "child-fork"))
+              .respond(_envelope("call", task="sub"), "00000000-0000-0000-0000-0000000000d4")
+              .respond(_envelope("yield", question="MFA?"), "00000000-0000-0000-0000-0000000000d1"))
         driver = _make_driver(tmp_path, ch)
         tree = driver.run(parent_session, ["main"])
         root, child = tree.nodes[0], tree.nodes[0].children[0]
@@ -281,9 +284,9 @@ class TestResume:
         assert root.status == "running"
 
         # Resume the child: it returns, parent should resume and complete.
-        ch.respond(_envelope("return", result="auth-ok"), "child-fork")
-        ch.respond(_envelope("return", result="all done"), "parent-fork")
-        driver.resume(tree, target_session_id="child-fork", reply="847291")
+        ch.respond(_envelope("return", result="auth-ok"), "00000000-0000-0000-0000-0000000000d1")
+        ch.respond(_envelope("return", result="all done"), "00000000-0000-0000-0000-0000000000d4")
+        driver.resume(tree, target_session_id="00000000-0000-0000-0000-0000000000d1", reply="847291")
 
         assert child.status == "complete"
         assert root.status == "complete"
@@ -323,7 +326,7 @@ class TestInstrumentation:
                 sid = "parent-fork"
             elif idx == 1:
                 body = _envelope("return", result="sub-done")
-                sid = "child-fork"
+                sid = "00000000-0000-0000-0000-0000000000d1"
             else:
                 body = _envelope("return", result="all done")
                 sid = "parent-fork"
@@ -346,11 +349,11 @@ class TestInstrumentation:
         assert root.children[0].max_context_tokens_seen == 5000
 
     def test_tree_schema_version_in_snapshot(self, tmp_path, parent_session):
-        ch = ScriptedChannel().respond(_envelope("yield", question="?"), "child-fork")
+        ch = ScriptedChannel().respond(_envelope("yield", question="?"), "00000000-0000-0000-0000-0000000000d1")
         driver = _make_driver(tmp_path, ch)
         project = tmp_path / "_no_real_projects" / "p"
         project.mkdir(parents=True)
-        (project / "child-fork.jsonl").write_text("")
+        (project / "00000000-0000-0000-0000-0000000000d1.jsonl").write_text("")
         tree = driver.run(parent_session, ["t"])
         assert tree.to_dict()["schema_version"] == "2"
 

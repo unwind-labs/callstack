@@ -12,6 +12,7 @@ whole subtree pauses; `Driver.resume(reply)` continues it.
 """
 from __future__ import annotations
 
+import atexit
 import concurrent.futures as cf
 import datetime as dt
 import os
@@ -29,10 +30,41 @@ def _utc_now() -> str:
 CALL_TREE_SCHEMA_VERSION = "2"
 
 from . import state as st
-from .channel import Channel, TurnTimeout
+from .channel import (
+    Channel, TurnTimeout,
+    _MAX_IN_FLIGHT_TURNS as _CHANNEL_MAX_IN_FLIGHT,
+)
 from .protocol import parse_envelope
 from .session import SessionRef, count_lines
 from .trace import TraceWriter, TreeStore
+
+
+# PERF-J: single module-level pool sized to the channel's in-flight turn
+# cap. Drives multi-task call_many fan-out without paying the cold-pool
+# construction cost per call. atexit shuts it down politely so pending
+# futures aren't killed mid-write.
+_RUN_POOL: Optional[cf.ThreadPoolExecutor] = None
+_RUN_POOL_LOCK = __import__("threading").Lock()
+
+
+def _get_run_pool() -> cf.ThreadPoolExecutor:
+    global _RUN_POOL
+    if _RUN_POOL is None:
+        with _RUN_POOL_LOCK:
+            if _RUN_POOL is None:
+                _RUN_POOL = cf.ThreadPoolExecutor(
+                    max_workers=max(2, _CHANNEL_MAX_IN_FLIGHT),
+                    thread_name_prefix="callstack-driver",
+                )
+                atexit.register(_shutdown_run_pool)
+    return _RUN_POOL
+
+
+def _shutdown_run_pool() -> None:
+    global _RUN_POOL
+    pool, _RUN_POOL = _RUN_POOL, None
+    if pool is not None:
+        pool.shutdown(wait=True, cancel_futures=False)
 
 
 # ---------- Tree of execution nodes ----------
@@ -234,12 +266,21 @@ class Driver:
         if len(nodes) == 1:
             self._drive(nodes[0], parent.session_id, parent.file, base_depth + 1)
         else:
-            with cf.ThreadPoolExecutor(max_workers=len(nodes)) as pool:
-                futures = [
-                    pool.submit(self._drive, n, parent.session_id, parent.file, base_depth + 1)
-                    for n in nodes
-                ]
-                cf.wait(futures)
+            # PERF-J: reuse the module-level pool instead of constructing a
+            # fresh ThreadPoolExecutor per call_many.
+            pool = _get_run_pool()
+            futures = [
+                pool.submit(self._drive, n, parent.session_id, parent.file,
+                            base_depth + 1)
+                for n in nodes
+            ]
+            cf.wait(futures)
+            for fut in futures:
+                # Surface any exception so it doesn't get lost on the pool's
+                # background thread. _drive doesn't raise on normal node
+                # failures (those land in Node.state), so an exception here
+                # is genuinely unexpected.
+                fut.result()
 
         self._persist_if_yielded(tree)
         self._notify()

@@ -18,8 +18,10 @@ import contextlib
 import fcntl
 import hashlib
 import os
+import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Iterator, Optional, Sequence
 
@@ -154,14 +156,10 @@ class _LiveReporter:
             self._latest_ended_at = ended_at
             self._do_merge(force=True, ended_at=ended_at)
             self._append_transitions(tree, ended_at)
-        # Root's finalize runs strictly after every nested finalize (parent
-        # driver.run() doesn't return until all forks complete), so it's
-        # safe to remove the lock file here — nothing else will need it.
-        if not self._ctx.is_nested:
-            try:
-                self._ctx.lock_path.unlink()
-            except FileNotFoundError:
-                pass
+        # SEC-009: never unlink the lock file. Re-creating it between
+        # acquirers races with the unlink and hands different inodes to
+        # concurrent waiters, breaking mutual exclusion. Orphan lock
+        # files are harmless and reused on the next run.
 
     # ---- per-frame snapshot ----
 
@@ -250,15 +248,55 @@ class _LiveReporter:
 
 # ---------- cross-process lock ----------
 
+# SEC-009: short-poll non-blocking retry budget for the merge lock. A
+# wedged sibling reporter can't deadlock the tree if we time-bound here.
+_LOCK_TIMEOUT_SECONDS = 30.0
+
+
 @contextlib.contextmanager
 def _interprocess_lock(path: Path) -> Iterator[None]:
+    """Exclusive cross-process lock around the report merge.
+
+    Uses ``fcntl.lockf`` (POSIX byte-range locks, defined on NFS) rather
+    than ``flock`` so behaviour is well-defined when ``~/.claude/`` lives
+    on a mounted volume. Non-blocking with exponential backoff up to
+    ``_LOCK_TIMEOUT_SECONDS`` — past that we proceed without the lock
+    rather than wedging the whole tree on one stuck writer.
+
+    SEC-009: we never unlink the lock file. Re-creating the same path
+    between acquirers would race with the unlink and hand different
+    inodes to concurrent waiters, breaking exclusion. Orphan lock files
+    are harmless (zero bytes, reused next run).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+    delay = 0.005
     with open(path, "a+") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        held = False
+        while True:
+            try:
+                fcntl.lockf(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = True
+                break
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    print(
+                        f"[callstack] interprocess merge lock {path} held by "
+                        f"another writer for >{_LOCK_TIMEOUT_SECONDS:.0f}s; "
+                        f"proceeding without lock",
+                        file=sys.stderr,
+                    )
+                    break
+                time.sleep(delay)
+                delay = min(delay * 2, 0.25)
         try:
             yield
         finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            if held:
+                try:
+                    fcntl.lockf(f.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
 
 
 def _atomic_yaml_write(path: Path, doc: Any) -> None:

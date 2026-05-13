@@ -7,8 +7,8 @@ import yaml
 
 from agent_callstack import (
     _InvocationContext, _LiveReporter, _ROOT_FRAME_KEY,
-    _write_invocation_report,
 )
+from tests._helpers import write_invocation_report as _write_invocation_report
 from agent_callstack.channel import ScriptedChannel
 from agent_callstack.driver import Driver, Node, Tree
 from agent_callstack.session import SessionLocator, SessionRef

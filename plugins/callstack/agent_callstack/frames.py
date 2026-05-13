@@ -15,6 +15,7 @@ Nothing here performs I/O outside of `_load_frames` (read + stat) and
 """
 from __future__ import annotations
 
+import re
 import threading
 from pathlib import Path
 from typing import Optional
@@ -38,6 +39,13 @@ _ROOT_FRAME_KEY = "root"
 _FRAMES_PARSED_CACHE: dict[Path, tuple[int, int, dict]] = {}
 _FRAMES_PARSED_CACHE_LOCK = threading.Lock()
 
+# SEC-006: safety bounds on the frames-dir scan. A stray or hostile
+# process that drops files into a known frames_dir can otherwise stall
+# the merge loop.
+_MAX_FRAMES_PER_LOAD = 2048
+_MAX_FRAME_FILE_BYTES = 2 * 1024 * 1024  # 2 MiB
+_FRAME_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
 
 def _frames_cache_clear() -> None:
     """Test hook: drop the parsed-frame cache."""
@@ -56,13 +64,25 @@ def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
     Backed by a stat-keyed cache (PERF-B): re-parsing every YAML on every
     reporter tick was the second-largest cost after the merge rebuild.
     """
+    import sys
     out: dict[str, list[dict]] = {}
     if not frames_dir.is_dir():
         return out
+    loaded = 0
     for p in frames_dir.glob("*.yaml"):
+        if loaded >= _MAX_FRAMES_PER_LOAD:
+            print(f"[callstack] frames_dir {frames_dir} contains more than "
+                  f"{_MAX_FRAMES_PER_LOAD} files; further frames ignored",
+                  file=sys.stderr)
+            break
         try:
             st = p.stat()
         except OSError:
+            continue
+        if st.st_size > _MAX_FRAME_FILE_BYTES:
+            print(f"[callstack] skipping oversized frame file {p} "
+                  f"({st.st_size} bytes > {_MAX_FRAME_FILE_BYTES})",
+                  file=sys.stderr)
             continue
         stat_key = (st.st_mtime_ns, st.st_size)
         with _FRAMES_PARSED_CACHE_LOCK:
@@ -77,7 +97,6 @@ def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
                 # preserve forward progress; the producer's next atomic
                 # write will land a fresh (mtime, size) tuple and we'll
                 # retry. SEC-011: log so corruption is observable.
-                import sys
                 print(f"[callstack] ignoring malformed frame file {p}: "
                       f"{type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
                 continue
@@ -88,8 +107,12 @@ def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
         if not isinstance(d, dict):
             continue
         key = d.get("frame_key")
-        if isinstance(key, str):
-            out.setdefault(key, []).append(d)
+        # SEC-006: reject frames whose key doesn't match the expected
+        # shape (root frame, hex uuid, or hex-uuid-instance pair).
+        if not (isinstance(key, str) and _FRAME_KEY_RE.fullmatch(key)):
+            continue
+        out.setdefault(key, []).append(d)
+        loaded += 1
     for key in out:
         out[key].sort(key=lambda f: str(f.get("started_at") or ""))
     return out

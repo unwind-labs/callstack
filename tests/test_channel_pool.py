@@ -70,8 +70,8 @@ class TestClaudePool:
 
     def test_register_then_acquire_returns_same_entry(self, pool):
         p = _mock_pooled_process()
-        pool.register("sA", p)
-        assert pool.acquire("sA") is p
+        pool.register("00000000-0000-0000-0000-0000000000c3", p)
+        assert pool.acquire("00000000-0000-0000-0000-0000000000c3") is p
 
     def test_acquire_missing_returns_none(self, pool):
         assert pool.acquire("nope") is None
@@ -79,16 +79,16 @@ class TestClaudePool:
     def test_dead_process_is_dropped_on_acquire(self, pool):
         p = _mock_pooled_process()
         p.proc.poll.return_value = 1  # exited
-        pool.register("sA", p)
-        assert pool.acquire("sA") is None
+        pool.register("00000000-0000-0000-0000-0000000000c3", p)
+        assert pool.acquire("00000000-0000-0000-0000-0000000000c3") is None
         # Subsequent acquire still None (entry was cleaned).
-        assert pool.acquire("sA") is None
+        assert pool.acquire("00000000-0000-0000-0000-0000000000c3") is None
 
     def test_evict_removes_and_closes(self, pool):
         p = _mock_pooled_process()
-        pool.register("sA", p)
-        pool.evict("sA")
-        assert pool.acquire("sA") is None
+        pool.register("00000000-0000-0000-0000-0000000000c3", p)
+        pool.evict("00000000-0000-0000-0000-0000000000c3")
+        assert pool.acquire("00000000-0000-0000-0000-0000000000c3") is None
         p.proc.terminate.assert_called()
 
     def test_lru_eviction_when_over_cap(self):
@@ -128,9 +128,9 @@ class TestClaudePool:
     def test_re_register_replaces_old_entry(self, pool):
         p1 = _mock_pooled_process()
         p2 = _mock_pooled_process()
-        pool.register("sA", p1)
-        pool.register("sA", p2)
-        assert pool.acquire("sA") is p2
+        pool.register("00000000-0000-0000-0000-0000000000c3", p1)
+        pool.register("00000000-0000-0000-0000-0000000000c3", p2)
+        assert pool.acquire("00000000-0000-0000-0000-0000000000c3") is p2
         # The displaced process was closed.
         p1.proc.terminate.assert_called()
 
@@ -200,82 +200,82 @@ class _SpawnAndTurnRecorder:
 class TestChannelPoolIntegration:
 
     def test_resume_reuses_same_pooled_process(self, monkeypatch, fresh_module_pool):
-        rec = _SpawnAndTurnRecorder(session_ids=["sX"])
+        rec = _SpawnAndTurnRecorder(session_ids=["00000000-0000-0000-0000-0000000000c2"])
         ch = ClaudeChannel()
         rec.patch(monkeypatch, ch)
 
         # First turn: fork. Spawns, ends with session_id=sX, pooled.
-        r1 = ch.run_turn("parent", "task1", mode="fork")
-        assert r1.session_id == "sX"
+        r1 = ch.run_turn("00000000-0000-0000-0000-0000000000c0", "task1", mode="fork")
+        assert r1.session_id == "00000000-0000-0000-0000-0000000000c2"
         assert len(rec.spawn_calls) == 1
         assert rec.turn_calls[0][2] is True  # do_handshake on first turn
 
         # Second turn: resume against sX. Should hit the pool — no new spawn.
-        r2 = ch.run_turn("sX", "task2", mode="resume")
-        assert r2.session_id == "sX"
+        r2 = ch.run_turn("00000000-0000-0000-0000-0000000000c2", "task2", mode="resume")
+        assert r2.session_id == "00000000-0000-0000-0000-0000000000c2"
         assert len(rec.spawn_calls) == 1, "second resume should reuse"
         assert rec.turn_calls[1][2] is False  # no handshake on reuse
         assert fresh_module_pool.size() == 1
 
     def test_two_different_sessions_each_spawn(self, monkeypatch, fresh_module_pool):
-        rec = _SpawnAndTurnRecorder(session_ids=["sA", "sB"])
+        rec = _SpawnAndTurnRecorder(session_ids=["00000000-0000-0000-0000-0000000000c3", "00000000-0000-0000-0000-0000000000c4"])
         ch = ClaudeChannel()
         rec.patch(monkeypatch, ch)
 
-        ch.run_turn("parent", "ta", mode="fork")
-        ch.run_turn("parent", "tb", mode="fork")
+        ch.run_turn("00000000-0000-0000-0000-0000000000c0", "ta", mode="fork")
+        ch.run_turn("00000000-0000-0000-0000-0000000000c0", "tb", mode="fork")
         assert len(rec.spawn_calls) == 2
         assert fresh_module_pool.size() == 2
-        assert set(fresh_module_pool.session_ids()) == {"sA", "sB"}
+        assert set(fresh_module_pool.session_ids()) == {"00000000-0000-0000-0000-0000000000c3", "00000000-0000-0000-0000-0000000000c4"}
 
     def test_lru_eviction_at_pool_cap(self, monkeypatch, fresh_module_pool):
         # Force a small cap by replacing the pool entirely.
         small_pool = ClaudePool(max_size=2)
         monkeypatch.setattr(ch_mod, "_pool", small_pool)
 
-        rec = _SpawnAndTurnRecorder(session_ids=["sA", "sB", "sC"])
+        rec = _SpawnAndTurnRecorder(session_ids=["00000000-0000-0000-0000-0000000000c3", "00000000-0000-0000-0000-0000000000c4", "00000000-0000-0000-0000-0000000000c5"])
         ch = ClaudeChannel()
         rec.patch(monkeypatch, ch)
 
-        ch.run_turn("p", "ta", mode="fork"); time.sleep(0.005)
-        ch.run_turn("p", "tb", mode="fork"); time.sleep(0.005)
-        ch.run_turn("p", "tc", mode="fork")
+        ch.run_turn("00000000-0000-0000-0000-0000000000c1", "ta", mode="fork"); time.sleep(0.005)
+        ch.run_turn("00000000-0000-0000-0000-0000000000c1", "tb", mode="fork"); time.sleep(0.005)
+        ch.run_turn("00000000-0000-0000-0000-0000000000c1", "tc", mode="fork")
 
         # sA (oldest) should have been evicted.
         assert small_pool.size() == 2
         sids = set(small_pool.session_ids())
-        assert sids == {"sB", "sC"}
+        assert sids == {"00000000-0000-0000-0000-0000000000c4", "00000000-0000-0000-0000-0000000000c5"}
 
     def test_timeout_in_pooled_turn_evicts(self, monkeypatch, fresh_module_pool):
-        # First turn: succeed and pool under "sP".
-        rec = _SpawnAndTurnRecorder(session_ids=["sP"])
+        # First turn: succeed and pool under "00000000-0000-0000-0000-0000000000c6".
+        rec = _SpawnAndTurnRecorder(session_ids=["00000000-0000-0000-0000-0000000000c6"])
         ch = ClaudeChannel()
         rec.patch(monkeypatch, ch)
-        ch.run_turn("parent", "ta", mode="fork")
+        ch.run_turn("00000000-0000-0000-0000-0000000000c0", "ta", mode="fork")
         assert fresh_module_pool.size() == 1
 
-        # Second turn: resume on "sP", but _run_one_turn raises TurnTimeout.
+        # Second turn: resume on "00000000-0000-0000-0000-0000000000c6", but _run_one_turn raises TurnTimeout.
         def boom(self_, entry, prompt, timeout, on_session_id, *, do_handshake):
             raise TurnTimeout("simulated", partial="")
         monkeypatch.setattr(ClaudeChannel, "_run_one_turn", boom)
 
         with pytest.raises(TurnTimeout):
-            ch.run_turn("sP", "tb", mode="resume")
+            ch.run_turn("00000000-0000-0000-0000-0000000000c6", "tb", mode="resume")
 
         # Failed pooled turn evicts the process.
         assert fresh_module_pool.size() == 0
-        assert fresh_module_pool.acquire("sP") is None
+        assert fresh_module_pool.acquire("00000000-0000-0000-0000-0000000000c6") is None
 
     def test_resume_cache_miss_spawns_and_pools(self, monkeypatch, fresh_module_pool):
-        rec = _SpawnAndTurnRecorder(session_ids=["sZ"])
+        rec = _SpawnAndTurnRecorder(session_ids=["00000000-0000-0000-0000-0000000000c7"])
         ch = ClaudeChannel()
         rec.patch(monkeypatch, ch)
 
         # First call is mode=resume for a session never seen → spawn fresh.
-        r = ch.run_turn("sZ", "go", mode="resume")
-        assert r.session_id == "sZ"
+        r = ch.run_turn("00000000-0000-0000-0000-0000000000c7", "go", mode="resume")
+        assert r.session_id == "00000000-0000-0000-0000-0000000000c7"
         assert len(rec.spawn_calls) == 1
-        # The recorder fed "sZ" back as the session id; pool now holds it.
-        assert fresh_module_pool.session_ids() == ["sZ"]
+        # The recorder fed "00000000-0000-0000-0000-0000000000c7" back as the session id; pool now holds it.
+        assert fresh_module_pool.session_ids() == ["00000000-0000-0000-0000-0000000000c7"]
         # Handshake was performed on the cache-miss spawn.
         assert rec.turn_calls[0][2] is True

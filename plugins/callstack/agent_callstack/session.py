@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,12 @@ from typing import Optional
 
 CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
+
+# Shape validation for session ids before any filesystem probe (SEC-003).
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
 
 # Env vars that may contain the parent session, in priority order.
 _ENV_PARENT_PATH = "CALLSTACK_PARENT_SESSION"   # absolute file path
@@ -105,8 +112,14 @@ class SessionLocator:
              (``{session_id: project_dir_name}``). Verified before returning.
           3. Full project-dir scan, populating the index with every
              ``session_id`` discovered before returning. The index is
-             persisted atomically.
+             persisted atomically. Skipped when `cwd` is provided — a
+             caller-scoped lookup must not probe other projects.
+
+        SEC-003: session_id is shape-validated as a UUID before any
+        filesystem probe; malformed input returns None immediately.
         """
+        if not _UUID_RE.fullmatch(session_id):
+            return None
         project_dir = self._project_dir_for(cwd)
         if project_dir:
             candidate = project_dir / f"{session_id}.jsonl"
@@ -121,6 +134,9 @@ class SessionLocator:
             cand = self._projects_dir / recorded / f"{session_id}.jsonl"
             if cand.is_file():
                 return cand
+        # Caller-scoped lookup: don't cross project boundaries via full scan.
+        if cwd is not None:
+            return None
         # Fallback scan; populate index with everything we see.
         found: Optional[Path] = None
         discovered: dict[str, str] = {}

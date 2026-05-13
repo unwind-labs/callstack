@@ -305,6 +305,16 @@ def _shared() -> Caller:
     return _default
 
 
+def _resolve_caller(seed: Optional[int], timeout: Optional[int]) -> Caller:
+    """ARCH-12: shared resolution between module-level wrappers.
+
+    Returns a fresh `Caller` when seed or timeout is overridden, else the
+    shared singleton."""
+    if seed is None and timeout is None:
+        return _shared()
+    return Caller(timeout=timeout or 300, seed=seed)
+
+
 def call(task: str, *, seed: Optional[int] = None,
          timeout: Optional[int] = None,
          context: str = "fork") -> Result:
@@ -321,58 +331,20 @@ def call(task: str, *, seed: Optional[int] = None,
         output — the Anthropic API has no seed parameter as of 2026-04. Use
         this to label trials, not to expect bitwise reproducibility.
     """
-    if timeout is not None or seed is not None:
-        return Caller(timeout=timeout or 300, seed=seed).call(task, context=context)
-    return _shared().call(task, context=context)
+    return _resolve_caller(seed, timeout).call(task, context=context)
 
 
 def call_many(tasks: Sequence[str], *, seed: Optional[int] = None,
               timeout: Optional[int] = None,
               context: str = "fork") -> MultiResult:
-    if timeout is not None or seed is not None:
-        return Caller(timeout=timeout or 300, seed=seed).call_many(tasks, context=context)
-    return _shared().call_many(tasks, context=context)
+    return _resolve_caller(seed, timeout).call_many(tasks, context=context)
 
 
 def resume(token: YieldToken, reply: str, *, seed: Optional[int] = None,
            timeout: Optional[int] = None) -> Result:
-    if timeout is not None or seed is not None:
-        return Caller(timeout=timeout or 300, seed=seed).resume(token, reply)
-    return _shared().resume(token, reply)
+    return _resolve_caller(seed, timeout).resume(token, reply)
 
 
-# ---------- legacy one-shot writer (tests / external callers) ----------
-
-def _write_invocation_report(
-    *,
-    log_dir: Path,
-    invoke_id: str,
-    kind: str,
-    tasks: Sequence[str],
-    tree: Tree,
-    cwd: str,
-    started_at: str,
-    ended_at: str,
-) -> Path:
-    """One-shot writer: materialize a root frame + merged report in one go.
-
-    Kept for tests and ad-hoc use. Live runs go through `_LiveReporter`.
-    Writes into `{log_dir}/{invoke_id}/report.yaml`."""
-    ctx = _InvocationContext(
-        invoke_id=invoke_id, log_dir=log_dir, cwd=cwd,
-        frame_key=_ROOT_FRAME_KEY, is_nested=False,
-    )
-    ctx.frames_dir.mkdir(parents=True, exist_ok=True)
-    _atomic_yaml_write(ctx.frame_path(), {
-        "frame_key": _ROOT_FRAME_KEY, "is_nested": False,
-        "kind": kind, "tasks": list(tasks), "cwd": cwd,
-        "started_at": started_at, "ended_at": ended_at,
-        "tree": tree.to_dict(),
-    })
-    frames = _load_frames(ctx.frames_dir)
-    doc = _build_merged_report(
-        invoke_id=invoke_id, frames=frames,
-        root_frame=frames[_ROOT_FRAME_KEY][0], ended_at=ended_at,
-    )
-    _atomic_yaml_write(ctx.report_path, doc)
-    return ctx.report_path
+# ARCH-13: the legacy one-shot writer `_write_invocation_report` previously
+# lived here for tests only. It has moved to tests/_helpers.py
+# (`write_invocation_report`). Production code uses `_LiveReporter`.

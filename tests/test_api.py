@@ -32,12 +32,13 @@ def parent_file(tmp_path):
 
 def _make_caller(tmp_path, parent_file, channel: ScriptedChannel) -> Caller:
     """Subclass Caller so all driver creation uses the scripted channel."""
-    projects = tmp_path / "projects" / "fake-project"
+    from agent_callstack.session import encode_project_dir
+    projects = tmp_path / "projects" / encode_project_dir(str(tmp_path))
     projects.mkdir(parents=True, exist_ok=True)
 
     class _Caller(Caller):
         def _invoke(self, tasks, *, context: str = "fork"):
-            parent = SessionRef(session_id="parent-id", file=parent_file)
+            parent = SessionRef(session_id="00000000-0000-0000-0000-0000000000d2", file=parent_file)
             driver = self._scripted_driver()
             tree = driver.run(parent, tasks, base_depth=0, context=context)
             from agent_callstack import _results_from_tree  # type: ignore
@@ -69,7 +70,8 @@ def _make_caller(tmp_path, parent_file, channel: ScriptedChannel) -> Caller:
 
 
 def _make_clone(tmp_path, name) -> Path:
-    p = tmp_path / "projects" / "fake-project"
+    from agent_callstack.session import encode_project_dir
+    p = tmp_path / "projects" / encode_project_dir(str(tmp_path))
     p.mkdir(parents=True, exist_ok=True)
     f = p / f"{name}.jsonl"
     f.write_text("")
@@ -81,8 +83,8 @@ def _make_clone(tmp_path, name) -> Path:
 class TestCall:
 
     def test_returns_result(self, tmp_path, parent_file):
-        _make_clone(tmp_path, "child")
-        ch = ScriptedChannel().respond(_envelope("return", result="hi", summary="s"), "child")
+        _make_clone(tmp_path, "00000000-0000-0000-0000-0000000000d5")
+        ch = ScriptedChannel().respond(_envelope("return", result="hi", summary="s"), "00000000-0000-0000-0000-0000000000d5")
         caller = _make_caller(tmp_path, parent_file, ch)
 
         r = caller.call("do thing")
@@ -91,15 +93,15 @@ class TestCall:
         assert r.summary == "s"
 
     def test_yield_raises(self, tmp_path, parent_file):
-        clone = _make_clone(tmp_path, "yld")
-        ch = ScriptedChannel().respond(_envelope("yield", question="MFA?"), "yld")
+        clone = _make_clone(tmp_path, "00000000-0000-0000-0000-0000000000d0")
+        ch = ScriptedChannel().respond(_envelope("yield", question="MFA?"), "00000000-0000-0000-0000-0000000000d0")
         caller = _make_caller(tmp_path, parent_file, ch)
 
         with pytest.raises(CallYielded) as excinfo:
             caller.call("auth")
         token = excinfo.value.token
         assert excinfo.value.question == "MFA?"
-        assert token.session_id == "yld"
+        assert token.session_id == "00000000-0000-0000-0000-0000000000d0"
         assert Path(token.clone_path) == clone
 
     def test_failure_raises(self, tmp_path, parent_file):
@@ -118,18 +120,20 @@ class TestCallMany:
 
     def test_mixed_results(self, tmp_path, parent_file):
         from agent_callstack.channel import TurnResult
-        _make_clone(tmp_path, "alpha")
-        _make_clone(tmp_path, "bravo")
+        _make_clone(tmp_path, "00000000-0000-0000-0000-0000000000d6")
+        _make_clone(tmp_path, "00000000-0000-0000-0000-0000000000d7")
         responses = {
-            "alpha": _envelope("return", result="A!"),
-            "bravo": _envelope("yield", question="?"),
+            "alpha": ("00000000-0000-0000-0000-0000000000d6",
+                      _envelope("return", result="A!")),
+            "bravo": ("00000000-0000-0000-0000-0000000000d7",
+                      _envelope("yield", question="?")),
         }
         def respond(_src, prompt, _fork):
             tail = prompt.rsplit("\n\n", 1)[-1]
-            for key, body in responses.items():
-                if key in tail:
+            for tag, (sid, body) in responses.items():
+                if tag in tail:
                     return TurnResult(
-                        text=body, session_id=key, duration=0.0,
+                        text=body, session_id=sid, duration=0.0,
                         api_request_id="", input_tokens=0, output_tokens=0,
                         cache_read_tokens=0, cache_creation_tokens=0,
                         total_cost_usd=0.0,
@@ -150,8 +154,8 @@ class TestCallMany:
 class TestResume:
 
     def test_resume_completes(self, tmp_path, parent_file):
-        clone = _make_clone(tmp_path, "child")
-        ch = ScriptedChannel().respond(_envelope("yield", question="MFA?"), "child")
+        clone = _make_clone(tmp_path, "00000000-0000-0000-0000-0000000000d5")
+        ch = ScriptedChannel().respond(_envelope("yield", question="MFA?"), "00000000-0000-0000-0000-0000000000d5")
         caller = _make_caller(tmp_path, parent_file, ch)
 
         with pytest.raises(CallYielded) as info:
@@ -159,6 +163,6 @@ class TestResume:
         token = info.value.token
 
         # Now respond to resume
-        ch.respond(_envelope("return", result="ok"), "child")
+        ch.respond(_envelope("return", result="ok"), "00000000-0000-0000-0000-0000000000d5")
         r = caller.resume(token, "847291")
         assert r.value == "ok"
