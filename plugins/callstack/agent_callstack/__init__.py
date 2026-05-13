@@ -202,16 +202,17 @@ class Caller:
         """Project folder of the caller's session — needed for cross-project
         fresh calls where `self._cwd` is the child's target, not the parent's
         project. Falls back through env, explicit cwd, then os.getcwd()."""
-        env_parent = os.environ.get(ENV_PARENT_SESSION)
-        if env_parent:
+        # We're inside a nested invocation iff the parent stamped its root
+        # identity into our env. Previously this was keyed off
+        # ENV_PARENT_SESSION, but that var is no longer propagated to spawned
+        # children (its inherited value caused the regression where
+        # grandchildren forked from root instead of their immediate parent).
+        # ENV_ROOT_INVOKE_ID serves the same "we're nested" signal.
+        if os.environ.get(ENV_ROOT_INVOKE_ID):
             try:
-                # ENV_PARENT_SESSION holds the parent session's JSONL path.
-                # Its parent dir is `~/.claude/projects/<encoded-cwd>/`,
-                # which we don't need to decode — SessionLocator can use any
-                # cwd to find the session; what matters is that we pick a
-                # cwd that resolves to the *caller's* project, not the
-                # redirected child cwd. The MCP server's actual os.getcwd()
-                # is reliably the caller's project folder.
+                # MCP server's os.getcwd() is reliably the caller's project
+                # folder; trust it over self._cwd (which may be a redirected
+                # child target in cross-project fresh calls).
                 return os.getcwd()
             except OSError:
                 pass
@@ -269,9 +270,15 @@ class Caller:
         # Children inherit the depth via env so nested CALLs respect max_depth.
         # Root identity propagates so nested MCP invokes can find and merge
         # into this same invocation's report.
+        #
+        # We deliberately do NOT propagate CALLSTACK_PARENT_SESSION here. Each
+        # spawned claude subprocess gets its own CLAUDE_SESSION_ID from Claude
+        # Code, which is the authoritative per-process identifier. Stamping
+        # the parent's session path into the child's env caused grandchildren
+        # to resolve the parent's parent (i.e. root) as their parent, because
+        # the inherited value was never overwritten by the intermediate claude.
         env = {
             ENV_DEPTH: str(depth_base + 1),
-            ENV_PARENT_SESSION: str(parent.file),
             ENV_ROOT_INVOKE_ID: ctx.invoke_id,
             ENV_ROOT_LOG_DIR: str(ctx.log_dir),
         }

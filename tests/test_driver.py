@@ -8,9 +8,10 @@ from pathlib import Path
 import pytest
 
 from agent_callstack.channel import ScriptedChannel, TurnResult, TurnTimeout
-from agent_callstack.driver import Driver, Tree
+from agent_callstack.driver import Driver, Node, Tree, _TreeIndex
 from agent_callstack.session import SessionLocator, SessionRef
 from agent_callstack.trace import TraceWriter, TreeStore
+import agent_callstack.state as st
 
 
 # ---------- helpers ----------
@@ -204,6 +205,33 @@ class TestParallel:
         assert len(tree.nodes) == 2
         assert {n.result for n in tree.nodes} == {"ALPHA done", "BRAVO done"}
         assert all(n.status == "complete" for n in tree.nodes)
+
+
+# ---------- parent-session invariant ----------
+
+class TestParentSessionInvariant:
+    """The core /call invariant at the Driver layer: `Driver.run(parent=P)`
+    forks from P's session, regardless of what env vars are present. The
+    Driver must NOT consult process env for parent identity."""
+
+    def test_forks_from_supplied_parent_ignoring_stale_env(self, tmp_path,
+                                                            parent_session,
+                                                            monkeypatch):
+        # Plant stale values that resemble the recursive-/call scenario.
+        monkeypatch.setenv("CALLSTACK_PARENT_SESSION", "/some/stale/path.jsonl")
+        monkeypatch.setenv("CLAUDE_SESSION_ID",
+                           "00000000-0000-0000-0000-0000000000ee")
+
+        ch = ScriptedChannel().respond(_envelope("return", result="ok"), "c1")
+        driver = _make_driver(tmp_path, ch)
+        driver.run(parent_session, ["task"])
+
+        # The Driver must use the SessionRef it was handed, not env.
+        assert ch.log[0][0] == parent_session.session_id, (
+            f"Driver forked from {ch.log[0][0]} but was given "
+            f"{parent_session.session_id} — Driver must not consult env "
+            f"for parent identity"
+        )
 
 
 # ---------- max-depth enforcement ----------
@@ -446,3 +474,54 @@ class TestDeepPropagate:
             node = node.children[0]
         assert node.state.kind == "done"
         assert node.result == "leaf-after-resume"
+
+
+class TestTreeIndexMissingClone:
+    """When a node has no clone_path (failed before snapshot resolved), its
+    children's parent_file must NOT silently attribute to the grandparent's
+    clone — that would misrepresent the call chain in trace output. The
+    legacy `_parent_file_for` returned `root_session.file` as a "we don't
+    know" sentinel; `_TreeIndex.build` must match."""
+
+    def test_missing_clone_falls_back_to_root_not_grandparent(self, tmp_path):
+        root_file = tmp_path / "root.jsonl"
+        root_file.write_text("")
+        a_clone = tmp_path / "a.jsonl"
+        a_clone.write_text("")
+        c_clone = tmp_path / "c.jsonl"
+        c_clone.write_text("")
+
+        def mk(node_id: str, clone: Path | None) -> Node:
+            n = Node(
+                id=node_id, task=node_id,
+                state=st.Pending(parent_session_id="root", task=node_id),
+            )
+            if clone is not None:
+                n.clone_path = str(clone)
+            return n
+
+        # Chain: top-level A (has clone) → B (NO clone) → C (has clone).
+        # Pre-fix: C.parent_file = A.clone (grandparent — wrong).
+        # Post-fix: C.parent_file = root_file (matches legacy fallback).
+        c = mk("c", c_clone)
+        b = mk("b", None)
+        a = mk("a", a_clone)
+        a.children.append(b)
+        b.children.append(c)
+
+        tree = Tree(
+            root_session=SessionRef(
+                session_id="00000000-0000-0000-0000-0000000000aa",
+                file=root_file,
+            ),
+            nodes=[a],
+            base_depth=0,
+        )
+        idx = _TreeIndex.build(tree)
+
+        assert idx.parent_file_of[id(a)] == root_file
+        assert idx.parent_file_of[id(b)] == a_clone
+        assert idx.parent_file_of[id(c)] == root_file, (
+            f"C's parent_file leaked to grandparent: {idx.parent_file_of[id(c)]} "
+            f"(expected root sentinel {root_file})"
+        )

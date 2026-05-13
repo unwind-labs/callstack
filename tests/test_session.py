@@ -108,6 +108,51 @@ class TestLocate:
         ref = loc.locate()
         assert ref.session_id == _sid("uuid-env")
 
+    def test_per_process_uuid_wins_over_inherited_path(self, tmp_path, projects,
+                                                        monkeypatch):
+        """REGRESSION (the core /call invariant): when BOTH env vars are set —
+        as happens inside every spawned child claude — the per-process
+        CLAUDE_SESSION_ID identifies *this* claude, while CALLSTACK_PARENT_SESSION
+        is the value the parent stamped pointing at *its* parent. The locator
+        must prefer the per-process identifier; otherwise nested /call grandchildren
+        fork from the wrong ancestor (root, not the immediate parent)."""
+        from agent_callstack.session import encode_project_dir
+        cwd = str(tmp_path / "proj")
+        proj = projects / encode_project_dir(cwd)
+        # Stale inherited path → root (the grandparent of any further /call).
+        root_file = _make_session(proj, "old", cwd=cwd)
+        # Fresh per-process identity → child (the immediate parent of /call).
+        _make_session(proj, "new", cwd=cwd)
+
+        monkeypatch.setenv("CALLSTACK_PARENT_SESSION", str(root_file))
+        monkeypatch.setenv("CLAUDE_SESSION_ID", _sid("new"))
+        loc = SessionLocator(projects_dir=projects)
+        ref = loc.locate(cwd=cwd)
+        assert ref.session_id == _sid("new"), (
+            "child claude resolved inherited root path instead of its own "
+            "per-process session id — nested /call would fork from root"
+        )
+
+    def test_stale_env_path_outside_projects_does_not_mask_uuid(self, tmp_path,
+                                                                  projects,
+                                                                  monkeypatch):
+        """SEC-002 guard composes with the priority order: if the inherited
+        path is outside PROJECTS_DIR AND a valid CLAUDE_SESSION_ID is set, the
+        UUID resolves; the rogue path is never opened. Both guards together,
+        not either alone."""
+        from agent_callstack.session import encode_project_dir
+        cwd = str(tmp_path / "real")
+        proj = projects / encode_project_dir(cwd)
+        _make_session(proj, "new", cwd=cwd)
+        rogue = tmp_path / "rogue.jsonl"
+        rogue.write_text(json.dumps({"cwd": "/elsewhere", "type": "user"}) + "\n")
+
+        monkeypatch.setenv("CALLSTACK_PARENT_SESSION", str(rogue))
+        monkeypatch.setenv("CLAUDE_SESSION_ID", _sid("new"))
+        loc = SessionLocator(projects_dir=projects)
+        ref = loc.locate(cwd=cwd)
+        assert ref.session_id == _sid("new")
+
     def test_mtime_fallback_picks_most_recent(self, projects, monkeypatch):
         from agent_callstack.session import encode_project_dir
         cwd = "/some/proj"
@@ -209,6 +254,41 @@ class TestSessionRefCwd:
         f.write_text(json.dumps({"type": "user"}) + "\n")
         ref = SessionRef(session_id="s", file=f)
         assert ref.cwd is None
+
+
+class TestLocateConcurrency:
+    """Layer 2 of the /call invariant suite: concurrent locate() must not
+    rely on (or mutate) shared global state. Guards against any future
+    introduction of module-level caches keyed across callers."""
+
+    def test_concurrent_explicit_resolution(self, projects, monkeypatch):
+        from concurrent.futures import ThreadPoolExecutor
+        from agent_callstack.session import encode_project_dir
+
+        # Build N distinct sessions in N distinct project dirs.
+        n = 16
+        sids = [f"00000000-0000-0000-0000-{i:012x}" for i in range(n)]
+        for i, sid in enumerate(sids):
+            cwd = f"/proj/{i}"
+            (projects / encode_project_dir(cwd)).mkdir(parents=True, exist_ok=True)
+            f = projects / encode_project_dir(cwd) / f"{sid}.jsonl"
+            f.write_text(json.dumps({"cwd": cwd, "type": "user"}) + "\n")
+
+        monkeypatch.delenv("CALLSTACK_PARENT_SESSION", raising=False)
+        monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+        loc = SessionLocator(projects_dir=projects)
+
+        def resolve(i):
+            sid = sids[i]
+            cwd = f"/proj/{i}"
+            return loc.locate(explicit=sid, cwd=cwd).session_id
+
+        order = list(range(n)) * 4  # 64 lookups, interleaved
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            got = list(ex.map(resolve, order))
+        assert got == [sids[i] for i in order], (
+            "concurrent locate() returned wrong sessions — shared state leak"
+        )
 
 
 class TestCountLines:

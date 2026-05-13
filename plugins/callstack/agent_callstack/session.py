@@ -51,8 +51,12 @@ class SessionRef:
 class SessionLocator:
     """Find session files on disk. Three strategies, tried in order."""
 
-    def __init__(self, projects_dir: Path = PROJECTS_DIR):
-        self._projects_dir = projects_dir
+    def __init__(self, projects_dir: Optional[Path] = None):
+        # Read the module global at construction time, not as a default arg.
+        # Python binds default args at function-definition time, so a
+        # monkeypatch of session.PROJECTS_DIR (used in tests for an isolated
+        # fake project tree) would otherwise never reach this locator.
+        self._projects_dir = projects_dir if projects_dir is not None else PROJECTS_DIR
         # Per-instance cache for _most_recent. Key: cwd string (or "" for
         # None). Value: (project_dir_mtime_ns, SessionRef-or-None). Stale
         # when project_dir_mtime advances (new/removed session JSONL).
@@ -71,7 +75,14 @@ class SessionLocator:
         if explicit:
             return self._from_explicit(explicit, cwd)
 
-        for env_var in (_ENV_PARENT_PATH, _ENV_PARENT_UUID):
+        # Priority: per-process CLAUDE_SESSION_ID before inherited
+        # CALLSTACK_PARENT_SESSION. The path env is set by a parent for its
+        # spawned child and gets inherited downward; without this order, a
+        # grandchild would resolve its parent as the *root* (the value its
+        # immediate parent originally inherited and never overwrote).
+        # CLAUDE_SESSION_ID is set fresh per claude subprocess and always
+        # identifies *this* process correctly.
+        for env_var in (_ENV_PARENT_UUID, _ENV_PARENT_PATH):
             value = os.environ.get(env_var)
             if not value:
                 continue

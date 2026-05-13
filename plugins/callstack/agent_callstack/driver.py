@@ -642,7 +642,12 @@ class _TreeIndex:
             depth_of[id(node)] = depth
             parent_file_of[id(node)] = pfile
             # Children fork from this node's clone, not its grandparent's.
-            child_pfile = Path(node.clone_path) if node.clone_path else pfile
+            # When clone_path is missing (e.g. node failed before its snapshot
+            # was resolved) we cannot honestly say "child forked from node",
+            # so fall back to root_file — same sentinel the legacy
+            # `_parent_file_for` returns. Falling back to `pfile` would
+            # silently attribute the child to its grandparent's clone.
+            child_pfile = Path(node.clone_path) if node.clone_path else root_file
             for c in node.children:
                 stack.append((c, node, depth + 1, child_pfile))
         return cls(parent_of=parent_of, depth_of=depth_of,
