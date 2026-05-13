@@ -385,6 +385,10 @@ def test_nested_detection_uses_mtime_fallback(tmp_path, monkeypatch):
     # Ensure newer has strictly greater mtime.
     _os.utime(newest, (newest.stat().st_atime, newest.stat().st_mtime + 1))
 
+    # `_most_recent_session` (now in agent_callstack.frames) reads from
+    # `agent_callstack.session.PROJECTS_DIR` dynamically — point both there
+    # and at the legacy re-export so older monkeypatches keep working.
+    monkeypatch.setattr("agent_callstack.session.PROJECTS_DIR", projects)
     monkeypatch.setattr("agent_callstack.PROJECTS_DIR", projects)
     monkeypatch.setenv(ENV_ROOT_INVOKE_ID, "inv-nest-fallback")
     monkeypatch.setenv(ENV_ROOT_LOG_DIR, str(tmp_path / "log"))
@@ -488,17 +492,19 @@ def test_debounce_coalesces_burst_of_notifies(tmp_path, monkeypatch):
     of frame YAML writes can complete on slow CI before the timer fires."""
     monkeypatch.setenv("CALLSTACK_REPORT_DEBOUNCE_SECS", "2.0")
 
-    import agent_callstack as ac
+    from agent_callstack import reporter as rep_mod
 
     write_count = {"n": 0}
-    real_atomic_write_bytes = ac._atomic_write_bytes
+    real_atomic_write_bytes = rep_mod._atomic_write_bytes
 
     def counting(path, payload):
         if path.name == "report.yaml":
             write_count["n"] += 1
         return real_atomic_write_bytes(path, payload)
 
-    monkeypatch.setattr(ac, "_atomic_write_bytes", counting)
+    # _LiveReporter._do_merge calls the reporter-module-local symbol; patch
+    # there, not on the agent_callstack re-export.
+    monkeypatch.setattr(rep_mod, "_atomic_write_bytes", counting)
 
     log_dir = tmp_path / "log"
     parent = SessionRef(session_id="root", file=tmp_path / "r.jsonl")
@@ -565,17 +571,17 @@ def test_content_hash_skip_avoids_duplicate_writes(tmp_path, monkeypatch):
     must produce exactly one report.yaml write; the second is hash-skipped."""
     monkeypatch.setenv("CALLSTACK_REPORT_DEBOUNCE_SECS", "0")
 
-    import agent_callstack as ac
+    from agent_callstack import reporter as rep_mod
 
     write_count = {"n": 0}
-    real_atomic_write_bytes = ac._atomic_write_bytes
+    real_atomic_write_bytes = rep_mod._atomic_write_bytes
 
     def counting(path, payload):
         if path.name == "report.yaml":
             write_count["n"] += 1
         return real_atomic_write_bytes(path, payload)
 
-    monkeypatch.setattr(ac, "_atomic_write_bytes", counting)
+    monkeypatch.setattr(rep_mod, "_atomic_write_bytes", counting)
 
     log_dir = tmp_path / "log"
     parent = SessionRef(session_id="root", file=tmp_path / "r.jsonl")
@@ -590,9 +596,10 @@ def test_content_hash_skip_avoids_duplicate_writes(tmp_path, monkeypatch):
 
     # ended_at flows into the merged document, so pin it to a constant
     # across all notifies — otherwise the doc differs each tick and the
-    # hash skip never triggers. This is the legitimate case the skip
-    # exists for: the tree is unchanged and time hasn't moved.
-    monkeypatch.setattr(ac, "_utc_now_iso", lambda: "2026-05-13T00:00:00+00:00")
+    # hash skip never triggers. _LiveReporter binds `_utc_now_iso` from
+    # the reporter module; patch there.
+    monkeypatch.setattr(rep_mod, "_utc_now_iso",
+                        lambda: "2026-05-13T00:00:00+00:00")
 
     reporter(tree)
     assert write_count["n"] == 1

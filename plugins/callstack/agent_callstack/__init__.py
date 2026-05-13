@@ -19,21 +19,40 @@ For power users (custom session, model, permission handler, etc.):
 """
 from __future__ import annotations
 
-import contextlib
-import datetime as dt
-import fcntl
-import hashlib
 import os
-import threading
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Optional, Sequence
-
-import yaml
+from typing import Optional, Sequence
 
 from .channel import ClaudeChannel, PermissionHandler, allow_all, shutdown_pool
 from .driver import Driver, Node, Tree
+from .frames import (
+    _ROOT_FRAME_KEY,
+    _build_merged_report,
+    _frames_cache_clear,
+    _load_frames,
+    _most_recent_session,
+)
+from .invocation_ctx import _InvocationContext, _new_invoke_id, _utc_now_iso
+from .reporter import (
+    _DEFAULT_REPORT_DEBOUNCE_SECS,
+    _LiveReporter,
+    _atomic_write_bytes,
+    _atomic_yaml_write,
+    _interprocess_lock,
+    _report_debounce_secs,
+)
+from .results import (
+    CallFailed,
+    CallYielded,
+    MultiResult,
+    Result,
+    YieldToken,
+    _result_from_node,
+    _results_from_tree,
+    _unwrap_single,
+    _wrap,
+)
 from .session import PROJECTS_DIR, SessionLocator, SessionRef, encode_project_dir
 from .trace import TraceWriter, TreeStore
 
@@ -45,48 +64,7 @@ __all__ = [
 ]
 
 
-# ---------- Public value types ----------
-
-@dataclass(frozen=True)
-class YieldToken:
-    """Opaque handle for resuming a yielded session. Pass to `resume()`."""
-    session_id: str
-    clone_path: str
-
-
-@dataclass(frozen=True)
-class Result:
-    value: Any
-    summary: Optional[str]
-    next: Optional[str]
-    duration: float
-    log: Optional[Path]
-    log_start: int
-
-
-@dataclass(frozen=True)
-class MultiResult:
-    """Returned by `call_many` (mixed completes/errors/yields)."""
-    results: list  # list[Result | CallFailed | CallYielded]
-
-
-class CallYielded(Exception):
-    """Raised when an agent emits YIELD. Carries the resume token + question."""
-    def __init__(self, question: str, token: YieldToken):
-        super().__init__(question)
-        self.question = question
-        self.token = token
-
-
-class CallFailed(Exception):
-    """Raised when an agent or its descendants fail. Carries any partial output."""
-    def __init__(self, error: str, partial: Any = None):
-        super().__init__(error)
-        self.error = error
-        self.partial = partial
-
-
-# ---------- Caller (power-user entry point) ----------
+# ---------- Env constants ----------
 
 ENV_DEPTH = "CALLSTACK_DEPTH"
 ENV_PARENT_SESSION = "CALLSTACK_PARENT_SESSION"
@@ -117,6 +95,8 @@ def _default_max_depth() -> int:
     except ValueError:
         return 10
 
+
+# ---------- Caller (power-user entry point) ----------
 
 class Caller:
     """Configurable runtime. Reuse across many `call()` invocations to share
@@ -243,7 +223,7 @@ class Caller:
     def _effective_log_dir(self, cwd: str) -> Path:
         return self._log_dir or (Path(cwd) / ".claude" / "callstack" / "log")
 
-    def _resolve_invocation_context(self, parent: SessionRef) -> "_InvocationContext":
+    def _resolve_invocation_context(self, parent: SessionRef) -> _InvocationContext:
         """Decide whether this call is a top-level (root) invocation or nested
         inside an already-running one. Nested calls inherit the root's
         `invoke_id` + `log_dir` from env so their tree can be merged under
@@ -283,7 +263,7 @@ class Caller:
             is_nested=False,
         )
 
-    def _driver_for(self, parent: SessionRef, *, ctx: "_InvocationContext",
+    def _driver_for(self, parent: SessionRef, *, ctx: _InvocationContext,
                     depth_base: int = 0) -> Driver:
         cwd = self._effective_cwd(parent)
         # Children inherit the depth via env so nested CALLs respect max_depth.
@@ -359,655 +339,6 @@ def resume(token: YieldToken, reply: str, *, seed: Optional[int] = None,
     if timeout is not None or seed is not None:
         return Caller(timeout=timeout or 300, seed=seed).resume(token, reply)
     return _shared().resume(token, reply)
-
-
-# ---------- Tree → public result translation ----------
-
-def _result_from_node(node: Node):
-    """Convert a finished node into Result / CallYielded / CallFailed."""
-    s = node.state
-    if s.kind == "done":
-        return Result(
-            value=node.result, summary=node.summary, next=node.suggested_next,
-            duration=round(node.duration, 2),
-            log=Path(node.clone_path) if node.clone_path else None,
-            log_start=node.parent_lines + 1,
-        )
-    if s.kind == "failed":
-        return CallFailed(error=node.error or "unknown error", partial=node.result)
-    if s.kind == "awaiting_user":
-        # Wraps the leaf the user must answer.
-        return CallYielded(
-            question=node.state.question,  # type: ignore[union-attr]
-            token=YieldToken(session_id=node.session_id or "",
-                             clone_path=node.clone_path or ""),
-        )
-    # Should not happen — drive() returned with an in-flight node.
-    return CallFailed(error=f"node ended in unexpected state: {s.kind}")
-
-
-def _results_from_tree(tree: Tree) -> list:
-    out = []
-    for root in tree.nodes:
-        leaf = root.yielded_descendant()
-        if leaf is not None:
-            out.append(_result_from_node(leaf))
-        else:
-            out.append(_result_from_node(root))
-    return out
-
-
-def _unwrap_single(item) -> Result:
-    if isinstance(item, Result):
-        return item
-    if isinstance(item, (CallYielded, CallFailed)):
-        raise item
-    raise CallFailed(error=f"unexpected result type: {type(item).__name__}")
-
-
-def _wrap(item):
-    """Identity for serialization; kept as a hook for future shaping."""
-    return item
-
-
-# ---------- Invocation-report writer ----------
-
-def _new_invoke_id() -> str:
-    """Sortable, collision-resistant id: `YYYYMMDDTHHMMSS-<8 hex>`."""
-    return f"{dt.datetime.now().strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
-
-
-def _utc_now_iso() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat()
-
-
-_ROOT_FRAME_KEY = "root"
-
-
-@dataclass(frozen=True)
-class _InvocationContext:
-    """Where a Caller writes its per-invocation artifacts.
-
-    ``instance_id`` disambiguates the frame *file* when multiple nested
-    invocations share the same ``frame_key`` (i.e. the same caller node
-    issues several sibling ``invoke*`` calls). Empty string preserves the
-    legacy ``{frame_key}.yaml`` filename — used for the root frame and for
-    tests that construct the context directly without setting it.
-
-    For the root (top-level) invocation `frame_key == "root"` and the Caller
-    owns the full invocation directory. For a nested MCP call — detected via
-    `CALLSTACK_ROOT_*` env — the Caller reuses the root's invocation directory
-    and writes its own tree to `_frames/{caller_session}.yaml`, where the
-    root's `_LiveReporter` picks it up and grafts it under the caller's node."""
-
-    invoke_id: str
-    log_dir: Path
-    cwd: str
-    frame_key: str
-    is_nested: bool
-    instance_id: str = ""
-
-    @property
-    def invocation_dir(self) -> Path:
-        return self.log_dir / self.invoke_id
-
-    @property
-    def frames_dir(self) -> Path:
-        return self.invocation_dir / "_frames"
-
-    @property
-    def report_path(self) -> Path:
-        return self.invocation_dir / "report.yaml"
-
-    @property
-    def log_path(self) -> Path:
-        return self.invocation_dir / "progress.log"
-
-    @property
-    def lock_path(self) -> Path:
-        return self.invocation_dir / ".report.lock"
-
-    def frame_path(self, key: Optional[str] = None) -> Path:
-        # Explicit key override (used by callers that need to read a peer
-        # frame) — keep the legacy single-file filename.
-        if key is not None:
-            return self.frames_dir / f"{key}.yaml"
-        # Production nested invocations carry a unique ``instance_id`` so
-        # multiple sibling invokes from the same caller don't overwrite
-        # each other's frame. The frame's ``frame_key`` field still pins it
-        # to the caller node for grafting.
-        if self.instance_id:
-            return self.frames_dir / f"{self.frame_key}-{self.instance_id}.yaml"
-        return self.frames_dir / f"{self.frame_key}.yaml"
-
-    def prefix(self, kind: str) -> str:
-        return f"nested_{kind}" if self.is_nested else kind
-
-
-_DEFAULT_REPORT_DEBOUNCE_SECS = 0.25
-
-
-def _report_debounce_secs() -> float:
-    """How long _LiveReporter waits before flushing a merged report write.
-
-    Coalesces bursty Driver._notify() calls so the heavy YAML emit + atomic
-    rewrite happens at most ~1/INTERVAL Hz. Tests can override via env.
-    """
-    raw = os.environ.get("CALLSTACK_REPORT_DEBOUNCE_SECS")
-    if raw is None:
-        return _DEFAULT_REPORT_DEBOUNCE_SECS
-    try:
-        v = float(raw)
-        return v if v >= 0 else _DEFAULT_REPORT_DEBOUNCE_SECS
-    except ValueError:
-        return _DEFAULT_REPORT_DEBOUNCE_SECS
-
-
-class _LiveReporter:
-    """`Driver.on_progress` callback — writes per-frame snapshots immediately,
-    appends transitions to a shared tail-friendly log immediately, and
-    coalesces merged-report rewrites behind a debounce timer (PERF-A).
-
-    Each invocation writes its own frame (`_frames/{key}.yaml`) containing
-    its Tree. The merged `report.yaml` is rebuilt by scanning every frame
-    and grafting non-root frames under their caller node. That rebuild is
-    O(total nodes) per call and YAML emit dominates, so we coalesce it
-    behind a ~0.25 s timer; finalize() forces a synchronous flush so the
-    on-disk report is fully up to date when the run ends.
-
-    A cross-process `fcntl.flock` serializes the merge so parent and
-    nested writers can't corrupt each other's updates; an in-process lock
-    serializes parallel roots in the same `call_many`."""
-
-    def __init__(self, *, ctx: _InvocationContext, kind: str,
-                 tasks: Sequence[str], started_at: str):
-        self._ctx = ctx
-        self._kind = kind
-        self._tasks = list(tasks)
-        self._started_at = started_at
-        self._prev_status: dict[str, str] = {}
-        self._thread_lock = threading.Lock()
-        self._merge_timer: Optional[threading.Timer] = None
-        self._latest_ended_at: Optional[str] = None
-        # SHA-256 of the last merged-report payload we actually wrote. Used
-        # to skip the atomic write when the rebuilt document is identical
-        # to what's already on disk (common when notifies arrive during a
-        # quiet period where only `ended_at` would change).
-        self._last_merged_hash: Optional[bytes] = None
-        self._finalized = False
-        self._debounce = _report_debounce_secs()
-
-    def __call__(self, tree: Tree) -> None:
-        ended_at = _utc_now_iso()
-        with self._thread_lock:
-            if self._finalized:
-                # Late notify after finalize — driver may still emit one
-                # while the timer is being cancelled; ignore.
-                return
-            self._ctx.invocation_dir.mkdir(parents=True, exist_ok=True)
-            self._ctx.frames_dir.mkdir(parents=True, exist_ok=True)
-            # Per-frame writes stay synchronous: cheap, and the merged-
-            # report consumer (nested writer's next tick, unwind UI)
-            # needs them visible promptly.
-            self._write_frame(tree, ended_at=ended_at)
-            self._latest_ended_at = ended_at
-            # Schedule the merge if one isn't already pending. The first
-            # action inside `_debounced_merge` is to null out the timer
-            # pointer under the same lock, so the next __call__ can
-            # schedule a fresh one.
-            if self._merge_timer is None and self._debounce > 0:
-                self._merge_timer = threading.Timer(
-                    self._debounce, self._debounced_merge,
-                )
-                self._merge_timer.daemon = True
-                self._merge_timer.start()
-            elif self._debounce == 0:
-                # 0-debounce: synchronous merge. Used by tests that want
-                # the legacy "write report.yaml on every notify" behavior.
-                self._do_merge(force=False, ended_at=ended_at)
-            # Transitions log stays synchronous so `tail -f progress.log`
-            # remains responsive.
-            self._append_transitions(tree, ended_at)
-
-    def _debounced_merge(self) -> None:
-        with self._thread_lock:
-            # finalize() may have run while the Timer thread was waiting
-            # for the lock — its synchronous merge already produced the
-            # authoritative report; nothing for us to do.
-            self._merge_timer = None
-            if self._finalized:
-                return
-            if self._latest_ended_at is None:
-                return
-            self._do_merge(force=False, ended_at=self._latest_ended_at)
-
-    def finalize(self, tree: Tree) -> None:
-        """Last write after the driver returns, so `ended_at` reflects real end.
-
-        Cancels any pending debounced merge and runs the merge synchronously
-        with force=True so the on-disk report reflects the final state even
-        when the merged-document hash hasn't changed (e.g. only `ended_at`
-        advanced in the last tick)."""
-        ended_at = _utc_now_iso()
-        with self._thread_lock:
-            if self._merge_timer is not None:
-                self._merge_timer.cancel()
-                self._merge_timer = None
-            self._finalized = True
-            self._ctx.invocation_dir.mkdir(parents=True, exist_ok=True)
-            self._ctx.frames_dir.mkdir(parents=True, exist_ok=True)
-            self._write_frame(tree, ended_at=ended_at)
-            self._latest_ended_at = ended_at
-            self._do_merge(force=True, ended_at=ended_at)
-            self._append_transitions(tree, ended_at)
-        # Root's finalize runs strictly after every nested finalize (parent
-        # driver.run() doesn't return until all forks complete), so it's
-        # safe to remove the lock file here — nothing else will need it.
-        if not self._ctx.is_nested:
-            try:
-                self._ctx.lock_path.unlink()
-            except FileNotFoundError:
-                pass
-
-    # ---- per-frame snapshot ----
-
-    def _write_frame(self, tree: Tree, *, ended_at: str) -> None:
-        frame = {
-            "frame_key": self._ctx.frame_key,
-            "is_nested": self._ctx.is_nested,
-            "kind": self._kind,
-            "tasks": self._tasks,
-            "cwd": self._ctx.cwd,
-            "started_at": self._started_at,
-            "ended_at": ended_at,
-            "tree": tree.to_dict(),
-        }
-        _atomic_yaml_write(self._ctx.frame_path(), frame)
-
-    # ---- merged report ----
-
-    def _do_merge(self, *, force: bool, ended_at: str) -> None:
-        """Rebuild the merged report and atomically write it, skipping the
-        write when the document is identical to what we last wrote (and
-        ``force`` is False). Must be called with ``self._thread_lock``."""
-        with _interprocess_lock(self._ctx.lock_path):
-            frames = _load_frames(self._ctx.frames_dir)
-            root_frames = frames.get(_ROOT_FRAME_KEY)
-            if not root_frames:
-                # Nested wrote first and root hasn't written yet — skip;
-                # the root's next progress tick will rewrite the report.
-                return
-            doc = _build_merged_report(
-                invoke_id=self._ctx.invoke_id, frames=frames,
-                root_frame=root_frames[0], ended_at=ended_at,
-            )
-            payload = yaml.safe_dump(
-                doc, sort_keys=False, default_flow_style=False,
-                width=120, allow_unicode=True,
-            ).encode("utf-8")
-            new_hash = hashlib.sha256(payload).digest()
-            if not force and new_hash == self._last_merged_hash:
-                return
-            _atomic_write_bytes(self._ctx.report_path, payload)
-            self._last_merged_hash = new_hash
-
-    # ---- shared append-only log ----
-
-    def _append_transitions(self, tree: Tree, ts: str) -> None:
-        # For nested, prefix every line's id-chain with the caller's node
-        # id (looked up from root.yaml by matching session_id). Cached so
-        # we don't re-read the root frame on every line.
-        ancestor_chain = self._ancestor_chain()
-        lines: list[str] = []
-        for node, depth, chain in _walk_tree(tree, ancestor_chain):
-            if self._prev_status.get(node.id) == node.status:
-                continue
-            lines.append(_format_log_line(ts, node, depth, chain=chain))
-            self._prev_status[node.id] = node.status
-        if not lines:
-            return
-        # O_APPEND on POSIX makes line-sized writes atomic; safe across
-        # processes without a lock.
-        with open(self._ctx.log_path, "a") as f:
-            f.write("\n".join(lines) + "\n")
-
-    def _ancestor_chain(self) -> list[str]:
-        """Short node ids from root down to the node that spawned this
-        invocation. Empty for root; for a deeply-nested call it's e.g.
-        ['c_short', 'e_short'] so G's lines read `[c→e→g]`.
-
-        Walks the *merged* tree built from every frame file — so a level-3
-        call (G nested under E nested under C) sees E's node in the
-        nested-C frame, and recursively that frame's own caller chain."""
-        if not self._ctx.is_nested:
-            return []
-        cached = getattr(self, "_cached_ancestor_chain", None)
-        if cached is not None:
-            return cached
-        frames = _load_frames(self._ctx.frames_dir)
-        if _ROOT_FRAME_KEY not in frames:
-            return []  # root hasn't landed yet; will resolve on next tick
-        merged = _merge_raw_nodes(frames)
-        chain = _chain_to_session(merged, self._ctx.frame_key) or []
-        if chain:
-            self._cached_ancestor_chain = chain
-        return chain
-
-
-# ---------- cross-process lock ----------
-
-@contextlib.contextmanager
-def _interprocess_lock(path: Path) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a+") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-
-
-def _atomic_yaml_write(path: Path, doc: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w") as f:
-        yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False,
-                       width=120, allow_unicode=True)
-    os.replace(tmp, path)
-
-
-def _atomic_write_bytes(path: Path, payload: bytes) -> None:
-    """Bytes-mode counterpart to `_atomic_yaml_write` for callers that
-    already serialized the YAML (e.g. to hash it for skip-if-unchanged)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "wb") as f:
-        f.write(payload)
-    os.replace(tmp, path)
-
-
-# ---------- frame loading + merging ----------
-
-# PERF-B: stat-based parsed-frame cache. Frame YAMLs are immutable once
-# written by a given invocation (each fresh write produces a strictly
-# newer (mtime_ns, size) tuple via atomic rename). Re-parsing the same
-# bytes on every reporter tick is wasted work — yaml.safe_load is
-# ~10–100× slower than dict equality. Keyed by absolute path; entries
-# never expire (files in `_frames/<invoke_id>/` are removed when the
-# invocation dir is cleaned up, after which subsequent stats miss).
-_FRAMES_PARSED_CACHE: dict[Path, tuple[int, int, dict]] = {}
-_FRAMES_PARSED_CACHE_LOCK = threading.Lock()
-
-
-def _frames_cache_clear() -> None:
-    """Test hook: drop the parsed-frame cache."""
-    with _FRAMES_PARSED_CACHE_LOCK:
-        _FRAMES_PARSED_CACHE.clear()
-
-
-def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
-    """Load every frame file under ``frames_dir``, grouped by ``frame_key``.
-
-    Returns a list per key because a caller node may have issued several
-    sibling nested invocations that all share its frame_key but live in
-    distinct files (disambiguated by ``instance_id`` in the filename).
-    Frames in each list are sorted by ``started_at`` so grafting is stable.
-
-    Backed by a stat-keyed cache (PERF-B): re-parsing every YAML on every
-    reporter tick was the second-largest cost after the merge rebuild.
-    """
-    out: dict[str, list[dict]] = {}
-    if not frames_dir.is_dir():
-        return out
-    for p in frames_dir.glob("*.yaml"):
-        try:
-            st = p.stat()
-        except OSError:
-            continue
-        stat_key = (st.st_mtime_ns, st.st_size)
-        with _FRAMES_PARSED_CACHE_LOCK:
-            cached = _FRAMES_PARSED_CACHE.get(p)
-        if cached is not None and (cached[0], cached[1]) == stat_key:
-            d = cached[2]
-        else:
-            try:
-                d = yaml.safe_load(p.read_text())
-            except Exception:
-                # Parse failed (corrupt/partially-written file). Skip
-                # silently to preserve forward progress; the producer's
-                # next atomic write will land a fresh (mtime, size) tuple
-                # and we'll retry.
-                continue
-            if not isinstance(d, dict):
-                continue
-            with _FRAMES_PARSED_CACHE_LOCK:
-                _FRAMES_PARSED_CACHE[p] = (stat_key[0], stat_key[1], d)
-        if not isinstance(d, dict):
-            continue
-        key = d.get("frame_key")
-        if isinstance(key, str):
-            out.setdefault(key, []).append(d)
-    for key in out:
-        out[key].sort(key=lambda f: str(f.get("started_at") or ""))
-    return out
-
-
-def _build_merged_report(*, invoke_id: str, frames: dict[str, list[dict]],
-                         root_frame: dict, ended_at: str) -> dict:
-    """Produce the report.yaml document by grafting each non-root frame's
-    tree under the node (anywhere in the root's tree) whose session_id
-    matches the frame key. Multiple frames may share a key (one per
-    sibling nested invocation); their nodes are concatenated under the
-    matching caller node, in started_at order."""
-    root_tree = root_frame.get("tree", {})
-    root_nodes = root_tree.get("nodes", []) or []
-    nested_by_session = {k: v for k, v in frames.items() if k != _ROOT_FRAME_KEY}
-    tasks = root_frame.get("tasks") or []
-    merged_nodes = [
-        _graft_node(n, tasks[i] if i < len(tasks) else n.get("task", ""),
-                    depth=root_tree.get("base_depth", 0) + 1,
-                    nested_by_session=nested_by_session)
-        for i, n in enumerate(root_nodes)
-    ]
-    overall = _status_of_nodes(merged_nodes)
-    return {
-        "invoke_id": invoke_id,
-        "kind": root_frame.get("kind"),
-        "cwd": root_frame.get("cwd"),
-        "parent_session": root_tree.get("root_session_id"),
-        "base_depth": root_tree.get("base_depth", 0),
-        "started_at": root_frame.get("started_at"),
-        "ended_at": ended_at,
-        "duration_seconds": round(
-            sum(float(n.get("duration_seconds", 0.0)) for n in merged_nodes), 2,
-        ),
-        "status": overall,
-        "nested_frames": sorted(nested_by_session.keys()),
-        "tasks": merged_nodes,
-    }
-
-
-def _graft_node(node_dict: dict, input_text: str, *, depth: int,
-                nested_by_session: dict[str, list[dict]]) -> dict:
-    """Render one Node.to_dict() into report shape, attaching nested-frame
-    children whose frame key matches this node's id (preferred, set by the
-    parent Driver via CALLSTACK_FRAME_KEY) or session_id (fallback). When
-    multiple frames share that key (sibling nested invocations from the
-    same caller), all of their nodes graft in — sorted by frame
-    ``started_at`` so order is stable."""
-    sid = node_dict.get("session_id")
-    nid = str(node_dict.get("id", ""))
-    children_raw = list(node_dict.get("children") or [])
-    matched_frames = nested_by_session.get(nid) or (
-        nested_by_session.get(sid) if sid else None
-    ) or []
-    for mf in matched_frames:
-        nested_nodes = (mf.get("tree") or {}).get("nodes") or []
-        children_raw.extend(nested_nodes)
-    children = [
-        _graft_node(c, c.get("task", ""), depth=depth + 1,
-                    nested_by_session=nested_by_session)
-        for c in children_raw
-    ]
-    out: dict = {
-        "id": str(node_dict.get("id", ""))[:8],
-        "task": node_dict.get("task"),
-        "status": _status_label_from_state(node_dict.get("state")),
-        "depth": depth,
-        "call_type": node_dict.get("call_type", "fork"),
-        "session_id": sid,
-        "clone_path": node_dict.get("clone_path"),
-        "duration_seconds": round(float(node_dict.get("duration", 0.0)), 2),
-        "max_context_tokens_seen": node_dict.get("max_context_tokens_seen"),
-        "input": input_text,
-        "output": node_dict.get("result"),
-        "summary": node_dict.get("summary"),
-        "suggested_next": node_dict.get("suggested_next"),
-        "error": node_dict.get("error"),
-    }
-    if children:
-        out["children"] = children
-    return out
-
-
-_STATUS_FROM_STATE = {
-    "pending": "pending",
-    "awaiting_turn": "running",
-    "awaiting_child": "running",
-    "awaiting_user": "yielded",
-    "done": "complete",
-    "failed": "error",
-}
-
-
-def _status_label_from_state(state: Any) -> str:
-    if isinstance(state, dict):
-        return _STATUS_FROM_STATE.get(state.get("kind", ""), "unknown")
-    return "unknown"
-
-
-def _status_of_nodes(nodes: list[dict]) -> str:
-    statuses = {n.get("status") for n in nodes}
-    if not statuses:
-        return "empty"
-    if statuses == {"complete"}:
-        return "complete"
-    if "yielded" in statuses:
-        return "yielded"
-    if statuses == {"error"}:
-        return "error"
-    return "mixed"
-
-
-def _walk_tree(tree: Tree, ancestor_chain: Optional[list[str]] = None):
-    """Yield `(node, depth, chain)` where `chain` is the list of short node
-    ids from the outermost ancestor down to (but not including) this node.
-
-    Iterative (PERF-K): explicit stack avoids per-frame Python recursion
-    overhead and removes the recursion-limit risk on very deep trees.
-    """
-    base_chain: list[str] = list(ancestor_chain or [])
-    base_depth = tree.base_depth + 1
-    # Stack of (node, depth, chain_to_this_node). Push roots in reverse so
-    # the first root pops first — matches the original recursive order.
-    stack: list[tuple[Node, int, list[str]]] = [
-        (root, base_depth, base_chain) for root in reversed(tree.nodes)
-    ]
-    while stack:
-        node, depth, chain = stack.pop()
-        yield node, depth, chain
-        child_chain = chain + [node.id[:8]]
-        for c in reversed(node.children):
-            stack.append((c, depth + 1, child_chain))
-
-
-def _format_log_line(ts: str, node: Node, depth: int, *, chain: list[str]) -> str:
-    indent = "  " * (depth - 1)
-    short_id = node.id[:8]
-    # Full chain up to and including this node, arrow-joined. Makes it
-    # trivial to see "which ancestor spawned this" in tail output.
-    id_chain = "→".join(chain + [short_id])
-    task = _one_line(node.task, 60)
-    detail = ""
-    if node.status == "complete" and node.result is not None:
-        detail = f'  result="{_one_line(str(node.result), 60)}"'
-    elif node.status == "error" and node.error:
-        detail = f'  error="{_one_line(node.error, 60)}"'
-    elif node.status == "yielded":
-        detail = "  (awaiting user)"
-    return (f"[{ts}] d={depth} {indent}[{id_chain}] "
-            f"{node.status:<9} task=\"{task}\"{detail}")
-
-
-def _merge_raw_nodes(frames: dict[str, list[dict]]) -> list[dict]:
-    """Build the full merged tree in raw `Node.to_dict()` shape (full ids
-    preserved), recursively grafting every nested frame under the node
-    whose id or session matches the frame's key. Used for chain lookups
-    that need to reach nodes living inside nested-frame sidecars."""
-    root_frames = frames.get(_ROOT_FRAME_KEY)
-    if not root_frames:
-        return []
-    nested = {k: v for k, v in frames.items() if k != _ROOT_FRAME_KEY}
-    root_nodes = (root_frames[0].get("tree") or {}).get("nodes") or []
-    return [_graft_raw(n, nested) for n in root_nodes]
-
-
-def _graft_raw(node: dict, nested: dict[str, list[dict]]) -> dict:
-    nid = str(node.get("id", ""))
-    sid = node.get("session_id")
-    children = list(node.get("children") or [])
-    matched = nested.get(nid) or (nested.get(sid) if sid else None) or []
-    for frame in matched:
-        frame_nodes = (frame.get("tree") or {}).get("nodes") or []
-        children.extend(frame_nodes)
-    return {**node, "children": [_graft_raw(c, nested) for c in children]}
-
-
-def _chain_to_session(nodes: list, target: str) -> Optional[list[str]]:
-    """DFS the root frame's nodes for one matching `target` (either a full
-    node id or a session id). Return the short-id chain ending at that
-    node (inclusive), or None if not found."""
-    def walk(node_list: list, path: list[str]) -> Optional[list[str]]:
-        for n in node_list:
-            if not isinstance(n, dict):
-                continue
-            full_id = str(n.get("id", ""))
-            short_id = full_id[:8]
-            sid = n.get("session_id")
-            new_path = path + [short_id]
-            if full_id == target or sid == target:
-                return new_path
-            hit = walk(n.get("children") or [], new_path)
-            if hit is not None:
-                return hit
-        return None
-    return walk(nodes, [])
-
-
-def _most_recent_session(cwd: str) -> Optional[str]:
-    """Stem of the most recently modified `.jsonl` in the cwd's project dir.
-
-    Used to identify the calling claude session when CLAUDE_SESSION_ID is
-    not exported. The active fork is the one currently being appended to,
-    so it wins by mtime."""
-    proj_dir = PROJECTS_DIR / encode_project_dir(cwd)
-    if not proj_dir.is_dir():
-        return None
-    best: Optional[str] = None
-    best_mtime: float = 0.0
-    for f in proj_dir.glob("*.jsonl"):
-        try:
-            m = f.stat().st_mtime
-        except OSError:
-            continue
-        if m > best_mtime:
-            best_mtime, best = m, f.stem
-    return best
-
-
-def _one_line(s: str, limit: int) -> str:
-    s = s.replace("\n", " ").replace("\r", " ").replace('"', "'")
-    return s if len(s) <= limit else s[: limit - 1] + "…"
 
 
 # ---------- legacy one-shot writer (tests / external callers) ----------
