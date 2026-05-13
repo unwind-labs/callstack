@@ -101,6 +101,20 @@ ENV_FRAME_KEY = "CALLSTACK_FRAME_KEY"
 # Set by Claude CLI inside a forked session; identifies the caller node.
 # Used only as a fallback when `CALLSTACK_FRAME_KEY` is absent.
 ENV_CLAUDE_SESSION = "CLAUDE_SESSION_ID"
+# Optional override for the default max_depth — picked up at Caller
+# construction time. Inherited by forked subprocesses unchanged.
+ENV_MAX_DEPTH = "CALLSTACK_MAX_DEPTH"
+
+
+def _default_max_depth() -> int:
+    raw = os.environ.get(ENV_MAX_DEPTH)
+    if raw is None:
+        return 10
+    try:
+        v = int(raw)
+        return v if v > 0 else 10
+    except ValueError:
+        return 10
 
 
 class Caller:
@@ -115,7 +129,7 @@ class Caller:
         model: Optional[str] = None,
         permission_mode: str = "default",
         on_permission: Optional[PermissionHandler] = None,
-        max_depth: int = 5,
+        max_depth: Optional[int] = None,
         timeout: int = 300,
         log_dir: Optional[Path] = None,
         invoke_id: Optional[str] = None,
@@ -126,7 +140,7 @@ class Caller:
         self._model = model
         self._permission_mode = permission_mode
         self._on_permission = on_permission or allow_all
-        self._max_depth = max_depth
+        self._max_depth = max_depth if max_depth is not None else _default_max_depth()
         self._timeout = timeout
         # `log_dir` is the directory that holds `{invoke_id}/call_trace.jsonl`
         # and `{invoke_id}.yaml` reports. `invoke_id`, if provided, is reused

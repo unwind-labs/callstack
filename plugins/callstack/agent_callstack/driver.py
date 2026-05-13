@@ -178,7 +178,7 @@ class Driver:
     store: TreeStore
     cwd: Optional[str] = None
     timeout: int = 300
-    max_depth: int = 5
+    max_depth: int = 10
     # Opaque label recorded into traces for pass^k trial grouping. Does NOT
     # produce deterministic provider output — the Anthropic API has no seed
     # parameter as of 2026-04. See agent_callstack.call() docstring.
