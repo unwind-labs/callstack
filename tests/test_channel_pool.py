@@ -1,0 +1,281 @@
+"""Tests for the ClaudePool process-per-session reuse (PERF-D).
+
+Two layers:
+
+1. ClaudePool unit tests — exercise acquire/register/evict/LRU directly
+   with mock _PooledProcess objects. No subprocess.Popen involved.
+
+2. ClaudeChannel integration tests — patch ClaudeChannel._spawn and
+   ._run_one_turn to count spawns and verify the pool's reuse logic
+   without needing the real `claude` CLI.
+"""
+from __future__ import annotations
+
+import threading
+import time
+from typing import Optional
+from unittest.mock import MagicMock
+
+import pytest
+
+from agent_callstack import channel as ch_mod
+from agent_callstack.channel import (
+    ClaudeChannel,
+    ClaudePool,
+    TurnResult,
+    TurnTimeout,
+    _PooledProcess,
+)
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+def _mock_pooled_process() -> _PooledProcess:
+    """Build a _PooledProcess wrapping mocks that look alive."""
+    proc = MagicMock()
+    proc.poll.return_value = None  # alive
+    proc.returncode = None
+    proc.wait.return_value = 0
+    entry = _PooledProcess(
+        proc=proc, stdin=MagicMock(), stdout=MagicMock(),
+        log=MagicMock(), log_path="/tmp/mock.log", cwd="/tmp",
+    )
+    return entry
+
+
+@pytest.fixture
+def pool() -> ClaudePool:
+    return ClaudePool(max_size=4)
+
+
+@pytest.fixture
+def fresh_module_pool():
+    """Swap out the module-level pool so tests can't leak into each other."""
+    saved = ch_mod._pool
+    ch_mod._pool = ClaudePool(max_size=ch_mod._MAX_CONCURRENT_FORKS)
+    try:
+        yield ch_mod._pool
+    finally:
+        ch_mod._pool.shutdown()
+        ch_mod._pool = saved
+
+
+# --------------------------------------------------------------------------
+# 1. ClaudePool unit tests
+# --------------------------------------------------------------------------
+
+class TestClaudePool:
+
+    def test_register_then_acquire_returns_same_entry(self, pool):
+        p = _mock_pooled_process()
+        pool.register("sA", p)
+        assert pool.acquire("sA") is p
+
+    def test_acquire_missing_returns_none(self, pool):
+        assert pool.acquire("nope") is None
+
+    def test_dead_process_is_dropped_on_acquire(self, pool):
+        p = _mock_pooled_process()
+        p.proc.poll.return_value = 1  # exited
+        pool.register("sA", p)
+        assert pool.acquire("sA") is None
+        # Subsequent acquire still None (entry was cleaned).
+        assert pool.acquire("sA") is None
+
+    def test_evict_removes_and_closes(self, pool):
+        p = _mock_pooled_process()
+        pool.register("sA", p)
+        pool.evict("sA")
+        assert pool.acquire("sA") is None
+        p.proc.terminate.assert_called()
+
+    def test_lru_eviction_when_over_cap(self):
+        pool = ClaudePool(max_size=2)
+        p1 = _mock_pooled_process()
+        p2 = _mock_pooled_process()
+        p3 = _mock_pooled_process()
+        pool.register("s1", p1)
+        # Force monotonic gap so last_used differs.
+        time.sleep(0.005)
+        pool.register("s2", p2)
+        time.sleep(0.005)
+        pool.register("s3", p3)  # over cap → evict the LRU (s1)
+        assert pool.size() == 2
+        assert pool.acquire("s1") is None
+        assert pool.acquire("s2") is p2
+        assert pool.acquire("s3") is p3
+        # The evicted process was terminated.
+        p1.proc.terminate.assert_called()
+
+    def test_in_use_entries_are_skipped_during_eviction(self):
+        pool = ClaudePool(max_size=1)
+        p1 = _mock_pooled_process()
+        p2 = _mock_pooled_process()
+        pool.register("s1", p1)
+        # Simulate p1 being held by an in-flight turn.
+        p1.lock.acquire()
+        try:
+            pool.register("s2", p2)
+            # p1 is busy so eviction couldn't reclaim it; pool exceeds cap.
+            assert pool.size() == 2
+            assert pool.acquire("s1") is p1
+            assert pool.acquire("s2") is p2
+        finally:
+            p1.lock.release()
+
+    def test_re_register_replaces_old_entry(self, pool):
+        p1 = _mock_pooled_process()
+        p2 = _mock_pooled_process()
+        pool.register("sA", p1)
+        pool.register("sA", p2)
+        assert pool.acquire("sA") is p2
+        # The displaced process was closed.
+        p1.proc.terminate.assert_called()
+
+    def test_shutdown_closes_every_entry(self, pool):
+        p1 = _mock_pooled_process()
+        p2 = _mock_pooled_process()
+        pool.register("s1", p1)
+        pool.register("s2", p2)
+        pool.shutdown()
+        assert pool.size() == 0
+        p1.proc.terminate.assert_called()
+        p2.proc.terminate.assert_called()
+
+
+# --------------------------------------------------------------------------
+# 2. ClaudeChannel integration tests (mocked spawn/turn)
+# --------------------------------------------------------------------------
+
+def _make_turn_result(session_id: str) -> TurnResult:
+    return TurnResult(
+        text="```json\n{\"op\": \"return\", \"result\": \"ok\"}\n```",
+        session_id=session_id,
+        duration=0.01,
+        api_request_id="", input_tokens=0, output_tokens=0,
+        cache_read_tokens=0, cache_creation_tokens=0, total_cost_usd=0.0,
+    )
+
+
+class _SpawnAndTurnRecorder:
+    """Replacement for ClaudeChannel._spawn + _run_one_turn that records
+    spawn calls and emits canned TurnResults. session_id chosen per spawn."""
+
+    def __init__(self, session_ids: list[str]):
+        self._session_ids = list(session_ids)
+        self.spawn_calls: list[tuple[str, str]] = []  # (source_sid, mode)
+        self.turn_calls: list[tuple[str, str, bool]] = []  # (sid, prompt, do_handshake)
+        self._lock = threading.Lock()
+
+    def patch(self, monkeypatch, channel: ClaudeChannel) -> None:
+        recorder = self
+
+        def fake_spawn(self_, source_sid, mode, cwd, extra_env):
+            with recorder._lock:
+                recorder.spawn_calls.append((source_sid, mode))
+                # Each spawn binds to the next prepared session_id.
+                next_sid = recorder._session_ids.pop(0) if recorder._session_ids else source_sid
+            entry = _mock_pooled_process()
+            entry.session_id = next_sid  # pre-mark for _run_one_turn
+            return entry
+
+        def fake_run_one_turn(self_, entry, prompt, timeout, on_session_id, *,
+                              do_handshake):
+            sid = entry.session_id or "auto-sid"
+            with recorder._lock:
+                recorder.turn_calls.append((sid, prompt, do_handshake))
+            if on_session_id is not None:
+                on_session_id(sid)
+            entry.initialized = True
+            entry.session_id = sid
+            entry.last_used = time.monotonic()
+            return _make_turn_result(sid)
+
+        monkeypatch.setattr(ClaudeChannel, "_spawn", fake_spawn)
+        monkeypatch.setattr(ClaudeChannel, "_run_one_turn", fake_run_one_turn)
+
+
+class TestChannelPoolIntegration:
+
+    def test_resume_reuses_same_pooled_process(self, monkeypatch, fresh_module_pool):
+        rec = _SpawnAndTurnRecorder(session_ids=["sX"])
+        ch = ClaudeChannel()
+        rec.patch(monkeypatch, ch)
+
+        # First turn: fork. Spawns, ends with session_id=sX, pooled.
+        r1 = ch.run_turn("parent", "task1", mode="fork")
+        assert r1.session_id == "sX"
+        assert len(rec.spawn_calls) == 1
+        assert rec.turn_calls[0][2] is True  # do_handshake on first turn
+
+        # Second turn: resume against sX. Should hit the pool — no new spawn.
+        r2 = ch.run_turn("sX", "task2", mode="resume")
+        assert r2.session_id == "sX"
+        assert len(rec.spawn_calls) == 1, "second resume should reuse"
+        assert rec.turn_calls[1][2] is False  # no handshake on reuse
+        assert fresh_module_pool.size() == 1
+
+    def test_two_different_sessions_each_spawn(self, monkeypatch, fresh_module_pool):
+        rec = _SpawnAndTurnRecorder(session_ids=["sA", "sB"])
+        ch = ClaudeChannel()
+        rec.patch(monkeypatch, ch)
+
+        ch.run_turn("parent", "ta", mode="fork")
+        ch.run_turn("parent", "tb", mode="fork")
+        assert len(rec.spawn_calls) == 2
+        assert fresh_module_pool.size() == 2
+        assert set(fresh_module_pool.session_ids()) == {"sA", "sB"}
+
+    def test_lru_eviction_at_pool_cap(self, monkeypatch, fresh_module_pool):
+        # Force a small cap by replacing the pool entirely.
+        small_pool = ClaudePool(max_size=2)
+        monkeypatch.setattr(ch_mod, "_pool", small_pool)
+
+        rec = _SpawnAndTurnRecorder(session_ids=["sA", "sB", "sC"])
+        ch = ClaudeChannel()
+        rec.patch(monkeypatch, ch)
+
+        ch.run_turn("p", "ta", mode="fork"); time.sleep(0.005)
+        ch.run_turn("p", "tb", mode="fork"); time.sleep(0.005)
+        ch.run_turn("p", "tc", mode="fork")
+
+        # sA (oldest) should have been evicted.
+        assert small_pool.size() == 2
+        sids = set(small_pool.session_ids())
+        assert sids == {"sB", "sC"}
+
+    def test_timeout_in_pooled_turn_evicts(self, monkeypatch, fresh_module_pool):
+        # First turn: succeed and pool under "sP".
+        rec = _SpawnAndTurnRecorder(session_ids=["sP"])
+        ch = ClaudeChannel()
+        rec.patch(monkeypatch, ch)
+        ch.run_turn("parent", "ta", mode="fork")
+        assert fresh_module_pool.size() == 1
+
+        # Second turn: resume on "sP", but _run_one_turn raises TurnTimeout.
+        def boom(self_, entry, prompt, timeout, on_session_id, *, do_handshake):
+            raise TurnTimeout("simulated", partial="")
+        monkeypatch.setattr(ClaudeChannel, "_run_one_turn", boom)
+
+        with pytest.raises(TurnTimeout):
+            ch.run_turn("sP", "tb", mode="resume")
+
+        # Failed pooled turn evicts the process.
+        assert fresh_module_pool.size() == 0
+        assert fresh_module_pool.acquire("sP") is None
+
+    def test_resume_cache_miss_spawns_and_pools(self, monkeypatch, fresh_module_pool):
+        rec = _SpawnAndTurnRecorder(session_ids=["sZ"])
+        ch = ClaudeChannel()
+        rec.patch(monkeypatch, ch)
+
+        # First call is mode=resume for a session never seen → spawn fresh.
+        r = ch.run_turn("sZ", "go", mode="resume")
+        assert r.session_id == "sZ"
+        assert len(rec.spawn_calls) == 1
+        # The recorder fed "sZ" back as the session id; pool now holds it.
+        assert fresh_module_pool.session_ids() == ["sZ"]
+        # Handshake was performed on the cache-miss spawn.
+        assert rec.turn_calls[0][2] is True

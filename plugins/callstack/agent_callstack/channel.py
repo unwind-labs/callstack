@@ -4,7 +4,37 @@ A Channel runs one LLM turn — either forking a parent session (the first
 turn) or resuming an existing session (subsequent turns) — and returns the
 agent's text output plus the session id the CLI assigned.
 
-Two implementations:
+## Process-per-session pool (PERF-D)
+
+Each turn used to spawn a fresh `claude` subprocess (~0.5–2 GB RSS, ~1 s
+cold start). A typical node runs 3–6 turns (initial fork → CALL → child
+returned → resume → final return), so naive spawn-per-turn paid that
+cost 3–6× per node. The pool keeps one long-lived `claude` process per
+session_id and reuses it across that session's consecutive resume-mode
+turns:
+
+  * mode='fork' / mode='fresh' — always spawn (creates a NEW session id).
+    After the turn, register the live process under the new id.
+  * mode='resume' — look up source_session_id in the pool. Hit: reuse
+    the existing stdin/stdout. Miss: spawn `claude --resume <id>` and
+    register under source_session_id.
+
+The CLI's stream-json input mode strips slash commands (verified
+2026-05), so a single process cannot be multiplexed across different
+session ids via `/resume`. The pool is therefore strictly
+process-PER-session, not a shared multiplex.
+
+Eviction: LRU when pool size exceeds CALLSTACK_MAX_CONCURRENT_FORKS.
+The same env var caps both concurrent active turns (`_FORK_SEMAPHORE`)
+and pooled idle processes (`_get_pool().max_size`). In-use processes
+(per-process lock held) are skipped during eviction — the pool may
+exceed cap briefly until a turn finishes.
+
+The pool is torn down at interpreter exit via `atexit`, or explicitly
+via `Caller.close()` / `shutdown_pool()`.
+
+## Implementations
+
 - ClaudeChannel: spawns `claude` and speaks the stream-json NDJSON protocol.
 - ScriptedChannel: returns canned text for a given (session_id, prompt). Used
   by tests so the entire driver/state machine can be exercised without ever
@@ -12,6 +42,7 @@ Two implementations:
 """
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import subprocess
@@ -84,11 +115,203 @@ class Channel(Protocol):
 
 
 # --------------------------------------------------------------------------
+# Process pool
+# --------------------------------------------------------------------------
+
+class _PooledProcess:
+    """A long-lived `claude` subprocess bound to one session_id.
+
+    Pooled by session_id; reused across that session's consecutive
+    resume-mode turns. The per-process `lock` serializes stdin writes
+    when multiple threads happen to drive the same session (rare; a
+    yield + concurrent resume would do it).
+
+    `initialized` tracks whether the stream-json `initialize` handshake
+    has been sent — required once per process, never re-sent on reuse.
+    """
+
+    def __init__(self, proc: subprocess.Popen, stdin, stdout, log,
+                 log_path: str, cwd: str):
+        self.proc = proc
+        self.stdin = stdin
+        self.stdout = stdout
+        self.log = log
+        self.log_path = log_path
+        self.cwd = cwd
+        self.session_id: Optional[str] = None
+        self.initialized = False
+        self.last_used = time.monotonic()
+        self.lock = threading.Lock()
+        self.closed = False
+
+    def is_alive(self) -> bool:
+        if self.closed:
+            return False
+        return self.proc.poll() is None
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            try:
+                self.proc.kill()
+                self.proc.wait()
+            except OSError:
+                pass
+        try:
+            self.log.write(f"Process exited with code {self.proc.returncode}\n")
+            self.log.close()
+        except (OSError, ValueError):
+            pass
+
+
+class ClaudePool:
+    """Thread-safe LRU pool of `_PooledProcess` keyed by session_id."""
+
+    def __init__(self, max_size: int):
+        self._max_size = max_size
+        self._processes: dict[str, _PooledProcess] = {}
+        self._lock = threading.Lock()
+
+    @property
+    def max_size(self) -> int:
+        return self._max_size
+
+    def acquire(self, session_id: str) -> Optional[_PooledProcess]:
+        """Look up a pooled process by session_id. Returns the entry (with
+        `last_used` updated) or None if absent / dead. Caller is responsible
+        for acquiring `entry.lock` before driving I/O."""
+        with self._lock:
+            entry = self._processes.get(session_id)
+            if entry is None:
+                return None
+            if not entry.is_alive():
+                del self._processes[session_id]
+                # Close outside the pool lock.
+                dead = entry
+            else:
+                entry.last_used = time.monotonic()
+                return entry
+        dead.close()
+        return None
+
+    def register(self, session_id: str, entry: _PooledProcess) -> None:
+        """Insert `entry` under `session_id`. Evicts LRU idle entries to
+        respect `max_size`. Replaces any existing entry under the same id.
+
+        The just-registered entry is protected from immediate eviction —
+        otherwise a register-when-full would silently drop the new entry."""
+        to_close: list[_PooledProcess] = []
+        with self._lock:
+            entry.session_id = session_id
+            entry.last_used = time.monotonic()
+            old = self._processes.pop(session_id, None)
+            if old is not None and old is not entry:
+                to_close.append(old)
+            self._processes[session_id] = entry
+            to_close.extend(self._evict_excess_locked(protect=session_id))
+        for e in to_close:
+            e.close()
+
+    def evict(self, session_id: str) -> None:
+        with self._lock:
+            entry = self._processes.pop(session_id, None)
+        if entry is not None:
+            entry.close()
+
+    def size(self) -> int:
+        with self._lock:
+            return len(self._processes)
+
+    def session_ids(self) -> list[str]:
+        with self._lock:
+            return list(self._processes.keys())
+
+    def shutdown(self) -> None:
+        """Close every pooled process. Safe to call repeatedly."""
+        with self._lock:
+            entries = list(self._processes.values())
+            self._processes.clear()
+        for e in entries:
+            e.close()
+
+    # ---- private ----
+
+    def _evict_excess_locked(self, *, protect: Optional[str] = None,
+                              ) -> list[_PooledProcess]:
+        """Pop entries beyond `max_size`, preferring idle (lock-free) ones
+        and lowest `last_used` first. Caller holds `self._lock`. Returns
+        entries the caller must `close()` outside the lock.
+
+        `protect` is a session_id whose entry will not be selected even if
+        it is the least-recently-used — used by register() to guarantee
+        the just-added process survives at least until another turn
+        bumps an older entry."""
+        to_close: list[_PooledProcess] = []
+        while len(self._processes) > self._max_size:
+            ranked = sorted(self._processes.items(),
+                            key=lambda kv: kv[1].last_used)
+            chosen_key: Optional[str] = None
+            for k, v in ranked:
+                if k == protect:
+                    continue
+                # Try-acquire; release immediately. Skipping in-use entries
+                # avoids tearing down a process mid-turn.
+                if v.lock.acquire(blocking=False):
+                    v.lock.release()
+                    chosen_key = k
+                    break
+            if chosen_key is None:
+                # All entries are busy (or protected). Accept temporary
+                # overage — once a turn finishes the next register()
+                # will catch up.
+                return to_close
+            to_close.append(self._processes.pop(chosen_key))
+        return to_close
+
+
+_pool: Optional[ClaudePool] = None
+_pool_init_lock = threading.Lock()
+
+
+def _get_pool() -> ClaudePool:
+    """Return the module-level process pool, creating it on first use.
+
+    Lazy so tests can monkeypatch / replace `_pool` before any spawn
+    happens. The atexit hook is registered on first creation."""
+    global _pool
+    if _pool is None:
+        with _pool_init_lock:
+            if _pool is None:
+                _pool = ClaudePool(_MAX_CONCURRENT_FORKS)
+                atexit.register(_pool.shutdown)
+    return _pool
+
+
+def shutdown_pool() -> None:
+    """Tear down every pooled `claude` subprocess. Called by `Caller.close()`
+    and at interpreter exit. Subsequent run_turn calls will rebuild the pool
+    lazily."""
+    global _pool
+    if _pool is not None:
+        _pool.shutdown()
+
+
+# --------------------------------------------------------------------------
 # Real Claude CLI channel
 # --------------------------------------------------------------------------
 
 class ClaudeChannel:
-    """Spawns `claude` and exchanges NDJSON over stdio."""
+    """Spawns `claude` and exchanges NDJSON over stdio. Maintains a
+    process-per-session pool — see module docstring."""
 
     def __init__(
         self,
@@ -116,93 +339,171 @@ class ClaudeChannel:
     ) -> TurnResult:
         if mode not in ("fork", "fresh", "resume"):
             raise ValueError(f"invalid run_turn mode: {mode!r}")
-        cmd = self._build_cmd(source_session_id, mode)
         effective_cwd = cwd or os.getcwd()
-        env = {**os.environ, **self._env_extra, **(extra_env or {})}
+        pool = _get_pool()
 
-        # `source_session_id` is empty in fresh mode — use a synthetic stem so
-        # the log filename stays meaningful and unique.
+        # Reuse a pooled process for resume mode against a known session_id.
+        # Fork/fresh always spawn fresh (they CREATE a new session id, which
+        # we can only pool under after the result message reports it).
+        pooled: Optional[_PooledProcess] = None
+        if mode == "resume" and source_session_id:
+            pooled = pool.acquire(source_session_id)
+
+        # Semaphore caps CONCURRENT TURNS. Pooled-idle processes do not
+        # hold a slot, so deep callstacks with many idle frames don't
+        # starve out new turns.
+        sem_wait_start = time.time()
+        _FORK_SEMAPHORE.acquire()
+        sem_wait = time.time() - sem_wait_start
+
+        try:
+            if pooled is not None:
+                return self._reuse_turn(
+                    pooled, source_session_id, prompt, timeout,
+                    on_session_id, sem_wait,
+                )
+            return self._fresh_spawn_turn(
+                source_session_id, prompt, mode, effective_cwd,
+                extra_env, timeout, on_session_id, sem_wait,
+            )
+        finally:
+            _FORK_SEMAPHORE.release()
+
+    # ---- private: top-level turn paths ----
+
+    def _reuse_turn(self, pooled: _PooledProcess, source_session_id: str,
+                    prompt: str, timeout: int,
+                    on_session_id: Optional[Callable[[str], None]],
+                    sem_wait: float) -> TurnResult:
+        """Run one turn on an existing pooled process. Evicts on failure."""
+        self._log_sem_wait(pooled.log, sem_wait)
+        try:
+            print(f"[callstack] reuse (session={source_session_id[:8]}..., "
+                  f"cwd={pooled.cwd}, log={pooled.log_path})", file=sys.stderr)
+            with pooled.lock:
+                return self._run_one_turn(
+                    pooled, prompt, timeout, on_session_id,
+                    do_handshake=False,
+                )
+        except Exception:
+            # Any failure on a pooled process leaves it in an unknown state.
+            _get_pool().evict(source_session_id)
+            raise
+
+    def _fresh_spawn_turn(self, source_session_id: str, prompt: str, mode: str,
+                          effective_cwd: str, extra_env: Optional[dict],
+                          timeout: int,
+                          on_session_id: Optional[Callable[[str], None]],
+                          sem_wait: float) -> TurnResult:
+        """Spawn a new claude subprocess, run one turn, and pool it on success."""
+        try:
+            pooled = self._spawn(source_session_id, mode, effective_cwd, extra_env)
+        except Exception as e:
+            raise RuntimeError(f"Failed to start claude CLI: {e}") from e
+
+        self._log_sem_wait(pooled.log, sem_wait)
+        try:
+            with pooled.lock:
+                result = self._run_one_turn(
+                    pooled, prompt, timeout, on_session_id,
+                    do_handshake=True,
+                )
+        except Exception:
+            pooled.close()
+            raise
+
+        # Pool keyed by the session id the CLI reported. For resume mode that
+        # equals source_session_id; for fork/fresh it's a brand-new id.
+        _get_pool().register(result.session_id, pooled)
+        return result
+
+    @staticmethod
+    def _log_sem_wait(log, sem_wait: float) -> None:
+        if sem_wait <= 0.5:
+            return
+        try:
+            log.write(f"semaphore-wait: {sem_wait:.2f}s "
+                      f"(cap={_MAX_CONCURRENT_FORKS})\n")
+            log.flush()
+        except (OSError, ValueError):
+            pass
+
+    # ---- private: spawn ----
+
+    def _spawn(self, source_session_id: str, mode: str,
+               effective_cwd: str, extra_env: Optional[dict]) -> _PooledProcess:
+        cmd = self._build_cmd(source_session_id, mode)
+        env = {**os.environ, **self._env_extra, **(extra_env or {})}
         stem = source_session_id[:8] if source_session_id else "fresh"
         log_path = f"/tmp/callstack_{stem}_{uuid.uuid4().hex[:8]}.log"
         log = open(log_path, "w")
         log.write(f"cmd: {' '.join(cmd)}\ncwd: {effective_cwd}\n")
         log.flush()
-        print(f"[callstack] turn (mode={mode}, source={stem}..., "
+        print(f"[callstack] spawn (mode={mode}, source={stem}..., "
               f"cwd={effective_cwd}, log={log_path})", file=sys.stderr)
 
-        start = time.time()
-        # Gate Popen behind the global semaphore so system-wide concurrent
-        # claude-subprocess count stays bounded even under deep recursive
-        # callstacks. We hold the slot for the duration of the turn
-        # (including the subprocess wait below); release on all exit paths.
-        _sem_wait_start = time.time()
-        _FORK_SEMAPHORE.acquire()
-        _sem_wait = time.time() - _sem_wait_start
-        if _sem_wait > 0.5:
-            log.write(f"semaphore-wait: {_sem_wait:.2f}s "
-                      f"(cap={_MAX_CONCURRENT_FORKS})\n")
-            log.flush()
-        _released = False
-        def _release_slot():
-            nonlocal _released
-            if not _released:
-                _FORK_SEMAPHORE.release()
-                _released = True
-
-        try:
-            proc = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, cwd=effective_cwd, env=env,
-            )
-        except Exception as e:
-            _release_slot()
-            log.close()
-            raise RuntimeError(f"Failed to start claude CLI: {e}") from e
-
-        # PIPE was passed for all three streams, so they are guaranteed non-None.
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, cwd=effective_cwd, env=env,
+        )
         assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
-        stdin, stdout, stderr = proc.stdin, proc.stdout, proc.stderr
-
-        # Drain stderr in the background so a full pipe can't deadlock the child.
-        def _drain_stderr():
+        entry = _PooledProcess(
+            proc=proc, stdin=proc.stdin, stdout=proc.stdout,
+            log=log, log_path=log_path, cwd=effective_cwd,
+        )
+        # Drain stderr for the LIFETIME of the process — survives across
+        # multiple pooled turns, so we don't restart on each reuse.
+        stderr = proc.stderr
+        def _drain():
             for line in stderr:
-                log.write(f"STDERR: {line}")
-                log.flush()
-        threading.Thread(target=_drain_stderr, daemon=True).start()
+                try:
+                    log.write(f"STDERR: {line}")
+                    log.flush()
+                except (OSError, ValueError):
+                    return
+        threading.Thread(target=_drain, daemon=True).start()
+        return entry
 
-        # Watchdog kills the child if a turn runs too long.
-        timed_out = threading.Event()
+    # ---- private: per-turn I/O ----
+
+    def _run_one_turn(self, entry: _PooledProcess, prompt: str, timeout: int,
+                      on_session_id: Optional[Callable[[str], None]],
+                      *, do_handshake: bool) -> TurnResult:
+        """Send one user message + read until result. Per-turn watchdog only
+        kills the process if THIS turn exceeds `timeout`; otherwise the
+        process stays alive for pool reuse."""
+        start = time.time()
         cancel = threading.Event()
+        timed_out = threading.Event()
+
         def _watchdog():
             if not cancel.wait(timeout):
                 timed_out.set()
-                log.write(f"TIMEOUT after {timeout}s\n"); log.flush()
-                try: proc.kill()
-                except OSError: pass
+                try:
+                    entry.log.write(f"TIMEOUT after {timeout}s\n")
+                    entry.log.flush()
+                except (OSError, ValueError):
+                    pass
+                try:
+                    entry.proc.kill()
+                except OSError:
+                    pass
         threading.Thread(target=_watchdog, daemon=True).start()
 
         text_parts: list[str] = []
-        session_id: Optional[str] = None
         result_meta: dict = {}
-
+        session_id: Optional[str] = None
         try:
-            self._handshake(stdin, log)
-            self._send_user_message(stdin, prompt, log)
+            if do_handshake and not entry.initialized:
+                self._handshake(entry.stdin, entry.log)
+                entry.initialized = True
+            self._send_user_message(entry.stdin, prompt, entry.log)
             session_id = self._read_until_result(
-                stdin, stdout, text_parts, log, result_meta,
+                entry.stdin, entry.stdout, text_parts, entry.log, result_meta,
                 on_session_id=on_session_id,
             )
         finally:
             cancel.set()
-            try: stdin.close()
-            except OSError: pass
-            try:
-                proc.terminate(); proc.wait(timeout=5)
-            except (subprocess.TimeoutExpired, OSError):
-                proc.kill(); proc.wait()
-            log.write(f"Process exited with code {proc.returncode}\n")
-            log.close()
-            _release_slot()
 
         text = "".join(text_parts)
         if timed_out.is_set():
@@ -210,9 +511,11 @@ class ClaudeChannel:
         if not session_id:
             raise RuntimeError(
                 f"claude CLI exited without reporting a session id "
-                f"(returncode={proc.returncode}, log={log_path})"
+                f"(returncode={entry.proc.returncode}, log={entry.log_path})"
             )
 
+        entry.session_id = session_id
+        entry.last_used = time.monotonic()
         return TurnResult(
             text=text,
             session_id=session_id,
@@ -225,7 +528,7 @@ class ClaudeChannel:
             total_cost_usd=result_meta.get("total_cost_usd", 0.0),
         )
 
-    # ---- private helpers ----
+    # ---- private: cmd + protocol ----
 
     def _build_cmd(self, source_session_id: str, mode: str) -> list[str]:
         cmd = [

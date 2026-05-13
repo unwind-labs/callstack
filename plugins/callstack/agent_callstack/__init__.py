@@ -31,7 +31,7 @@ from typing import Any, Iterator, Optional, Sequence
 
 import yaml
 
-from .channel import ClaudeChannel, PermissionHandler, allow_all
+from .channel import ClaudeChannel, PermissionHandler, allow_all, shutdown_pool
 from .driver import Driver, Node, Tree
 from .session import PROJECTS_DIR, SessionLocator, SessionRef, encode_project_dir
 from .trace import TraceWriter, TreeStore
@@ -158,6 +158,20 @@ class Caller:
                   context: str = "fork") -> MultiResult:
         wrapped = [_wrap(item) for item in self._invoke(list(tasks), context=context)]
         return MultiResult(results=wrapped)
+
+    def close(self) -> None:
+        """Tear down every pooled `claude` subprocess. The pool is a
+        module-level singleton shared by all Callers, so calling close()
+        from one Caller affects others — typically only called at
+        program exit. Pooled processes are also drained by an
+        `atexit` hook, so this is rarely needed explicitly."""
+        shutdown_pool()
+
+    def __enter__(self) -> "Caller":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     def resume(self, token: YieldToken, reply: str) -> Result:
         clone = Path(token.clone_path)
