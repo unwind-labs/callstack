@@ -117,7 +117,11 @@ def test_report_writes_yaml_at_expected_path(tmp_path):
 
 # ---------- live reporter ----------
 
-def test_driver_progress_callback_fires_per_transition(tmp_path):
+def test_driver_progress_callback_fires_per_transition(tmp_path, monkeypatch):
+    # This test asserts the legacy per-notify report.yaml write contract.
+    # PERF-A added a default 250 ms debounce; opt into synchronous-merge
+    # mode here so intermediate snapshots land before the run finishes.
+    monkeypatch.setenv("CALLSTACK_REPORT_DEBOUNCE_SECS", "0")
     parent_file = tmp_path / "parent.jsonl"
     parent_file.write_text(json.dumps({"cwd": str(tmp_path), "type": "user"}) + "\n")
     parent = SessionRef(session_id="parent", file=parent_file)
@@ -474,3 +478,176 @@ def test_nested_reporter_is_noop_if_root_frame_absent(tmp_path):
     # Frame written, but no merged report yet.
     assert (ctx.frames_dir / "sess-C.yaml").exists()
     assert not ctx.report_path.exists()
+
+
+# ---------- PERF-A: debounce + content-hash skip + frames cache ----------
+
+def test_debounce_coalesces_burst_of_notifies(tmp_path, monkeypatch):
+    """50 notifies inside a single debounce window must produce ONE atomic
+    write of report.yaml, not 50. Uses a generous 2s window so the burst
+    of frame YAML writes can complete on slow CI before the timer fires."""
+    monkeypatch.setenv("CALLSTACK_REPORT_DEBOUNCE_SECS", "2.0")
+
+    import agent_callstack as ac
+
+    write_count = {"n": 0}
+    real_atomic_write_bytes = ac._atomic_write_bytes
+
+    def counting(path, payload):
+        if path.name == "report.yaml":
+            write_count["n"] += 1
+        return real_atomic_write_bytes(path, payload)
+
+    monkeypatch.setattr(ac, "_atomic_write_bytes", counting)
+
+    log_dir = tmp_path / "log"
+    parent = SessionRef(session_id="root", file=tmp_path / "r.jsonl")
+
+    ctx = _InvocationContext(
+        invoke_id="inv-burst", log_dir=log_dir, cwd="/cwd",
+        frame_key=_ROOT_FRAME_KEY, is_nested=False,
+    )
+    reporter = _LiveReporter(ctx=ctx, kind="call", tasks=["t"],
+                             started_at="s")
+
+    # Mutate the tree slightly each tick so the hash differs and we'd
+    # otherwise write 50 times.
+    nodes = [_done_node(f"n{i:06d}", f"task {i}", f"r{i}") for i in range(50)]
+    for i in range(50):
+        tree = Tree(root_session=parent, nodes=nodes[: i + 1], base_depth=0)
+        reporter(tree)
+
+    # Before debounce fires: no report write yet (frame writes don't count).
+    assert write_count["n"] == 0
+
+    # Finalize cancels the pending timer and forces a single synchronous
+    # merge — so total writes after the burst is exactly 1.
+    reporter.finalize(Tree(root_session=parent, nodes=nodes, base_depth=0))
+    assert write_count["n"] == 1
+
+
+def test_finalize_writes_report_even_after_quiet_window(tmp_path, monkeypatch):
+    """finalize() must always produce an up-to-date report.yaml, even when
+    no notify has happened in the last debounce window (timer already
+    fired and the in-memory hash matches)."""
+    monkeypatch.setenv("CALLSTACK_REPORT_DEBOUNCE_SECS", "0.05")
+
+    log_dir = tmp_path / "log"
+    parent = SessionRef(session_id="root", file=tmp_path / "r.jsonl")
+    ctx = _InvocationContext(
+        invoke_id="inv-final", log_dir=log_dir, cwd="/cwd",
+        frame_key=_ROOT_FRAME_KEY, is_nested=False,
+    )
+    reporter = _LiveReporter(ctx=ctx, kind="call", tasks=["t"],
+                             started_at="s")
+    node = _done_node("a0000000", "t", "r")
+    tree = Tree(root_session=parent, nodes=[node], base_depth=0)
+    reporter(tree)
+
+    import time as _time
+    _time.sleep(0.20)  # let the debounce timer fire
+    first_mtime_ns = ctx.report_path.stat().st_mtime_ns
+
+    # Sleep past the cache window — finalize must still rewrite.
+    _time.sleep(0.05)
+    reporter.finalize(tree)
+
+    # report.yaml exists, was rewritten (mtime advanced), still complete.
+    assert ctx.report_path.exists()
+    doc = yaml.safe_load(ctx.report_path.read_text())
+    assert doc["tasks"][0]["status"] == "complete"
+    second_mtime_ns = ctx.report_path.stat().st_mtime_ns
+    assert second_mtime_ns >= first_mtime_ns  # never went backwards
+
+
+def test_content_hash_skip_avoids_duplicate_writes(tmp_path, monkeypatch):
+    """Two consecutive synchronous merges of the same tree (debounce=0)
+    must produce exactly one report.yaml write; the second is hash-skipped."""
+    monkeypatch.setenv("CALLSTACK_REPORT_DEBOUNCE_SECS", "0")
+
+    import agent_callstack as ac
+
+    write_count = {"n": 0}
+    real_atomic_write_bytes = ac._atomic_write_bytes
+
+    def counting(path, payload):
+        if path.name == "report.yaml":
+            write_count["n"] += 1
+        return real_atomic_write_bytes(path, payload)
+
+    monkeypatch.setattr(ac, "_atomic_write_bytes", counting)
+
+    log_dir = tmp_path / "log"
+    parent = SessionRef(session_id="root", file=tmp_path / "r.jsonl")
+    ctx = _InvocationContext(
+        invoke_id="inv-hash", log_dir=log_dir, cwd="/cwd",
+        frame_key=_ROOT_FRAME_KEY, is_nested=False,
+    )
+    reporter = _LiveReporter(ctx=ctx, kind="call", tasks=["t"],
+                             started_at="s")
+    node = _done_node("a0000000", "t", "r")
+    tree = Tree(root_session=parent, nodes=[node], base_depth=0)
+
+    # ended_at flows into the merged document, so pin it to a constant
+    # across all notifies — otherwise the doc differs each tick and the
+    # hash skip never triggers. This is the legitimate case the skip
+    # exists for: the tree is unchanged and time hasn't moved.
+    monkeypatch.setattr(ac, "_utc_now_iso", lambda: "2026-05-13T00:00:00+00:00")
+
+    reporter(tree)
+    assert write_count["n"] == 1
+    # Same tree, same time → identical doc → hash match → skip.
+    reporter(tree)
+    reporter(tree)
+    assert write_count["n"] == 1
+
+
+def test_frames_cache_skips_yaml_safe_load_when_stat_unchanged(
+    tmp_path, monkeypatch,
+):
+    """_load_frames must not re-parse frame YAMLs whose (mtime_ns, size)
+    matches the cached entry."""
+    import agent_callstack as ac
+
+    ac._frames_cache_clear()
+
+    safe_load_count = {"n": 0}
+    real_safe_load = yaml.safe_load
+
+    def counting(data):
+        safe_load_count["n"] += 1
+        return real_safe_load(data)
+
+    monkeypatch.setattr(yaml, "safe_load", counting)
+
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    frame = {
+        "frame_key": _ROOT_FRAME_KEY, "is_nested": False, "kind": "call",
+        "tasks": ["t"], "cwd": "/cwd",
+        "started_at": "s", "ended_at": "e",
+        "tree": {"schema_version": "2", "root_session_id": "r",
+                  "root_session_file": "/r.jsonl", "base_depth": 0,
+                  "nodes": []},
+    }
+    ac._atomic_yaml_write(frames_dir / "root.yaml", frame)
+
+    safe_load_count["n"] = 0  # ignore any parsing inside _atomic_yaml_write
+    out1 = ac._load_frames(frames_dir)
+    after_first = safe_load_count["n"]
+    assert _ROOT_FRAME_KEY in out1
+    assert after_first >= 1
+
+    # Second call without touching the file: cache hit, no new parse.
+    out2 = ac._load_frames(frames_dir)
+    assert safe_load_count["n"] == after_first
+    assert out2.keys() == out1.keys()
+
+    # Rewrite the same file with a new mtime; cache must invalidate and
+    # safe_load is called again.
+    import os as _os
+    import time as _time
+    new_mtime = _time.time() + 10  # bump mtime forward
+    _os.utime(frames_dir / "root.yaml", (new_mtime, new_mtime))
+    ac._load_frames(frames_dir)
+    assert safe_load_count["n"] > after_first

@@ -22,6 +22,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import fcntl
+import hashlib
 import os
 import threading
 import uuid
@@ -483,17 +484,40 @@ class _InvocationContext:
         return f"nested_{kind}" if self.is_nested else kind
 
 
+_DEFAULT_REPORT_DEBOUNCE_SECS = 0.25
+
+
+def _report_debounce_secs() -> float:
+    """How long _LiveReporter waits before flushing a merged report write.
+
+    Coalesces bursty Driver._notify() calls so the heavy YAML emit + atomic
+    rewrite happens at most ~1/INTERVAL Hz. Tests can override via env.
+    """
+    raw = os.environ.get("CALLSTACK_REPORT_DEBOUNCE_SECS")
+    if raw is None:
+        return _DEFAULT_REPORT_DEBOUNCE_SECS
+    try:
+        v = float(raw)
+        return v if v >= 0 else _DEFAULT_REPORT_DEBOUNCE_SECS
+    except ValueError:
+        return _DEFAULT_REPORT_DEBOUNCE_SECS
+
+
 class _LiveReporter:
-    """`Driver.on_progress` callback — rewrites the merged report.yaml and
-    appends per-transition lines to a shared tail-friendly log.
+    """`Driver.on_progress` callback — writes per-frame snapshots immediately,
+    appends transitions to a shared tail-friendly log immediately, and
+    coalesces merged-report rewrites behind a debounce timer (PERF-A).
 
     Each invocation writes its own frame (`_frames/{key}.yaml`) containing
-    its Tree. On every update the reporter scans all frames, grafts each
-    non-root frame's nodes under the root node whose session_id matches
-    the frame key, and writes the combined report. A cross-process
-    `fcntl.flock` serializes the merge so parent and nested writers can't
-    corrupt each other's updates; an in-process lock serializes parallel
-    roots in the same `call_many`."""
+    its Tree. The merged `report.yaml` is rebuilt by scanning every frame
+    and grafting non-root frames under their caller node. That rebuild is
+    O(total nodes) per call and YAML emit dominates, so we coalesce it
+    behind a ~0.25 s timer; finalize() forces a synchronous flush so the
+    on-disk report is fully up to date when the run ends.
+
+    A cross-process `fcntl.flock` serializes the merge so parent and
+    nested writers can't corrupt each other's updates; an in-process lock
+    serializes parallel roots in the same `call_many`."""
 
     def __init__(self, *, ctx: _InvocationContext, kind: str,
                  tasks: Sequence[str], started_at: str):
@@ -503,13 +527,79 @@ class _LiveReporter:
         self._started_at = started_at
         self._prev_status: dict[str, str] = {}
         self._thread_lock = threading.Lock()
+        self._merge_timer: Optional[threading.Timer] = None
+        self._latest_ended_at: Optional[str] = None
+        # SHA-256 of the last merged-report payload we actually wrote. Used
+        # to skip the atomic write when the rebuilt document is identical
+        # to what's already on disk (common when notifies arrive during a
+        # quiet period where only `ended_at` would change).
+        self._last_merged_hash: Optional[bytes] = None
+        self._finalized = False
+        self._debounce = _report_debounce_secs()
 
     def __call__(self, tree: Tree) -> None:
-        self._write(tree, ended_at=_utc_now_iso())
+        ended_at = _utc_now_iso()
+        with self._thread_lock:
+            if self._finalized:
+                # Late notify after finalize — driver may still emit one
+                # while the timer is being cancelled; ignore.
+                return
+            self._ctx.invocation_dir.mkdir(parents=True, exist_ok=True)
+            self._ctx.frames_dir.mkdir(parents=True, exist_ok=True)
+            # Per-frame writes stay synchronous: cheap, and the merged-
+            # report consumer (nested writer's next tick, unwind UI)
+            # needs them visible promptly.
+            self._write_frame(tree, ended_at=ended_at)
+            self._latest_ended_at = ended_at
+            # Schedule the merge if one isn't already pending. The first
+            # action inside `_debounced_merge` is to null out the timer
+            # pointer under the same lock, so the next __call__ can
+            # schedule a fresh one.
+            if self._merge_timer is None and self._debounce > 0:
+                self._merge_timer = threading.Timer(
+                    self._debounce, self._debounced_merge,
+                )
+                self._merge_timer.daemon = True
+                self._merge_timer.start()
+            elif self._debounce == 0:
+                # 0-debounce: synchronous merge. Used by tests that want
+                # the legacy "write report.yaml on every notify" behavior.
+                self._do_merge(force=False, ended_at=ended_at)
+            # Transitions log stays synchronous so `tail -f progress.log`
+            # remains responsive.
+            self._append_transitions(tree, ended_at)
+
+    def _debounced_merge(self) -> None:
+        with self._thread_lock:
+            # finalize() may have run while the Timer thread was waiting
+            # for the lock — its synchronous merge already produced the
+            # authoritative report; nothing for us to do.
+            self._merge_timer = None
+            if self._finalized:
+                return
+            if self._latest_ended_at is None:
+                return
+            self._do_merge(force=False, ended_at=self._latest_ended_at)
 
     def finalize(self, tree: Tree) -> None:
-        """Last write after the driver returns, so `ended_at` reflects real end."""
-        self._write(tree, ended_at=_utc_now_iso())
+        """Last write after the driver returns, so `ended_at` reflects real end.
+
+        Cancels any pending debounced merge and runs the merge synchronously
+        with force=True so the on-disk report reflects the final state even
+        when the merged-document hash hasn't changed (e.g. only `ended_at`
+        advanced in the last tick)."""
+        ended_at = _utc_now_iso()
+        with self._thread_lock:
+            if self._merge_timer is not None:
+                self._merge_timer.cancel()
+                self._merge_timer = None
+            self._finalized = True
+            self._ctx.invocation_dir.mkdir(parents=True, exist_ok=True)
+            self._ctx.frames_dir.mkdir(parents=True, exist_ok=True)
+            self._write_frame(tree, ended_at=ended_at)
+            self._latest_ended_at = ended_at
+            self._do_merge(force=True, ended_at=ended_at)
+            self._append_transitions(tree, ended_at)
         # Root's finalize runs strictly after every nested finalize (parent
         # driver.run() doesn't return until all forks complete), so it's
         # safe to remove the lock file here — nothing else will need it.
@@ -518,15 +608,6 @@ class _LiveReporter:
                 self._ctx.lock_path.unlink()
             except FileNotFoundError:
                 pass
-
-    def _write(self, tree: Tree, *, ended_at: str) -> None:
-        with self._thread_lock:
-            self._ctx.invocation_dir.mkdir(parents=True, exist_ok=True)
-            self._ctx.frames_dir.mkdir(parents=True, exist_ok=True)
-            self._write_frame(tree, ended_at=ended_at)
-            with _interprocess_lock(self._ctx.lock_path):
-                self._rewrite_merged_report(ended_at=ended_at)
-            self._append_transitions(tree, ended_at)
 
     # ---- per-frame snapshot ----
 
@@ -545,18 +626,30 @@ class _LiveReporter:
 
     # ---- merged report ----
 
-    def _rewrite_merged_report(self, *, ended_at: str) -> None:
-        frames = _load_frames(self._ctx.frames_dir)
-        root_frames = frames.get(_ROOT_FRAME_KEY)
-        if not root_frames:
-            # Nested wrote first and root hasn't written yet — skip; the
-            # root's next progress tick will rewrite the merged report.
-            return
-        doc = _build_merged_report(
-            invoke_id=self._ctx.invoke_id, frames=frames,
-            root_frame=root_frames[0], ended_at=ended_at,
-        )
-        _atomic_yaml_write(self._ctx.report_path, doc)
+    def _do_merge(self, *, force: bool, ended_at: str) -> None:
+        """Rebuild the merged report and atomically write it, skipping the
+        write when the document is identical to what we last wrote (and
+        ``force`` is False). Must be called with ``self._thread_lock``."""
+        with _interprocess_lock(self._ctx.lock_path):
+            frames = _load_frames(self._ctx.frames_dir)
+            root_frames = frames.get(_ROOT_FRAME_KEY)
+            if not root_frames:
+                # Nested wrote first and root hasn't written yet — skip;
+                # the root's next progress tick will rewrite the report.
+                return
+            doc = _build_merged_report(
+                invoke_id=self._ctx.invoke_id, frames=frames,
+                root_frame=root_frames[0], ended_at=ended_at,
+            )
+            payload = yaml.safe_dump(
+                doc, sort_keys=False, default_flow_style=False,
+                width=120, allow_unicode=True,
+            ).encode("utf-8")
+            new_hash = hashlib.sha256(payload).digest()
+            if not force and new_hash == self._last_merged_hash:
+                return
+            _atomic_write_bytes(self._ctx.report_path, payload)
+            self._last_merged_hash = new_hash
 
     # ---- shared append-only log ----
 
@@ -623,7 +716,34 @@ def _atomic_yaml_write(path: Path, doc: Any) -> None:
     os.replace(tmp, path)
 
 
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    """Bytes-mode counterpart to `_atomic_yaml_write` for callers that
+    already serialized the YAML (e.g. to hash it for skip-if-unchanged)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "wb") as f:
+        f.write(payload)
+    os.replace(tmp, path)
+
+
 # ---------- frame loading + merging ----------
+
+# PERF-B: stat-based parsed-frame cache. Frame YAMLs are immutable once
+# written by a given invocation (each fresh write produces a strictly
+# newer (mtime_ns, size) tuple via atomic rename). Re-parsing the same
+# bytes on every reporter tick is wasted work — yaml.safe_load is
+# ~10–100× slower than dict equality. Keyed by absolute path; entries
+# never expire (files in `_frames/<invoke_id>/` are removed when the
+# invocation dir is cleaned up, after which subsequent stats miss).
+_FRAMES_PARSED_CACHE: dict[Path, tuple[int, int, dict]] = {}
+_FRAMES_PARSED_CACHE_LOCK = threading.Lock()
+
+
+def _frames_cache_clear() -> None:
+    """Test hook: drop the parsed-frame cache."""
+    with _FRAMES_PARSED_CACHE_LOCK:
+        _FRAMES_PARSED_CACHE.clear()
+
 
 def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
     """Load every frame file under ``frames_dir``, grouped by ``frame_key``.
@@ -632,15 +752,36 @@ def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
     sibling nested invocations that all share its frame_key but live in
     distinct files (disambiguated by ``instance_id`` in the filename).
     Frames in each list are sorted by ``started_at`` so grafting is stable.
+
+    Backed by a stat-keyed cache (PERF-B): re-parsing every YAML on every
+    reporter tick was the second-largest cost after the merge rebuild.
     """
     out: dict[str, list[dict]] = {}
     if not frames_dir.is_dir():
         return out
     for p in frames_dir.glob("*.yaml"):
         try:
-            d = yaml.safe_load(p.read_text())
-        except Exception:
+            st = p.stat()
+        except OSError:
             continue
+        stat_key = (st.st_mtime_ns, st.st_size)
+        with _FRAMES_PARSED_CACHE_LOCK:
+            cached = _FRAMES_PARSED_CACHE.get(p)
+        if cached is not None and (cached[0], cached[1]) == stat_key:
+            d = cached[2]
+        else:
+            try:
+                d = yaml.safe_load(p.read_text())
+            except Exception:
+                # Parse failed (corrupt/partially-written file). Skip
+                # silently to preserve forward progress; the producer's
+                # next atomic write will land a fresh (mtime, size) tuple
+                # and we'll retry.
+                continue
+            if not isinstance(d, dict):
+                continue
+            with _FRAMES_PARSED_CACHE_LOCK:
+                _FRAMES_PARSED_CACHE[p] = (stat_key[0], stat_key[1], d)
         if not isinstance(d, dict):
             continue
         key = d.get("frame_key")
@@ -760,16 +901,24 @@ def _status_of_nodes(nodes: list[dict]) -> str:
 
 def _walk_tree(tree: Tree, ancestor_chain: Optional[list[str]] = None):
     """Yield `(node, depth, chain)` where `chain` is the list of short node
-    ids from the outermost ancestor down to (but not including) this node."""
-    chain: list[str] = list(ancestor_chain or [])
+    ids from the outermost ancestor down to (but not including) this node.
 
-    def walk(node: Node, d: int, current_chain: list[str]):
-        yield node, d, current_chain
-        next_chain = current_chain + [node.id[:8]]
-        for c in node.children:
-            yield from walk(c, d + 1, next_chain)
-    for root in tree.nodes:
-        yield from walk(root, tree.base_depth + 1, chain)
+    Iterative (PERF-K): explicit stack avoids per-frame Python recursion
+    overhead and removes the recursion-limit risk on very deep trees.
+    """
+    base_chain: list[str] = list(ancestor_chain or [])
+    base_depth = tree.base_depth + 1
+    # Stack of (node, depth, chain_to_this_node). Push roots in reverse so
+    # the first root pops first — matches the original recursive order.
+    stack: list[tuple[Node, int, list[str]]] = [
+        (root, base_depth, base_chain) for root in reversed(tree.nodes)
+    ]
+    while stack:
+        node, depth, chain = stack.pop()
+        yield node, depth, chain
+        child_chain = chain + [node.id[:8]]
+        for c in reversed(node.children):
+            stack.append((c, depth + 1, child_chain))
 
 
 def _format_log_line(ts: str, node: Node, depth: int, *, chain: list[str]) -> str:
