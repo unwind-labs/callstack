@@ -46,7 +46,7 @@ def _make_caller(tmp_path, parent_file, channel: ScriptedChannel) -> Caller:
         def _scripted_driver(self):
             return Driver(
                 channel=channel,
-                locator=SessionLocator(projects_dir=tmp_path / "projects"),
+                resolve_session=SessionLocator(projects_dir=tmp_path / "projects").resolve,
                 trace=TraceWriter(tmp_path / "traces"),
                 store=TreeStore(),
                 cwd=str(tmp_path),

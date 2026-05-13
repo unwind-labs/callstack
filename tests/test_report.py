@@ -142,7 +142,7 @@ def test_driver_progress_callback_fires_per_transition(tmp_path, monkeypatch):
     )
     driver = Driver(
         channel=channel,
-        locator=SessionLocator(projects_dir=tmp_path / "projects"),
+        resolve_session=SessionLocator(projects_dir=tmp_path / "projects").resolve,
         trace=TraceWriter(ctx.invocation_dir),
         store=TreeStore(),
         cwd=str(tmp_path), timeout=10, max_depth=5,

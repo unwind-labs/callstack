@@ -29,7 +29,7 @@ def parent_session(tmp_path) -> SessionRef:
 def _make_driver(tmp_path, channel: ScriptedChannel, *, max_depth: int = 5) -> Driver:
     return Driver(
         channel=channel,
-        locator=SessionLocator(projects_dir=tmp_path / "_no_real_projects"),
+        resolve_session=SessionLocator(projects_dir=tmp_path / "_no_real_projects").resolve,
         trace=TraceWriter(tmp_path / "traces"),
         store=TreeStore(),
         cwd=str(tmp_path),
@@ -85,7 +85,7 @@ class TestRunSingleTask:
         ch = ScriptedChannel().respond(_envelope("return", result="ok"), "child-y")
         driver = Driver(
             channel=ch,
-            locator=SessionLocator(projects_dir=tmp_path / "_proj"),
+            resolve_session=SessionLocator(projects_dir=tmp_path / "_proj").resolve,
             trace=TraceWriter(tmp_path / "traces"),
             store=TreeStore(),
             cwd=str(proj_b),
@@ -373,7 +373,7 @@ class TestInstrumentation:
         ch = ScriptedChannel().respond(_envelope("return", result="ok"), "f")
         driver = Driver(
             channel=ch,
-            locator=SessionLocator(projects_dir=tmp_path / "_no_real_projects"),
+            resolve_session=SessionLocator(projects_dir=tmp_path / "_no_real_projects").resolve,
             trace=TraceWriter(tmp_path / "traces"),
             store=TreeStore(),
             cwd=str(tmp_path),

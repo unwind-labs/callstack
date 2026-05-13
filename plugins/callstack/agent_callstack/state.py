@@ -94,6 +94,31 @@ def is_suspended(state: State) -> bool:
     return state.kind in SUSPENDED
 
 
+# Canonical mapping from state kind → externally-visible status label.
+# Owned here because state.py is the source of truth for state kinds;
+# both the runtime (driver.Node.status) and the merged report (frames.py)
+# consume the same labels.
+_STATUS_BY_KIND = {
+    "pending": "pending",
+    "awaiting_turn": "running",
+    "awaiting_child": "running",
+    "awaiting_user": "yielded",
+    "done": "complete",
+    "failed": "error",
+}
+
+
+def status_label(state: object) -> str:
+    """Map a State instance or a `{state: ..., kind: ...}` dict to its
+    user-facing status label. Unknown kinds → ``"unknown"``."""
+    kind: object
+    if isinstance(state, dict):
+        kind = state.get("kind", "")
+    else:
+        kind = getattr(state, "kind", "")
+    return _STATUS_BY_KIND.get(kind, "unknown") if isinstance(kind, str) else "unknown"
+
+
 # ---------- Events ----------
 
 @dataclass(frozen=True)

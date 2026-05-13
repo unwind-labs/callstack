@@ -283,7 +283,7 @@ class Caller:
         )
         return Driver(
             channel=channel,
-            locator=SessionLocator(),
+            resolve_session=SessionLocator().resolve,
             trace=TraceWriter(ctx.invocation_dir),
             store=TreeStore(),
             cwd=cwd,

@@ -33,6 +33,18 @@ class Result:
     log: Optional[Path]
     log_start: int
 
+    def to_envelope(self) -> dict:
+        """Wire-format envelope returned by the MCP `call`/`resume` tools."""
+        return {
+            "status": "complete",
+            "result": self.value,
+            "summary": self.summary,
+            "suggested_next": self.next,
+            "duration": self.duration,
+            "session_log": str(self.log) if self.log else None,
+            "session_log_start_line": self.log_start,
+        }
+
 
 @dataclass(frozen=True)
 class MultiResult:
@@ -47,6 +59,14 @@ class CallYielded(Exception):
         self.question = question
         self.token = token
 
+    def to_envelope(self) -> dict:
+        return {
+            "status": "yield",
+            "question": self.question,
+            "session_id": self.token.session_id,
+            "clone_path": self.token.clone_path,
+        }
+
 
 class CallFailed(Exception):
     """Raised when an agent or its descendants fail. Carries any partial output."""
@@ -54,6 +74,13 @@ class CallFailed(Exception):
         super().__init__(error)
         self.error = error
         self.partial = partial
+
+    def to_envelope(self) -> dict:
+        return {
+            "status": "error",
+            "error": self.error,
+            "partial_result": self.partial,
+        }
 
 
 # ---------- Tree → public result translation ----------

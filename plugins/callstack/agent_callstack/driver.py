@@ -31,7 +31,7 @@ CALL_TREE_SCHEMA_VERSION = "2"
 from . import state as st
 from .channel import Channel, TurnTimeout
 from .protocol import parse_envelope
-from .session import SessionLocator, SessionRef, count_lines
+from .session import SessionRef, count_lines
 from .trace import TraceWriter, TreeStore
 
 
@@ -170,10 +170,18 @@ class MaxDepthExceeded(Exception):
     pass
 
 
+SessionResolver = Callable[[str, Optional[str]], Optional[Path]]
+
+
 @dataclass
 class Driver:
     channel: Channel
-    locator: SessionLocator
+    # Resolves a session_id (and optional cwd) to its .jsonl file path.
+    # Matches `SessionLocator.resolve(session_id, cwd=...)` so existing
+    # callers can pass `SessionLocator().resolve` directly. Decoupling
+    # the Driver from session discovery (ARCH-9) keeps the driver
+    # testable with a trivial lambda.
+    resolve_session: SessionResolver
     trace: TraceWriter
     store: TreeStore
     cwd: Optional[str] = None
@@ -516,7 +524,7 @@ class Driver:
         # child's cwd's project dir — pass the effective cwd so the locator
         # looks in the right place.
         if produces_new_session:
-            resolved = self.locator.resolve(result.session_id, cwd=self.cwd)
+            resolved = self.resolve_session(result.session_id, self.cwd)
             if resolved is not None:
                 node.clone_path = str(resolved)
         self.trace.write(
@@ -623,14 +631,8 @@ def _state_from_dict(d: dict) -> st.State:
 
 
 def _status_label(s: st.State) -> str:
-    return {
-        "pending": "pending",
-        "awaiting_turn": "running",
-        "awaiting_child": "running",
-        "awaiting_user": "yielded",
-        "done": "complete",
-        "failed": "error",
-    }[s.kind]
+    """Back-compat one-liner. Canonical mapping lives in state.status_label."""
+    return st.status_label(s)
 
 
 def _denormalize(node: Node) -> None:

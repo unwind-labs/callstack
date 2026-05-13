@@ -34,29 +34,8 @@ mcp = FastMCP("call")
 
 def _result_to_dict(item: Any) -> dict:
     """Translate a Result / CallYielded / CallFailed into the wire envelope."""
-    if isinstance(item, Result):
-        return {
-            "status": "complete",
-            "result": item.value,
-            "summary": item.summary,
-            "suggested_next": item.next,
-            "duration": item.duration,
-            "session_log": str(item.log) if item.log else None,
-            "session_log_start_line": item.log_start,
-        }
-    if isinstance(item, CallYielded):
-        return {
-            "status": "yield",
-            "question": item.question,
-            "session_id": item.token.session_id,
-            "clone_path": item.token.clone_path,
-        }
-    if isinstance(item, CallFailed):
-        return {
-            "status": "error",
-            "error": item.error,
-            "partial_result": item.partial,
-        }
+    if isinstance(item, (Result, CallYielded, CallFailed)):
+        return item.to_envelope()
     raise TypeError(f"unknown result type: {type(item).__name__}")
 
 

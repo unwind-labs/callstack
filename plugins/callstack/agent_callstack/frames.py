@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import yaml
 
@@ -182,20 +182,10 @@ def _graft_node(node_dict: dict, input_text: str, *, depth: int,
     return out
 
 
-_STATUS_FROM_STATE = {
-    "pending": "pending",
-    "awaiting_turn": "running",
-    "awaiting_child": "running",
-    "awaiting_user": "yielded",
-    "done": "complete",
-    "failed": "error",
-}
-
-
-def _status_label_from_state(state: Any) -> str:
-    if isinstance(state, dict):
-        return _STATUS_FROM_STATE.get(state.get("kind", ""), "unknown")
-    return "unknown"
+# Back-compat alias for the (kind → status) mapping; canonical source is
+# in state._STATUS_BY_KIND. Re-exported here so legacy imports still work.
+from .state import _STATUS_BY_KIND as _STATUS_FROM_STATE  # noqa: E402
+from .state import status_label as _status_label_from_state  # noqa: E402
 
 
 def _status_of_nodes(nodes: list[dict]) -> str:
