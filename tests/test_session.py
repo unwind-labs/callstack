@@ -127,6 +127,40 @@ class TestLocate:
         with pytest.raises(RuntimeError, match="Could not discover"):
             loc.locate(cwd=cwd)
 
+    def test_env_path_outside_projects_dir_is_rejected(self, projects, tmp_path,
+                                                        monkeypatch, capsys):
+        """SEC-002: CALLSTACK_PARENT_SESSION pointing at a file outside
+        PROJECTS_DIR must be rejected and the locator must fall through to
+        the next strategy (rather than blindly opening the attacker-chosen
+        file)."""
+        outside = tmp_path / "rogue.jsonl"
+        outside.write_text(json.dumps({"cwd": "/tmp", "type": "user"}) + "\n")
+        # Also put a legitimate session in the cwd-matching project dir so
+        # the mtime fallback can find SOMETHING — we want to assert the env
+        # path was rejected, not that locate() raised for a different reason.
+        from agent_callstack.session import encode_project_dir
+        cwd = "/real/proj"
+        legit = _make_session(projects / encode_project_dir(cwd),
+                              "in-cwd", cwd=cwd)
+        monkeypatch.setenv("CALLSTACK_PARENT_SESSION", str(outside))
+        monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+        loc = SessionLocator(projects_dir=projects)
+        ref = loc.locate(cwd=cwd)
+        assert ref.file == legit, "rogue env path must be ignored"
+        err = capsys.readouterr().err
+        assert "rejected" in err and "not under" in err
+
+    def test_env_path_inside_projects_dir_is_accepted(self, projects,
+                                                       monkeypatch):
+        """Positive control for SEC-002: a path that DOES resolve under
+        PROJECTS_DIR is accepted normally."""
+        f = _make_session(projects / "p", "inside")
+        monkeypatch.setenv("CALLSTACK_PARENT_SESSION", str(f))
+        monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+        loc = SessionLocator(projects_dir=projects)
+        ref = loc.locate()
+        assert ref.file == f
+
     def test_no_session_anywhere_raises(self, projects, monkeypatch):
         monkeypatch.delenv("CALLSTACK_PARENT_SESSION", raising=False)
         monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)

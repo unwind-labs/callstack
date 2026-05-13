@@ -7,7 +7,10 @@ Two concerns, each owned by one class:
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import uuid
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -82,12 +85,26 @@ class TreeStore:
         return path
 
     def load(self, clone_path: Path) -> Optional[dict]:
+        """Consume the sidecar atomically.
+
+        SEC-007: the prior `exists → open → unlink` sequence let two
+        concurrent resumes both pass `exists`, both read the same dict,
+        and then the second `unlink` would raise. Now we rename the
+        sidecar to a unique claim file first; whoever wins the rename
+        owns the read. The loser sees `FileNotFoundError` from
+        `os.replace` and returns None."""
         path = self._path_for(clone_path)
-        if not path.exists():
+        claim = Path(f"{path}.claim-{uuid.uuid4().hex[:8]}")
+        try:
+            os.replace(path, claim)
+        except FileNotFoundError:
             return None
-        with open(path, "r") as f:
-            data = json.load(f)
-        path.unlink()
+        try:
+            with open(claim, "r") as f:
+                data = json.load(f)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                claim.unlink()
         return data
 
 

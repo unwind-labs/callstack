@@ -18,6 +18,7 @@ import contextlib
 import fcntl
 import hashlib
 import os
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Iterator, Optional, Sequence
@@ -261,19 +262,39 @@ def _interprocess_lock(path: Path) -> Iterator[None]:
 
 
 def _atomic_yaml_write(path: Path, doc: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w") as f:
-        yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False,
-                       width=120, allow_unicode=True)
-    os.replace(tmp, path)
+    """SEC-008: write to a uniquely-named tmp file via tempfile, fsync the
+    contents, then rename into place. The prior fixed `.tmp` suffix
+    collided when two writers (e.g. nested + root reporters, or
+    `_write_invocation_report` racing the live reporter) targeted the
+    same path — one could truncate the other mid-write and publish a
+    partial file. fsync ensures a crash between write and replace doesn't
+    leave an empty doc as the new report."""
+    payload = yaml.safe_dump(
+        doc, sort_keys=False, default_flow_style=False,
+        width=120, allow_unicode=True,
+    )
+    _atomic_write_bytes(path, payload.encode("utf-8"))
 
 
 def _atomic_write_bytes(path: Path, payload: bytes) -> None:
     """Bytes-mode counterpart to `_atomic_yaml_write` for callers that
-    already serialized the YAML (e.g. to hash it for skip-if-unchanged)."""
+    already serialized the YAML (e.g. to hash it for skip-if-unchanged).
+
+    Uses tempfile.NamedTemporaryFile with `dir=path.parent` so the tmp
+    sits on the same filesystem as the target (required for atomic
+    `os.replace`). Each call gets a unique tmp name — concurrent writers
+    no longer collide on a single shared `.tmp`."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "wb") as f:
-        f.write(payload)
-    os.replace(tmp, path)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".tmp", dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp_name)
+        raise

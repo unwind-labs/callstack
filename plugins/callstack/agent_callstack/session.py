@@ -64,6 +64,19 @@ class SessionLocator:
             value = os.environ.get(env_var)
             if not value:
                 continue
+            # SEC-002: when the env supplies an absolute file path, require
+            # it to resolve under PROJECTS_DIR. An attacker who controls the
+            # environment (CI leak, shared box) could otherwise point us at
+            # arbitrary readable files, whose recorded `cwd` then propagates
+            # into subprocess.Popen(cwd=...). UUID-form values fall through
+            # to `resolve()` which already scans only PROJECTS_DIR.
+            if env_var == _ENV_PARENT_PATH and not self._env_path_under_projects(value):
+                print(
+                    f"[callstack] {env_var} rejected: not under "
+                    f"{self._projects_dir}",
+                    file=sys.stderr,
+                )
+                continue
             ref = self._from_value(value, cwd)
             if ref:
                 print(f"[callstack] Found session via {env_var}", file=sys.stderr)
@@ -104,6 +117,24 @@ class SessionLocator:
         raise RuntimeError(
             f"Explicit session '{value}' not found in {self._projects_dir}"
         )
+
+    def _env_path_under_projects(self, value: str) -> bool:
+        """True iff `value` is a file path that resolves under PROJECTS_DIR.
+
+        Non-path values (e.g. bare UUIDs) return True — they don't escape
+        the projects dir on their own (`resolve()` only scans inside it)."""
+        p = Path(value)
+        if not p.is_absolute() and "/" not in value:
+            return True  # bare UUID-like string, no path to validate
+        try:
+            resolved = p.resolve(strict=True)
+            projects = self._projects_dir.resolve()
+        except (OSError, RuntimeError):
+            return False
+        try:
+            return resolved.is_relative_to(projects)
+        except AttributeError:  # Python < 3.9 fallback (unused here, defensive)
+            return str(resolved).startswith(str(projects) + os.sep)
 
     def _from_value(self, value: str, cwd: Optional[str]) -> Optional[SessionRef]:
         """Accept either a file path or a UUID."""

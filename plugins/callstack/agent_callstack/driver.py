@@ -191,6 +191,11 @@ class Driver:
     on_progress: Optional[Callable[["Tree"], None]] = None
 
     _current_tree: Optional["Tree"] = field(default=None, init=False, repr=False)
+    # SEC-011: log the first on_progress failure with full traceback, then
+    # set this flag so subsequent ticks swallow silently. Avoids drowning
+    # stderr in identical errors on every state transition while still
+    # surfacing the first occurrence for debugging.
+    _notify_failed: bool = field(default=False, init=False, repr=False)
 
     # ---- entry points ----
 
@@ -276,8 +281,17 @@ class Driver:
         try:
             self.on_progress(self._current_tree)
         except Exception:
-            # Progress reporting is advisory; never let it break the run.
-            pass
+            if not self._notify_failed:
+                # First failure: surface with traceback so the cause is
+                # debuggable. Subsequent failures stay quiet (the run can
+                # produce thousands of transitions; one bad reporter would
+                # otherwise spam stderr).
+                import sys
+                import traceback
+                print("[callstack] on_progress callback raised "
+                      "(further failures suppressed):", file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
+                self._notify_failed = True
 
     # ---- private: tree topology helpers ----
 

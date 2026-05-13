@@ -47,11 +47,38 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Protocol, Union
+
+
+def _process_log_path(stem: str) -> str:
+    """Private log path for a `claude` subprocess (SEC-004).
+
+    Prefer the current callstack invocation's log dir when the runtime
+    has stamped it via env (`CALLSTACK_ROOT_LOG_DIR` + `CALLSTACK_ROOT_INVOKE_ID`)
+    so logs land alongside report.yaml / call_trace.jsonl under a tree
+    the OS already keeps in the user's private home. Fall back to a
+    mode-0600 NamedTemporaryFile when the env isn't set (CLI / library
+    use outside an active invocation)."""
+    root_dir = os.environ.get("CALLSTACK_ROOT_LOG_DIR")
+    invoke_id = os.environ.get("CALLSTACK_ROOT_INVOKE_ID")
+    if root_dir and invoke_id:
+        proc_dir = Path(root_dir) / invoke_id / "process_logs"
+        proc_dir.mkdir(parents=True, exist_ok=True)
+        return str(proc_dir / f"callstack_{stem}_{uuid.uuid4().hex[:8]}.log")
+    # NamedTemporaryFile(delete=False) creates the file with mode 0600,
+    # unlike a bare `open()` which inherits the (typically 022) umask.
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", prefix=f"callstack_{stem}_", suffix=".log", delete=False,
+    )
+    path = tmp.name
+    tmp.close()
+    return path
 
 
 # Global concurrency cap for concurrent claude subprocess invocations.
@@ -98,6 +125,16 @@ PermissionHandler = Callable[[str, dict], dict]
 def allow_all(tool_name: str, input_data: dict) -> dict:
     print(f"[callstack] Permission: allowing {tool_name}", file=sys.stderr)
     return {"behavior": "allow", "updatedInput": input_data}
+
+
+def _fire_on_session_id(cb: Callable[[str], None], sid: str) -> None:
+    """SEC-011: invoke an advisory on_session_id callback, surfacing any
+    exception to stderr instead of swallowing silently."""
+    try:
+        cb(sid)
+    except Exception as e:
+        print(f"[callstack] on_session_id callback raised: "
+              f"{type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
 
 
 class Channel(Protocol):
@@ -435,7 +472,7 @@ class ClaudeChannel:
         cmd = self._build_cmd(source_session_id, mode)
         env = {**os.environ, **self._env_extra, **(extra_env or {})}
         stem = source_session_id[:8] if source_session_id else "fresh"
-        log_path = f"/tmp/callstack_{stem}_{uuid.uuid4().hex[:8]}.log"
+        log_path = _process_log_path(stem)
         log = open(log_path, "w")
         log.write(f"cmd: {' '.join(cmd)}\ncwd: {effective_cwd}\n")
         log.flush()
@@ -618,9 +655,15 @@ class ClaudeChannel:
                     early_id_fired = True
                     try:
                         on_session_id(early_sid)
-                    except Exception:
-                        # Never let an observer error abort the turn.
-                        log.write("on_session_id callback raised; ignoring\n")
+                    except Exception as e:
+                        # SEC-011: advisory observer — never abort the turn,
+                        # but surface what went wrong instead of swallowing
+                        # silently. exc class + short repr lands in stderr
+                        # and the per-turn log.
+                        _msg = (f"on_session_id callback raised: "
+                                f"{type(e).__name__}: {str(e)[:200]}")
+                        print(f"[callstack] {_msg}", file=sys.stderr)
+                        log.write(_msg + "\n")
                         log.flush()
 
             if mtype == "control_response":
@@ -651,7 +694,22 @@ class ClaudeChannel:
         request_id = msg.get("request_id", "")
         subtype = request.get("subtype", "")
         if subtype == "can_use_tool":
-            response = self._handler(request.get("tool_name", ""), request.get("input", {}))
+            tool_name = request.get("tool_name", "")
+            # SEC-011: this is the ONE fail-closed swallow. If the user-
+            # supplied permission_handler raises, we MUST NOT default-allow
+            # — that would let a buggy handler turn into a silent
+            # permissive policy. Send a deny + log + carry on.
+            try:
+                response = self._handler(tool_name, request.get("input", {}))
+            except Exception as e:
+                print(f"[callstack] permission_handler raised on tool={tool_name!r}: "
+                      f"{type(e).__name__}: {str(e)[:200]} — denying request",
+                      file=sys.stderr)
+                response = {
+                    "behavior": "deny",
+                    "message": (f"permission_handler raised "
+                                f"{type(e).__name__}; request denied"),
+                }
         else:
             response = {}
         self._send(stdin, {
@@ -713,13 +771,11 @@ class ScriptedChannel:
         if callable(nxt):
             result = nxt(source_session_id, prompt, mode)
             if on_session_id is not None and result.session_id:
-                try: on_session_id(result.session_id)
-                except Exception: pass
+                _fire_on_session_id(on_session_id, result.session_id)
             return result
         text, session_id = nxt
         if on_session_id is not None and session_id:
-            try: on_session_id(session_id)
-            except Exception: pass
+            _fire_on_session_id(on_session_id, session_id)
         return TurnResult(
             text=text, session_id=session_id, duration=0.0,
             api_request_id="", input_tokens=0, output_tokens=0,

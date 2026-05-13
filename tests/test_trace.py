@@ -86,3 +86,38 @@ class TestTreeStore:
     def test_load_missing_returns_none(self, tmp_path):
         store = TreeStore()
         assert store.load(tmp_path / "ghost") is None
+
+    def test_concurrent_load_one_winner(self, tmp_path):
+        """SEC-007: two threads racing to load the same sidecar must yield
+        exactly one winner; the loser sees None, no exception escapes."""
+        import threading
+        clone = tmp_path / "clone.jsonl"
+        clone.write_text("")
+        store = TreeStore()
+        snapshot = {"only": "once"}
+        store.save(clone, snapshot)
+
+        results: list = []
+        errors: list = []
+        start = threading.Event()
+
+        def race():
+            start.wait()
+            try:
+                results.append(store.load(clone))
+            except Exception as e:  # pragma: no cover - guarded by assertion
+                errors.append(e)
+
+        threads = [threading.Thread(target=race) for _ in range(8)]
+        for t in threads:
+            t.start()
+            start.set()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"load raised under race: {errors}"
+        winners = [r for r in results if r is not None]
+        losers = [r for r in results if r is None]
+        assert len(winners) == 1, f"expected one winner, got {len(winners)}"
+        assert winners[0] == snapshot
+        assert len(losers) == len(threads) - 1

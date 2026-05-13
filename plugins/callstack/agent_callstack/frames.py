@@ -73,11 +73,14 @@ def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
         else:
             try:
                 d = yaml.safe_load(p.read_text())
-            except Exception:
-                # Parse failed (corrupt/partially-written file). Skip
-                # silently to preserve forward progress; the producer's
-                # next atomic write will land a fresh (mtime, size) tuple
-                # and we'll retry.
+            except Exception as e:
+                # Parse failed (corrupt/partially-written file). Skip to
+                # preserve forward progress; the producer's next atomic
+                # write will land a fresh (mtime, size) tuple and we'll
+                # retry. SEC-011: log so corruption is observable.
+                import sys
+                print(f"[callstack] ignoring malformed frame file {p}: "
+                      f"{type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
                 continue
             if not isinstance(d, dict):
                 continue
