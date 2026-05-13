@@ -26,7 +26,7 @@ _UUID_RE = re.compile(
 
 # Env vars that may contain the parent session, in priority order.
 _ENV_PARENT_PATH = "CALLSTACK_PARENT_SESSION"   # absolute file path
-_ENV_PARENT_UUID = "CLAUDE_SESSION_ID"           # UUID set by Claude Code
+_ENV_PARENT_UUID = "CLAUDE_CODE_SESSION_ID"      # UUID set by Claude Code per process
 
 
 def encode_project_dir(cwd: str) -> str:

@@ -219,7 +219,7 @@ class TestParentSessionInvariant:
                                                             monkeypatch):
         # Plant stale values that resemble the recursive-/call scenario.
         monkeypatch.setenv("CALLSTACK_PARENT_SESSION", "/some/stale/path.jsonl")
-        monkeypatch.setenv("CLAUDE_SESSION_ID",
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID",
                            "00000000-0000-0000-0000-0000000000ee")
 
         ch = ScriptedChannel().respond(_envelope("return", result="ok"), "c1")

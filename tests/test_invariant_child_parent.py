@@ -162,7 +162,7 @@ class TestNestedInvariant:
         monkeypatch.setenv("CALLSTACK_PARENT_SESSION", str(root.file))
         monkeypatch.setenv("CALLSTACK_ROOT_INVOKE_ID", "root-iv")
         monkeypatch.setenv("CALLSTACK_ROOT_LOG_DIR", cwd + "/.claude/log")
-        monkeypatch.setenv("CLAUDE_SESSION_ID", CHILD_SID)
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", CHILD_SID)
         monkeypatch.delenv("CALLSTACK_DEPTH", raising=False)
 
         Caller()._invoke(["grandchild task"], context="fork")
@@ -197,7 +197,7 @@ class TestConcurrentSiblings:
         monkeypatch.setenv("CALLSTACK_PARENT_SESSION", str(root.file))
         monkeypatch.setenv("CALLSTACK_ROOT_INVOKE_ID", "root-iv")
         monkeypatch.setenv("CALLSTACK_ROOT_LOG_DIR", cwd + "/.claude/log")
-        monkeypatch.setenv("CLAUDE_SESSION_ID", CHILD_SID)
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", CHILD_SID)
         monkeypatch.delenv("CALLSTACK_DEPTH", raising=False)
 
         # Each thread issues its own /call; build a fresh Caller per thread
@@ -213,3 +213,189 @@ class TestConcurrentSiblings:
             f"concurrent siblings forked from inconsistent parents: "
             f"{parents}; expected only {CHILD_SID}"
         )
+
+
+# ---------- Layer 7 — env var name (the production-name gotcha) ----------
+
+class TestEnvVarName:
+    """Claude Code actually exports `CLAUDE_CODE_SESSION_ID` to each spawned
+    claude subprocess (and downstream to its MCP server). The earlier
+    locator read `CLAUDE_SESSION_ID` — a var that is never set in production.
+    With UUID-first priority, that means locate() silently fell through to
+    the mtime heuristic — which under concurrent siblings races and can
+    pick the wrong jsonl. Pin the actual env var name down."""
+
+    def test_locator_constant_is_production_env_var_name(self):
+        from agent_callstack.session import _ENV_PARENT_UUID
+        assert _ENV_PARENT_UUID == "CLAUDE_CODE_SESSION_ID", (
+            f"_ENV_PARENT_UUID is {_ENV_PARENT_UUID!r} — Claude Code sets "
+            f"CLAUDE_CODE_SESSION_ID per claude subprocess. Reading the wrong "
+            f"name causes locate() to fall through to mtime under concurrent "
+            f"siblings, which then picks the wrong sibling's session."
+        )
+
+    def test_locator_resolves_via_claude_code_session_id(
+        self, tmp_path, monkeypatch,
+    ):
+        from agent_callstack.session import SessionLocator
+        cwd = tmp_path / "p"
+        cwd.mkdir()
+        projects = tmp_path / "projects"
+        proj = projects / encode_project_dir(str(cwd))
+        proj.mkdir(parents=True)
+        sid = "00000000-0000-0000-0000-00000000c0de"
+        (proj / f"{sid}.jsonl").write_text(
+            json.dumps({"cwd": str(cwd), "type": "user"}) + "\n"
+        )
+        monkeypatch.delenv("CALLSTACK_PARENT_SESSION", raising=False)
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", sid)
+        monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+
+        ref = SessionLocator(projects_dir=projects).locate(cwd=str(cwd))
+        assert ref.session_id == sid
+
+
+# ---------- Layer 8 — depth 3+ with parallel siblings at each level ----------
+
+def _setup_session_world(tmp_path, monkeypatch, sids):
+    """Build a projects dir containing one .jsonl per sid. Returns
+    (projects_dir, cwd, {sid: SessionRef})."""
+    projects = tmp_path / "projects"
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    proj_dir = projects / encode_project_dir(str(cwd))
+    proj_dir.mkdir(parents=True)
+    refs = {}
+    for sid in sids:
+        f = proj_dir / f"{sid}.jsonl"
+        f.write_text(json.dumps({"cwd": str(cwd), "type": "user"}) + "\n")
+        refs[sid] = SessionRef(session_id=sid, file=f)
+    monkeypatch.chdir(cwd)
+
+    class _TestLocator(_RealLocator):
+        def __init__(self, projects_dir=projects):
+            super().__init__(projects_dir)
+    monkeypatch.setattr(ac, "SessionLocator", _TestLocator)
+    return projects, str(cwd), refs
+
+
+class TestDeeperDepthParallelSiblings:
+    """The exact scenario the user observed: at depth 2, parallel sibling
+    /calls dispatched from one node spawn grandchildren that ended up
+    forking from the WRONG sibling's session.
+
+    Mechanism: each child claude's MCP server resolved 'self' via a stale
+    env path or an mtime heuristic that races when siblings run
+    concurrently. With CLAUDE_CODE_SESSION_ID read correctly, each child
+    claude identifies itself unambiguously — regardless of sibling activity
+    or stale env leakage."""
+
+    def test_depth_3_parallel_siblings_dont_cross_contaminate(
+        self, tmp_path, monkeypatch,
+    ):
+        """root → {A, B} → each of A and B dispatches its own grandchildren.
+        Worst-case env: stale CALLSTACK_PARENT_SESSION points to root (as
+        a pre-fix runtime would have propagated), and B's jsonl is mtime-
+        newer than A's (so any mtime-based fallback prefers B).
+
+        Invariant: A's grandchildren MUST fork from A, B's from B."""
+        ROOT = "00000000-0000-0000-0000-000000003001"
+        A    = "00000000-0000-0000-0000-000000003002"  # noqa: E221
+        B    = "00000000-0000-0000-0000-000000003003"  # noqa: E221
+        projects, cwd, refs = _setup_session_world(
+            tmp_path, monkeypatch, [ROOT, A, B],
+        )
+
+        # Bump B's mtime so it'd win an mtime heuristic.
+        import time as _time
+        _time.sleep(0.01)
+        refs[B].file.write_text(refs[B].file.read_text() + " ")
+
+        # Per-call capture (each Caller() builds its own ClaudeChannel
+        # instance; capture instance-by-instance).
+        captures = []
+
+        class _PerInvokeChannel:
+            def __init__(self, *, model=None, permission_mode="default",
+                         permission_handler=None, env=None):
+                self.parent_session_ids = []
+                self.env = dict(env or {})
+                self._inner = ScriptedChannel()
+                env_done = ('```json\n'
+                            + json.dumps({"op": "return", "result": "ok"})
+                            + '\n```')
+                for _ in range(64):
+                    self._inner.respond(env_done, GRANDCHILD_SID)
+                captures.append(self)
+
+            def run_turn(self, source_session_id, prompt, **kw):
+                self.parent_session_ids.append(source_session_id)
+                return self._inner.run_turn(source_session_id, prompt, **kw)
+
+        monkeypatch.setattr(ac, "ClaudeChannel", _PerInvokeChannel)
+
+        # Common env every nested child claude sees.
+        monkeypatch.setenv("CALLSTACK_ROOT_INVOKE_ID", "root-iv")
+        monkeypatch.setenv("CALLSTACK_ROOT_LOG_DIR", cwd + "/.claude/log")
+        monkeypatch.setenv("CALLSTACK_PARENT_SESSION", str(refs[ROOT].file))
+        monkeypatch.delenv("CALLSTACK_DEPTH", raising=False)
+
+        # ---- Inside A's claude: dispatch A's grandchildren ----
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", A)
+        Caller()._invoke(["A-gc-1", "A-gc-2"], context="fork")
+
+        # ---- Inside B's claude: dispatch B's grandchildren ----
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", B)
+        Caller()._invoke(["B-gc-1", "B-gc-2"], context="fork")
+
+        assert len(captures) == 2, (
+            f"expected one channel per _invoke, got {len(captures)}"
+        )
+        a_channel, b_channel = captures
+        assert set(a_channel.parent_session_ids) == {A}, (
+            f"A's grandchildren forked from {a_channel.parent_session_ids}; "
+            f"expected all {A} (sibling B's jsonl was mtime-newer — fix must "
+            f"prefer per-process UUID over filesystem mtime)"
+        )
+        assert set(b_channel.parent_session_ids) == {B}, (
+            f"B's grandchildren forked from {b_channel.parent_session_ids}; "
+            f"expected all {B}"
+        )
+
+    def test_depth_4_each_level_correctly_identified(
+        self, tmp_path, monkeypatch,
+    ):
+        """Walk a depth-4 chain with multiple siblings at each level. At
+        every simulated level, the locator inside that level's process
+        must return that level's session — never an ancestor, never a
+        sibling. Stale CALLSTACK_PARENT_SESSION leaks root throughout."""
+        from agent_callstack.session import SessionLocator
+
+        levels = {
+            "root": "00000000-0000-0000-0000-000000004001",
+            "L1a":  "00000000-0000-0000-0000-000000004002",
+            "L1b":  "00000000-0000-0000-0000-000000004003",
+            "L2a":  "00000000-0000-0000-0000-000000004004",
+            "L2b":  "00000000-0000-0000-0000-000000004005",
+            "L3a":  "00000000-0000-0000-0000-000000004006",
+            "L3b":  "00000000-0000-0000-0000-000000004007",
+        }
+        projects, cwd, _ = _setup_session_world(
+            tmp_path, monkeypatch, list(levels.values()),
+        )
+        # Worst case: every level still has CALLSTACK_PARENT_SESSION leaking
+        # the root.jsonl (would happen if any upstream MCP server was running
+        # pre-fix code that still propagates the var).
+        root_file = (projects / encode_project_dir(cwd)
+                     / f"{levels['root']}.jsonl")
+        monkeypatch.setenv("CALLSTACK_PARENT_SESSION", str(root_file))
+
+        for label, sid in levels.items():
+            monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", sid)
+            ref = SessionLocator(projects_dir=projects).locate(cwd=cwd)
+            assert ref.session_id == sid, (
+                f"At simulated level {label!r}, locator returned "
+                f"{ref.session_id} instead of {sid}. With stale "
+                f"CALLSTACK_PARENT_SESSION leaking root in env, the "
+                f"per-process CLAUDE_CODE_SESSION_ID must always win."
+            )

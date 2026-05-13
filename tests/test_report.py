@@ -393,6 +393,10 @@ def test_nested_detection_uses_mtime_fallback(tmp_path, monkeypatch):
     monkeypatch.setenv(ENV_ROOT_INVOKE_ID, "inv-nest-fallback")
     monkeypatch.setenv(ENV_ROOT_LOG_DIR, str(tmp_path / "log"))
     monkeypatch.delenv(ENV_CLAUDE_SESSION, raising=False)
+    # If we're running under a callstack-forked test process, our own
+    # CALLSTACK_FRAME_KEY would otherwise short-circuit the mtime fallback
+    # this test exists to exercise.
+    monkeypatch.delenv("CALLSTACK_FRAME_KEY", raising=False)
 
     caller = Caller(cwd=str(cwd))
     parent = SessionRef(session_id="parent", file=proj / "older.jsonl")

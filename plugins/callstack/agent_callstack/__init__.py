@@ -79,7 +79,7 @@ ENV_ROOT_LOG_DIR = "CALLSTACK_ROOT_LOG_DIR"
 ENV_FRAME_KEY = "CALLSTACK_FRAME_KEY"
 # Set by Claude CLI inside a forked session; identifies the caller node.
 # Used only as a fallback when `CALLSTACK_FRAME_KEY` is absent.
-ENV_CLAUDE_SESSION = "CLAUDE_SESSION_ID"
+ENV_CLAUDE_SESSION = "CLAUDE_CODE_SESSION_ID"
 # Optional override for the default max_depth — picked up at Caller
 # construction time. Inherited by forked subprocesses unchanged.
 ENV_MAX_DEPTH = "CALLSTACK_MAX_DEPTH"

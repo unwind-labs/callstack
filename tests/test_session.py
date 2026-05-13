@@ -96,7 +96,7 @@ class TestLocate:
         f = _make_session(projects / "p", "env-id")
         loc = SessionLocator(projects_dir=projects)
         monkeypatch.setenv("CALLSTACK_PARENT_SESSION", str(f))
-        monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
         ref = loc.locate()
         assert ref.file == f
 
@@ -104,7 +104,7 @@ class TestLocate:
         _make_session(projects / "p", "uuid-env")
         loc = SessionLocator(projects_dir=projects)
         monkeypatch.delenv("CALLSTACK_PARENT_SESSION", raising=False)
-        monkeypatch.setenv("CLAUDE_SESSION_ID", _sid("uuid-env"))
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", _sid("uuid-env"))
         ref = loc.locate()
         assert ref.session_id == _sid("uuid-env")
 
@@ -125,7 +125,7 @@ class TestLocate:
         _make_session(proj, "new", cwd=cwd)
 
         monkeypatch.setenv("CALLSTACK_PARENT_SESSION", str(root_file))
-        monkeypatch.setenv("CLAUDE_SESSION_ID", _sid("new"))
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", _sid("new"))
         loc = SessionLocator(projects_dir=projects)
         ref = loc.locate(cwd=cwd)
         assert ref.session_id == _sid("new"), (
@@ -148,7 +148,7 @@ class TestLocate:
         rogue.write_text(json.dumps({"cwd": "/elsewhere", "type": "user"}) + "\n")
 
         monkeypatch.setenv("CALLSTACK_PARENT_SESSION", str(rogue))
-        monkeypatch.setenv("CLAUDE_SESSION_ID", _sid("new"))
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", _sid("new"))
         loc = SessionLocator(projects_dir=projects)
         ref = loc.locate(cwd=cwd)
         assert ref.session_id == _sid("new")
@@ -162,7 +162,7 @@ class TestLocate:
         os.utime(old, (1000, 1000))
         os.utime(new, (2000, 2000))
         monkeypatch.delenv("CALLSTACK_PARENT_SESSION", raising=False)
-        monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
         loc = SessionLocator(projects_dir=projects)
         ref = loc.locate(cwd=cwd)
         assert ref.session_id == _sid("new")
@@ -179,7 +179,7 @@ class TestLocate:
         os.utime(old, (1000, 1000))
         os.utime(new, (9999, 9999))
         monkeypatch.delenv("CALLSTACK_PARENT_SESSION", raising=False)
-        monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
         loc = SessionLocator(projects_dir=projects)
         ref = loc.locate(cwd=cwd)
         assert ref.session_id == _sid("in-cwd")
@@ -192,7 +192,7 @@ class TestLocate:
         (projects / encode_project_dir(cwd)).mkdir(parents=True)
         _make_session(projects / "other-proj", "elsewhere", cwd="/other")
         monkeypatch.delenv("CALLSTACK_PARENT_SESSION", raising=False)
-        monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
         loc = SessionLocator(projects_dir=projects)
         with pytest.raises(RuntimeError, match="Could not discover"):
             loc.locate(cwd=cwd)
@@ -213,7 +213,7 @@ class TestLocate:
         legit = _make_session(projects / encode_project_dir(cwd),
                               "in-cwd", cwd=cwd)
         monkeypatch.setenv("CALLSTACK_PARENT_SESSION", str(outside))
-        monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
         loc = SessionLocator(projects_dir=projects)
         ref = loc.locate(cwd=cwd)
         assert ref.file == legit, "rogue env path must be ignored"
@@ -226,14 +226,14 @@ class TestLocate:
         PROJECTS_DIR is accepted normally."""
         f = _make_session(projects / "p", "inside")
         monkeypatch.setenv("CALLSTACK_PARENT_SESSION", str(f))
-        monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
         loc = SessionLocator(projects_dir=projects)
         ref = loc.locate()
         assert ref.file == f
 
     def test_no_session_anywhere_raises(self, projects, monkeypatch):
         monkeypatch.delenv("CALLSTACK_PARENT_SESSION", raising=False)
-        monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
         loc = SessionLocator(projects_dir=projects)
         with pytest.raises(RuntimeError, match="Could not discover"):
             loc.locate()
@@ -275,7 +275,7 @@ class TestLocateConcurrency:
             f.write_text(json.dumps({"cwd": cwd, "type": "user"}) + "\n")
 
         monkeypatch.delenv("CALLSTACK_PARENT_SESSION", raising=False)
-        monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
         loc = SessionLocator(projects_dir=projects)
 
         def resolve(i):
