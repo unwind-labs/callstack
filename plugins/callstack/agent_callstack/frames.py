@@ -93,6 +93,24 @@ def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
     return out
 
 
+def _grafted_children(node_dict: dict,
+                      nested_by_key: dict[str, list[dict]]) -> list[dict]:
+    """Children of `node_dict` plus the root nodes of every nested frame
+    whose key matches this node's id (preferred) or session_id.
+
+    Single source of truth for the graft step shared by `_graft_node` and
+    `_graft_raw` (previously had this logic duplicated verbatim)."""
+    nid = str(node_dict.get("id", ""))
+    sid = node_dict.get("session_id")
+    children = list(node_dict.get("children") or [])
+    matched = nested_by_key.get(nid) or (
+        nested_by_key.get(sid) if sid else None
+    ) or []
+    for mf in matched:
+        children.extend((mf.get("tree") or {}).get("nodes") or [])
+    return children
+
+
 def _build_merged_report(*, invoke_id: str, frames: dict[str, list[dict]],
                          root_frame: dict, ended_at: str) -> dict:
     """Produce the report.yaml document by grafting each non-root frame's
@@ -136,19 +154,10 @@ def _graft_node(node_dict: dict, input_text: str, *, depth: int,
     multiple frames share that key (sibling nested invocations from the
     same caller), all of their nodes graft in — sorted by frame
     ``started_at`` so order is stable."""
-    sid = node_dict.get("session_id")
-    nid = str(node_dict.get("id", ""))
-    children_raw = list(node_dict.get("children") or [])
-    matched_frames = nested_by_session.get(nid) or (
-        nested_by_session.get(sid) if sid else None
-    ) or []
-    for mf in matched_frames:
-        nested_nodes = (mf.get("tree") or {}).get("nodes") or []
-        children_raw.extend(nested_nodes)
     children = [
         _graft_node(c, c.get("task", ""), depth=depth + 1,
                     nested_by_session=nested_by_session)
-        for c in children_raw
+        for c in _grafted_children(node_dict, nested_by_session)
     ]
     out: dict = {
         "id": str(node_dict.get("id", ""))[:8],
@@ -156,7 +165,7 @@ def _graft_node(node_dict: dict, input_text: str, *, depth: int,
         "status": _status_label_from_state(node_dict.get("state")),
         "depth": depth,
         "call_type": node_dict.get("call_type", "fork"),
-        "session_id": sid,
+        "session_id": node_dict.get("session_id"),
         "clone_path": node_dict.get("clone_path"),
         "duration_seconds": round(float(node_dict.get("duration", 0.0)), 2),
         "max_context_tokens_seen": node_dict.get("max_context_tokens_seen"),
@@ -254,14 +263,11 @@ def _merge_raw_nodes(frames: dict[str, list[dict]]) -> list[dict]:
 
 
 def _graft_raw(node: dict, nested: dict[str, list[dict]]) -> dict:
-    nid = str(node.get("id", ""))
-    sid = node.get("session_id")
-    children = list(node.get("children") or [])
-    matched = nested.get(nid) or (nested.get(sid) if sid else None) or []
-    for frame in matched:
-        frame_nodes = (frame.get("tree") or {}).get("nodes") or []
-        children.extend(frame_nodes)
-    return {**node, "children": [_graft_raw(c, nested) for c in children]}
+    """Recursively graft nested-frame nodes under matching caller nodes,
+    preserving the raw `Node.to_dict()` shape (full ids, all fields)."""
+    return {**node, "children": [
+        _graft_raw(c, nested) for c in _grafted_children(node, nested)
+    ]}
 
 
 def _chain_to_session(nodes: list, target: str) -> Optional[list[str]]:
