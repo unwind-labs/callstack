@@ -56,6 +56,46 @@ class TestResolveCwd:
         _, err = mcp_server._resolve_cwd("{PWD}/afile.txt")
         assert err is not None
 
+    def test_pwd_root_allowed(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        resolved, err = mcp_server._resolve_cwd("{PWD}")
+        assert err is None
+        assert Path(resolved).resolve() == tmp_path.resolve()
+
+    def test_etc_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        _, err = mcp_server._resolve_cwd("/etc")
+        assert err is not None
+        assert "sensitive" in err
+
+    def test_ssh_rejected(self, tmp_path, monkeypatch):
+        fake_home = tmp_path / "home"
+        (fake_home / ".ssh").mkdir(parents=True)
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        monkeypatch.chdir(proj)
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+        _, err = mcp_server._resolve_cwd("~/.ssh")
+        assert err is not None
+        assert "sensitive" in err
+
+    def test_symlink_to_etc_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        link = tmp_path / "shortcut"
+        os.symlink("/etc", link)
+        _, err = mcp_server._resolve_cwd("{PWD}/shortcut")
+        assert err is not None
+        assert "sensitive" in err
+
+    def test_subdir_of_parent_project_allowed(self, tmp_path, monkeypatch):
+        sub = tmp_path / "src"
+        sub.mkdir()
+        monkeypatch.chdir(tmp_path)
+        resolved, err = mcp_server._resolve_cwd("{PWD}/src")
+        assert err is None
+        assert Path(resolved).resolve() == sub.resolve()
+
 
 class TestSameProject:
     def test_identical_paths(self, tmp_path):

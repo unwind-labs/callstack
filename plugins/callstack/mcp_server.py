@@ -100,6 +100,17 @@ def _parent_project_folder() -> str:
     return os.getcwd()
 
 
+def _sensitive_prefixes() -> list[Path]:
+    """System / user-secret locations that callstack refuses to use as cwd
+    unless the parent project itself happens to live under one of them."""
+    home = Path.home()
+    return [
+        Path("/etc"), Path("/var"), Path("/usr"), Path("/bin"), Path("/sbin"),
+        Path("/private/etc"), Path("/private/var"),
+        home / ".ssh", home / ".aws", home / ".gnupg", home / ".config",
+    ]
+
+
 def _resolve_cwd(raw: str) -> tuple[str, Optional[str]]:
     """Expand `{PWD}` against the caller's project folder, then canonicalize.
 
@@ -109,14 +120,53 @@ def _resolve_cwd(raw: str) -> tuple[str, Optional[str]]:
     and error_message describes what went wrong.
 
     Empty `raw` resolves to the caller's project folder (the default behavior
-    before this feature) — no validation needed in that case."""
+    before this feature) — no validation needed in that case.
+
+    Canonicalizes symlinks via `Path.resolve(strict=True)` and rejects paths
+    that resolve under sensitive system/user prefixes (e.g. /etc, ~/.ssh)
+    unless they fall under the parent project folder itself."""
     if not raw:
         return _parent_project_folder(), None
     expanded = raw.replace("{PWD}", _parent_project_folder())
     expanded = os.path.abspath(os.path.expanduser(expanded))
-    if not os.path.isdir(expanded):
+    try:
+        resolved = Path(expanded).resolve(strict=True)
+    except FileNotFoundError:
         return expanded, f"cwd '{expanded}' is not an existing directory"
-    return expanded, None
+    except OSError as e:
+        return expanded, f"cwd '{expanded}' could not be resolved: {e}"
+    if not resolved.is_dir():
+        return str(resolved), f"cwd '{resolved}' is not an existing directory"
+    parent_project = Path(_parent_project_folder()).resolve()
+    if resolved != parent_project and not _is_within(resolved, parent_project):
+        for prefix in _sensitive_prefixes():
+            try:
+                prefix_resolved = prefix.resolve(strict=True)
+            except (FileNotFoundError, OSError):
+                continue
+            # If the parent project itself lives under this sensitive prefix
+            # (e.g. macOS tmp at /private/var/folders/...), the user has
+            # already accepted that location as their workspace — don't
+            # gate siblings at the same level.
+            if (parent_project == prefix_resolved
+                    or _is_within(parent_project, prefix_resolved)):
+                continue
+            if resolved == prefix_resolved or _is_within(resolved, prefix_resolved):
+                return str(resolved), (
+                    f"cwd '{resolved}' is in a sensitive system/user "
+                    f"location ('{prefix}') and is not allowed; pass an "
+                    f"explicit project subdirectory"
+                )
+    return str(resolved), None
+
+
+def _is_within(child: Path, parent: Path) -> bool:
+    """True iff `child` lies inside `parent` (both already resolved)."""
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
 
 
 def _same_project(a: str, b: str) -> bool:
