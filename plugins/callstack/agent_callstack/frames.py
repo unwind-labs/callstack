@@ -23,7 +23,6 @@ import yaml
 
 from . import session
 from .driver import Node, Tree
-from .session import encode_project_dir
 
 
 _ROOT_FRAME_KEY = "root"
@@ -294,6 +293,9 @@ def _chain_to_session(nodes: list, target: str) -> Optional[list[str]]:
     return walk(nodes, [])
 
 
+_SHARED_LOCATOR: Optional["session.SessionLocator"] = None
+
+
 def _most_recent_session(cwd: str) -> Optional[str]:
     """Stem of the most recently modified `.jsonl` in the cwd's project dir.
 
@@ -301,22 +303,17 @@ def _most_recent_session(cwd: str) -> Optional[str]:
     not exported. The active fork is the one currently being appended to,
     so it wins by mtime.
 
-    Reads ``session.PROJECTS_DIR`` dynamically so tests can monkeypatch
-    either ``agent_callstack.session.PROJECTS_DIR`` or
-    ``agent_callstack.frames.session.PROJECTS_DIR``."""
-    proj_dir = session.PROJECTS_DIR / encode_project_dir(cwd)
-    if not proj_dir.is_dir():
-        return None
-    best: Optional[str] = None
-    best_mtime: float = 0.0
-    for f in proj_dir.glob("*.jsonl"):
-        try:
-            m = f.stat().st_mtime
-        except OSError:
-            continue
-        if m > best_mtime:
-            best_mtime, best = m, f.stem
-    return best
+    Delegates to ``SessionLocator._most_recent`` (consolidated in PERF-F).
+    Reuses one module-level locator so the per-instance MRU cache survives
+    across reporter ticks and yields real benefit. The locator reads
+    ``session.PROJECTS_DIR`` at construction; if a test monkeypatches
+    that, recreate the shared locator to pick it up."""
+    global _SHARED_LOCATOR
+    if (_SHARED_LOCATOR is None
+            or _SHARED_LOCATOR._projects_dir is not session.PROJECTS_DIR):
+        _SHARED_LOCATOR = session.SessionLocator()
+    ref = _SHARED_LOCATOR._most_recent(cwd)
+    return ref.session_id if ref else None
 
 
 def _one_line(s: str, limit: int) -> str:

@@ -46,6 +46,10 @@ class SessionLocator:
 
     def __init__(self, projects_dir: Path = PROJECTS_DIR):
         self._projects_dir = projects_dir
+        # Per-instance cache for _most_recent. Key: cwd string (or "" for
+        # None). Value: (project_dir_mtime_ns, SessionRef-or-None). Stale
+        # when project_dir_mtime advances (new/removed session JSONL).
+        self._mru_cache: dict[str, tuple[int, Optional[SessionRef]]] = {}
 
     def locate(
         self,
@@ -93,20 +97,50 @@ class SessionLocator:
         )
 
     def resolve(self, session_id: str, cwd: Optional[str] = None) -> Optional[Path]:
-        """Find the .jsonl file for a known session UUID. Returns None if missing."""
-        # Look in the cwd-matching project dir first, then any project dir.
+        """Find the .jsonl file for a known session UUID. Returns None if missing.
+
+        Strategy (in order):
+          1. cwd-matching project dir.
+          2. Lazy index at ``PROJECTS_DIR/.session_index.json``
+             (``{session_id: project_dir_name}``). Verified before returning.
+          3. Full project-dir scan, populating the index with every
+             ``session_id`` discovered before returning. The index is
+             persisted atomically.
+        """
         project_dir = self._project_dir_for(cwd)
         if project_dir:
             candidate = project_dir / f"{session_id}.jsonl"
             if candidate.is_file():
                 return candidate
-        if self._projects_dir.is_dir():
-            for d in self._projects_dir.iterdir():
-                if d.is_dir():
-                    candidate = d / f"{session_id}.jsonl"
-                    if candidate.is_file():
-                        return candidate
-        return None
+        if not self._projects_dir.is_dir():
+            return None
+        # Index lookup
+        idx = _load_session_index(self._projects_dir)
+        recorded = idx.get(session_id)
+        if recorded:
+            cand = self._projects_dir / recorded / f"{session_id}.jsonl"
+            if cand.is_file():
+                return cand
+        # Fallback scan; populate index with everything we see.
+        found: Optional[Path] = None
+        discovered: dict[str, str] = {}
+        for d in self._projects_dir.iterdir():
+            if not d.is_dir():
+                continue
+            try:
+                with os.scandir(d) as it:
+                    for entry in it:
+                        if not entry.name.endswith(".jsonl"):
+                            continue
+                        sid = entry.name[:-len(".jsonl")]
+                        discovered[sid] = d.name
+                        if sid == session_id and found is None:
+                            found = Path(entry.path)
+            except OSError:
+                continue
+        if discovered:
+            _save_session_index(self._projects_dir, {**idx, **discovered})
+        return found
 
     # ---- private ----
 
@@ -165,22 +199,44 @@ class SessionLocator:
         Scoped to one project: cross-project guessing is unsafe — the
         most-recently-touched session in some unrelated project dir is
         never "the caller", and conflating them produces a wrong
-        parent_session in the resulting report."""
+        parent_session in the resulting report.
+
+        Uses os.scandir (one syscall per entry, vs glob+stat) and an
+        instance-level cache invalidated when the project_dir's mtime
+        advances (a new session was added or removed)."""
         primary = self._project_dir_for(cwd)
         if not primary:
             return None
-        best: Optional[Path] = None
-        best_mtime: float = 0.0
-        for f in primary.glob("*.jsonl"):
-            try:
-                m = f.stat().st_mtime
-            except OSError:
-                continue
-            if m > best_mtime:
-                best_mtime, best = m, f
-        if best is None:
+        key = cwd or ""
+        try:
+            dir_mtime_ns = primary.stat().st_mtime_ns
+        except OSError:
             return None
-        return SessionRef(session_id=best.stem, file=best)
+        cached = self._mru_cache.get(key)
+        if cached is not None and cached[0] == dir_mtime_ns:
+            return cached[1]
+        best_path: Optional[str] = None
+        best_mtime_ns: int = 0
+        try:
+            with os.scandir(primary) as it:
+                for entry in it:
+                    if not entry.name.endswith(".jsonl"):
+                        continue
+                    try:
+                        st = entry.stat()
+                    except OSError:
+                        continue
+                    if st.st_mtime_ns > best_mtime_ns:
+                        best_mtime_ns = st.st_mtime_ns
+                        best_path = entry.path
+        except OSError:
+            return None
+        if best_path is None:
+            self._mru_cache[key] = (dir_mtime_ns, None)
+            return None
+        ref = SessionRef(session_id=Path(best_path).stem, file=Path(best_path))
+        self._mru_cache[key] = (dir_mtime_ns, ref)
+        return ref
 
 
 def _extract_cwd(session_file: Path) -> Optional[str]:
@@ -203,10 +259,66 @@ def _extract_cwd(session_file: Path) -> Optional[str]:
     return None
 
 
-def count_lines(path: Path) -> int:
-    """Cheap line counter; returns 0 on read error."""
+_SESSION_INDEX_FILENAME = ".session_index.json"
+
+
+def _load_session_index(projects_dir: Path) -> dict[str, str]:
+    """Best-effort load of the lazy session-id → project-dir-name index.
+    Returns empty dict on any error (corrupt, missing, perm denied).
+
+    TODO: index grows monotonically. Add a maintenance pass when it
+    exceeds some cap (e.g. 100 KB) to prune session_ids whose .jsonl
+    no longer exists. Skipped for now — corrupt entries are detected
+    at lookup time via the `is_file()` check, so staleness is a
+    correctness no-op."""
+    path = projects_dir / _SESSION_INDEX_FILENAME
     try:
         with open(path, "r") as f:
-            return sum(1 for _ in f)
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items()
+            if isinstance(k, str) and isinstance(v, str)}
+
+
+def _save_session_index(projects_dir: Path, idx: dict[str, str]) -> None:
+    """Atomic write of the session index. Silently best-effort on error."""
+    import tempfile
+    path = projects_dir / _SESSION_INDEX_FILENAME
+    try:
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(projects_dir), prefix=path.name + ".", suffix=".tmp",
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(idx, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_name, path)
+        except Exception:
+            try: os.unlink(tmp_name)
+            except OSError: pass
+            raise
+    except OSError:
+        return
+
+
+def count_lines(path: Path) -> int:
+    """Cheap line counter; returns 0 on read error.
+
+    Binary chunked read — 10–50× faster than text-mode iteration on
+    multi-MB session JSONLs.
+    """
+    try:
+        total = 0
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                total += chunk.count(b"\n")
+        return total
     except OSError:
         return 0
