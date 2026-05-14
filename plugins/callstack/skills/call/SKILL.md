@@ -129,10 +129,11 @@ MFA codes, passwords, confirmations). Do not guess.
 ### RETURN — finish and hand results to the parent
 
 ```json
-{"op": "return", "result": "...", "summary": "...", "next": "..."}
+{"op": "return", "result": <any JSON value>, "summary": "...", "next": "..."}
 ```
 
-- `result` — the deliverable/answer for the parent. Structure it however
+- `result` — the deliverable/answer for the parent. Any JSON value:
+  string, number, boolean, object, array, or null. Structure it however
   is appropriate for the task.
 - `summary` — COMPACT brain-dump of everything the parent needs to
   execute upcoming tasks: sub-calls made and their outcomes, key

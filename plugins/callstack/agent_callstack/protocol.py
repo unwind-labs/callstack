@@ -23,7 +23,7 @@ emitting EXACTLY ONE JSON envelope wrapped in a fenced ```json code block.
 
 - {"op": "call", "task": "<what to accomplish>"}
 - {"op": "yield", "question": "<question for user>"}
-- {"op": "return", "result": "...", "summary": "...", "next": "..."}
+- {"op": "return", "result": ..., "summary": "...", "next": "..."}
 """
 
 
