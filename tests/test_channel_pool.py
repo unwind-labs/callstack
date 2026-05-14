@@ -172,7 +172,8 @@ class _SpawnAndTurnRecorder:
     def patch(self, monkeypatch, channel: ClaudeChannel) -> None:
         recorder = self
 
-        def fake_spawn(self_, source_sid, mode, cwd, extra_env):
+        def fake_spawn(self_, source_sid, mode, cwd, extra_env,
+                       *, preallocated_session_id=None):
             with recorder._lock:
                 recorder.spawn_calls.append((source_sid, mode))
                 # Each spawn binds to the next prepared session_id.
@@ -182,7 +183,7 @@ class _SpawnAndTurnRecorder:
             return entry
 
         def fake_run_one_turn(self_, entry, prompt, timeout, on_session_id, *,
-                              do_handshake):
+                              do_handshake, preallocated_session_id=None):
             sid = entry.session_id or "auto-sid"
             with recorder._lock:
                 recorder.turn_calls.append((sid, prompt, do_handshake))

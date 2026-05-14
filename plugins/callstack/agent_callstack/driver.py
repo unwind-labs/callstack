@@ -509,6 +509,15 @@ class Driver:
             # the id is already set on the node.
             produces_new_session = effect.mode in ("fork", "fresh")
 
+            # Pre-allocate the child's session UUID for fork/fresh so the
+            # child claude is told (via `--session-id`) exactly which
+            # UUID to use, and its MCP server can read the same value
+            # back from CALLSTACK_OWN_SESSION env. Removes the
+            # SessionLocator mtime-fallback race on concurrent siblings.
+            preallocated_sid: Optional[str] = (
+                str(uuid.uuid4()) if produces_new_session else None
+            )
+
             def _early_session(sid: str) -> None:
                 if not produces_new_session:
                     return
@@ -527,7 +536,15 @@ class Driver:
                     if produces_new_session else None
                 ),
                 on_session_id=_early_session,
+                preallocated_session_id=preallocated_sid,
             )
+            # NB: the consistency check (claude must honor --session-id)
+            # lives inside ClaudeChannel itself, NOT here. The Driver
+            # is channel-agnostic and ScriptedChannel doesn't simulate
+            # the --session-id contract — enforcing it at the Driver
+            # would break every scripted test that returns a stable
+            # known session id like "child-1". See `_run_one_turn` in
+            # channel.py for the production-only check.
         except TurnTimeout as e:
             node.duration += time.time() - t0
             self.trace.write(

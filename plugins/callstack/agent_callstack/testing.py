@@ -54,8 +54,9 @@ class ScriptedChannel:
         timeout: int = 300,
         extra_env: Optional[dict] = None,
         on_session_id: Optional[Callable[[str], None]] = None,
+        preallocated_session_id: Optional[str] = None,
     ) -> TurnResult:
-        _ = (cwd, timeout, extra_env)  # accepted for parity with ClaudeChannel
+        _ = (cwd, timeout, extra_env, preallocated_session_id)  # parity
         with self._lock:
             if not self.responses:
                 raise AssertionError(

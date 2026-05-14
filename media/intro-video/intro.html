@@ -1,0 +1,1503 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>callstack — intro</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root{
+    --bg:#F4EFE8;            /* warm off-white */
+    --bg-2:#EAE2D5;          /* slightly deeper warm */
+    --ink:#1F1B16;           /* near-black warm */
+    --ink-2:#5A4F44;         /* muted body text */
+    --rule:#D8CDB9;          /* hairline */
+    --orange:#CC785C;        /* Anthropic-ish accent */
+    --orange-2:#A75A40;      /* deeper orange for emphasis */
+    --green:#3F7A3F;
+    --red:#B0463A;
+    --term-bg:#221C16;       /* dark terminal panel */
+    --term-ink:#F1E6D2;
+    --term-dim:#9C8E7B;
+    --term-orange:#E5A677;
+    --term-green:#A7C77B;
+
+    --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, -apple-system, "Inter", "Helvetica Neue", Arial, sans-serif;
+    --serif: ui-serif, "Iowan Old Style", "Source Serif Pro", Georgia, serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:#000;color:var(--ink);font-family:var(--sans);}
+  /* Stage: 16:9 fixed-frame so screen-recording is consistent */
+  .stage{
+    position:fixed; inset:0;
+    display:grid; place-items:center;
+    background:#000;
+  }
+  .frame{
+    position:relative;
+    width:min(100vw, calc(100vh * 16 / 9));
+    aspect-ratio: 16/9;
+    background:var(--bg);
+    overflow:hidden;
+    box-shadow:0 0 0 1px var(--rule);
+  }
+  /* dotted background pattern */
+  .frame::before{
+    content:"";
+    position:absolute; inset:0;
+    background-image: radial-gradient(rgba(31,27,22,0.08) 1px, transparent 1px);
+    background-size: 22px 22px;
+    pointer-events:none;
+    z-index:0;
+  }
+
+  /* Wordmark in corner */
+  .wordmark{
+    position:absolute; top:3.2%; left:3.5%;
+    font-family:var(--mono); font-size:1.15vw; letter-spacing:.02em;
+    color:var(--ink); z-index:50;
+    display:flex; align-items:center; gap:.55em;
+    opacity:.85;
+  }
+  .wordmark .dot{
+    width:.55em; height:.55em; border-radius:50%;
+    background:var(--orange);
+    box-shadow:0 0 0 .14em rgba(204,120,92,.22);
+  }
+  .timecode{
+    position:absolute; top:3.2%; right:3.5%;
+    font-family:var(--mono); font-size:.95vw;
+    color:var(--ink-2); opacity:.55; z-index:50;
+    letter-spacing:.05em;
+  }
+
+  /* Each scene fills the frame, fades in/out via JS */
+  .scene{
+    position:absolute; inset:0;
+    display:grid; place-items:center;
+    opacity:0; transition: opacity 600ms ease;
+    z-index:1;
+    padding: 9% 7% 7%;
+  }
+  .scene.on{ opacity:1; z-index:2; }
+
+  /* Caption (lower-third style, but inline) */
+  .caption{
+    font-family:var(--serif);
+    font-size:2.4vw; line-height:1.25;
+    color:var(--ink); max-width:80%;
+    text-align:center;
+    letter-spacing:-.005em;
+  }
+  .caption .em{ color:var(--orange-2); font-style: italic; }
+  .kicker{
+    font-family:var(--mono); font-size:.95vw;
+    text-transform:uppercase; letter-spacing:.18em;
+    color:var(--orange-2); margin-bottom:1.2vw;
+  }
+
+  /* ============ SCENE 1: cold open ============ */
+  .term{
+    background:var(--term-bg); color:var(--term-ink);
+    border-radius:.7vw;
+    font-family:var(--mono);
+    font-size:1.05vw; line-height:1.55;
+    padding:1.4vw 1.6vw 1.6vw;
+    box-shadow:0 1.2vw 3vw rgba(31,27,22,.18), 0 0 0 1px rgba(31,27,22,.06);
+  }
+  .term .bar{
+    display:flex; gap:.45vw; margin-bottom:.95vw;
+  }
+  .term .bar i{ width:.7vw; height:.7vw; border-radius:50%; background:#574a3e; display:block; }
+  .term .bar i:first-child{ background:#C75646; }
+  .term .bar i:nth-child(2){ background:#D5A24B; }
+  .term .bar i:nth-child(3){ background:#7CA56A; }
+  .term .prompt{ color:var(--term-orange); }
+  .term .dim{ color:var(--term-dim); }
+  .term .green{ color:var(--term-green); }
+  .term .ink{ color:var(--term-ink); }
+  .term .cursor{
+    display:inline-block; width:.55ch; height:1.1em; vertical-align:-.2em;
+    background:var(--term-ink); margin-left:.1ch;
+    animation: blink 1s steps(1,end) infinite;
+  }
+  @keyframes blink{ 50%{opacity:0} }
+
+  /* ============ SCENE 2: context bloat ============ */
+  .ctx-wrap{ width: 86%; display:flex; flex-direction:column; align-items:center; gap:1.6vw; }
+  .ctx-meta{
+    display:flex; justify-content:space-between; width:100%;
+    font-family:var(--mono); font-size:1vw; color:var(--ink-2);
+  }
+  .ctx-meta .tokens{ color:var(--ink); font-weight:600; font-variant-numeric: tabular-nums; }
+  .ctx-meta .tokens.hot{ color:var(--red); }
+  .ctx-bar{
+    width:100%;
+    height:3.2vw;
+    background:var(--bg-2);
+    border-radius:.45vw;
+    border:1px solid var(--rule);
+    overflow:hidden; display:flex; position:relative;
+  }
+  .ctx-bar .seg{
+    height:100%;
+    border-right:1px solid rgba(31,27,22,.12);
+    display:flex; align-items:center; justify-content:center;
+    font-family:var(--mono); font-size:.7vw;
+    color:rgba(31,27,22,.55);
+    white-space:nowrap; overflow:hidden;
+    transform: scaleX(0); transform-origin: left;
+    transition: transform .12s linear;
+  }
+  .ctx-bar .sys{ background:#E2D5BD; color:#5A4F44; }
+  .ctx-bar .file{ background:#D9C9A8; }
+  .ctx-bar .tool{ background:#E8C9A8; }
+  .ctx-bar .ass{ background:#D6BFA0; }
+  .ctx-bar .rot{ background:repeating-linear-gradient(-45deg,#B0463A,#B0463A 6px,#943728 6px,#943728 12px); color:#fff;}
+
+  .ctx-bar .overflow-glow{
+    position:absolute; right:-2vw; top:-30%; bottom:-30%;
+    width:6vw; pointer-events:none;
+    background: radial-gradient(closest-side, rgba(176,70,58,.55), transparent 70%);
+    opacity:0;
+  }
+  .ctx-tags{
+    display:flex; flex-wrap:wrap; gap:.5vw 1.1vw;
+    font-family:var(--mono); font-size:.95vw; color:var(--ink-2);
+    justify-content:center; max-width:100%;
+  }
+  .ctx-tags span{
+    opacity:0; transform:translateY(.4em);
+    transition: opacity .25s ease, transform .25s ease;
+  }
+  .ctx-tags span.in{ opacity:1; transform:translateY(0); }
+
+  .scene-2 .caption{ margin-top:1.2vw; }
+  /* Two layered captions that fade-swap mid-scene */
+  .scene2-caps{
+    position:relative;
+    width:100%;
+    min-height: 5vw;
+    margin-top:.8vw;
+    display:flex; align-items:flex-start; justify-content:center;
+  }
+  .scene2-cap{
+    position:absolute;
+    inset:0;
+    display:flex; align-items:flex-start; justify-content:center;
+    text-align:center;
+    font-family:var(--serif);
+    font-size:2.2vw; line-height:1.3;
+    color:var(--ink);
+    max-width:84%; margin:0 auto;
+    opacity:0;
+    transition: opacity .55s ease;
+  }
+  .scene2-cap.on{ opacity:1; }
+  .scene2-cap .em{ color:var(--orange-2); font-style:italic; }
+
+  /* ============ SCENE 3: subagent waste ============ */
+  .pair{
+    display:grid; grid-template-columns: 1fr auto 1fr;
+    gap:2.2vw; align-items:center;
+    width: 92%;
+  }
+  .pair .term{ width:100%; min-height: 19vw; font-size:.95vw; }
+  .pair .label{
+    font-family:var(--mono); font-size:.85vw; color:var(--ink-2);
+    text-transform:uppercase; letter-spacing:.16em;
+    margin-bottom:.55vw;
+  }
+  .pair .arrow{
+    position:relative;
+    width:7vw; height:6vw;
+    display:grid; place-items:center;
+  }
+  .pair .arrow svg{ width:100%; height:100%; }
+  .blob{
+    position:absolute; left:-7vw; top:50%; transform:translateY(-50%) scale(.4);
+    background:var(--orange); color:#fff; padding:.55vw .9vw; border-radius:.4vw;
+    font-family:var(--mono); font-size:.78vw;
+    box-shadow:0 .4vw 1.2vw rgba(204,120,92,.45);
+    opacity:0;
+  }
+  .scene-3.on .blob{ animation: blob-fly 3s ease-in-out 1.2s forwards; }
+  @keyframes blob-fly{
+    0%{ left:-7vw; opacity:0; transform:translateY(-50%) scale(.4); }
+    18%{ opacity:1; transform:translateY(-50%) scale(1); }
+    78%{ left: 7vw; opacity:1; transform:translateY(-50%) scale(1); }
+    100%{ left: 7vw; opacity:0; transform:translateY(-50%) scale(.4); }
+  }
+
+  .meter{
+    margin-top:.9vw;
+    display:flex; align-items:center; gap:.6vw;
+    font-family:var(--mono); font-size:.78vw; color:var(--term-dim);
+  }
+  .meter .track{ flex:1; height:.5vw; background:#3a2f25; border-radius:.25vw; overflow:hidden; }
+  .meter .fill{
+    height:100%; width:6%;
+    background:linear-gradient(90deg, var(--term-orange), var(--orange-2));
+    transition: width 2.4s ease-out;
+  }
+  .scene-3.on .meter .fill{ width: 92%; transition-delay: 1.6s; }
+  .meter .num{ color:var(--term-orange); min-width:5ch; text-align:right; font-variant-numeric:tabular-nums; }
+
+  .scene-3 .caption{ margin-top:1.6vw; font-size:1.95vw; }
+
+  /* ============ SCENE 4: /fork footnote ============ */
+  .scene-4 .card{
+    width:62%;
+    background:var(--bg);
+    border:1px solid var(--rule);
+    border-left:.35vw solid var(--orange);
+    padding:2.2vw 2.4vw;
+    border-radius:.4vw;
+    box-shadow:0 1vw 2.4vw rgba(31,27,22,.08);
+  }
+  .scene-4 .card .h{
+    font-family:var(--mono); font-size:.9vw;
+    text-transform:uppercase; letter-spacing:.18em;
+    color:var(--orange-2); margin-bottom:.9vw;
+  }
+  .scene-4 .card p{
+    margin:0;
+    font-family:var(--serif);
+    font-size:1.95vw; line-height:1.35; color:var(--ink);
+  }
+  .scene-4 .card p .strike{
+    text-decoration: line-through;
+    text-decoration-color: var(--orange-2);
+    text-decoration-thickness: .12em;
+    color:var(--ink-2);
+  }
+  .scene-4 .card p .nope{ color:var(--orange-2); font-style:italic; }
+
+  /* ============ SCENE 5: callstack diagram ============ */
+  .stack{
+    width: 88%;
+    font-family:var(--mono); font-size:1.02vw; line-height:1.7;
+    color:var(--ink);
+    display:flex; flex-direction:column; gap:.15vw;
+  }
+  .stack .row{ display:flex; align-items:center; gap:.6vw; opacity:0; transform:translateY(.4em); }
+  .stack .row.in{ opacity:1; transform:translateY(0); transition: all .35s ease-out; }
+  .stack .indent{ display:inline-block; }
+  .stack .ind1{ width:1.6ch; }
+  .stack .ind2{ width:5.4ch; }
+  .stack .ind3{ width:9.2ch; }
+  .stack .gutter{ color:#9d8c75; }
+  .stack .label{ color:var(--ink-2); }
+  .stack .ctxline{
+    display:inline-flex; align-items:center; gap:.4vw;
+    font-family:var(--mono); font-size:.95vw; color:var(--ink);
+  }
+  .ctxbar{
+    display:inline-flex; height:1.3vw;
+    border:1px solid var(--rule); border-radius:.18vw; overflow:hidden;
+    background:#EFE7D7;
+    font-family:var(--mono); font-size:.65vw;
+    color:rgba(31,27,22,.6);
+    align-items:center;
+    min-width: 24vw; max-width:34vw;
+  }
+  .ctxbar .b{
+    height:100%; display:flex; align-items:center; justify-content:center;
+    border-right:1px solid rgba(31,27,22,.12);
+    transition: width .45s ease, opacity .35s ease;
+  }
+  .ctxbar .b:last-child{ border-right:0; }
+  .ctxbar .S{ background:#E2D5BD; }
+  .ctxbar .A{ background:#D9C9A8; color:#5a4f44; }
+  .ctxbar .B{ background:#E8C9A8; }
+  .ctxbar .C{ background:#D6BFA0; }
+  .ctxbar .c{ background:var(--orange); color:#fff; }
+  .ctxbar .b{ }
+  .ctxbar .empty{ background: #EFE7D7; color: rgba(31,27,22,.25); }
+
+  .stack .return{ color:var(--orange-2); }
+  .stack .call{ color:var(--green); }
+  .stack .arrow-note{
+    margin-left:.4vw; color:var(--ink-2); font-size:.85vw;
+  }
+
+  .scene-5 .caption{ margin-top:1.4vw; font-size:1.85vw; }
+
+  /* ============ SCENE 6: refund tree ============ */
+  .scene-6 .layout{
+    display:grid; grid-template-columns: 1fr 1.1fr;
+    gap:3vw; width: 92%; align-items:center;
+  }
+  .tree{
+    font-family:var(--mono); font-size:1vw; line-height:1.65; color:var(--ink);
+    background:var(--bg);
+    border:1px solid var(--rule);
+    border-radius:.45vw;
+    padding:1.6vw 1.8vw;
+    box-shadow:0 .8vw 2vw rgba(31,27,22,.06);
+  }
+  .tree .root{ color:var(--ink); margin-bottom:.4vw; }
+  .tree .br{ color:#a89881; }
+  .tree .skill{ color:var(--ink); }
+  .tree .yield{
+    background:var(--orange);
+    color:#fff;
+    padding:0 .55ch; border-radius:.18vw;
+    box-shadow:0 0 0 0 rgba(204,120,92,.5);
+  }
+  .scene-6.on .tree .yield{ animation: yield-pulse 2s ease-in-out 1.4s 2; }
+  @keyframes yield-pulse{
+    0%,100%{ box-shadow:0 0 0 0 rgba(204,120,92,.6); }
+    50%{ box-shadow:0 0 0 .7vw rgba(204,120,92,0); }
+  }
+  .tree .ret{ color:var(--green); }
+  .tree .user{ color:var(--orange-2); }
+  .tree .row{ opacity:0; transform: translateX(-.4em); }
+  .scene-6.on .tree .row{ animation: tree-in .3s ease-out forwards; }
+
+  .scene-6 .right{
+    display:flex; flex-direction:column; gap:1.4vw;
+  }
+  .scene-6 .right .kicker{ margin:0; }
+  .scene-6 .right h3{
+    font-family:var(--serif); font-weight:500;
+    font-size:2.4vw; line-height:1.2; margin:0; color:var(--ink);
+  }
+  .scene-6 .right h3 .em{ color:var(--orange-2); font-style:italic; }
+  .scene-6 .right p{
+    font-family:var(--sans); font-size:1.1vw; line-height:1.55;
+    color:var(--ink-2); margin:0; max-width:30vw;
+  }
+
+  /* ============ SCENE 7: CTA ============ */
+  .scene-7{ background:var(--bg); }
+  .cta{
+    display:flex; flex-direction:column; align-items:center; gap:1.8vw;
+    text-align:center;
+  }
+  .cta .mark{
+    display:flex; align-items:center; gap:.7vw;
+    font-family:var(--mono); font-size:1.4vw; letter-spacing:.02em; color:var(--ink);
+  }
+  .cta .mark .dot{
+    width:.7em; height:.7em; border-radius:50%;
+    background:var(--orange);
+    box-shadow:0 0 0 .18em rgba(204,120,92,.22);
+  }
+  .cta h1{
+    font-family:var(--serif); font-weight:500;
+    font-size:5vw; line-height:1; margin:0; color:var(--ink);
+    letter-spacing:-.01em;
+  }
+  .cta .tag{
+    font-family:var(--serif); font-style:italic;
+    font-size:1.7vw; color:var(--ink-2); margin-top:-.4vw;
+  }
+  .cta .install{
+    margin-top:.6vw;
+    background:var(--term-bg); color:var(--term-ink);
+    font-family:var(--mono); font-size:1.1vw;
+    padding:1.1vw 1.4vw; border-radius:.5vw;
+    display:flex; flex-direction:column; gap:.35vw; text-align:left;
+  }
+  .cta .install .p{ color:var(--term-orange); }
+  .cta .url{
+    font-family:var(--mono); font-size:1.1vw;
+    color:var(--orange-2);
+    border-bottom:1px solid var(--orange);
+    padding-bottom:.05vw;
+  }
+
+  /* ============ unwind-style dark cards (used by scenes 3 + 5) ============ */
+  :root{
+    --uw-bg:#0B1116;
+    --uw-card:#10171D;
+    --uw-card-2:#0E2433;
+    --uw-rule:#1F2A30;
+    --uw-rule-2:#2C3A42;
+    --uw-ink:#E5EAEE;
+    --uw-ink-2:#9AA6AE;
+    --uw-ink-3:#5C6973;
+    --uw-green:#5DD39E;
+    --uw-blue:#6BC0E0;
+    --uw-blue-bg:#152C3F;
+    --uw-blue-border:#1F4866;
+    --uw-pending:#E5A24B;
+  }
+  .unwind-stage{
+    background:var(--uw-bg);
+    border-radius:.55vw;
+    padding:1.6vw 2vw;
+    width:92%;
+    position:relative;
+    /* dotted grid like unwind */
+    background-image: radial-gradient(rgba(180,200,210,.05) 1px, transparent 1px);
+    background-size: 14px 14px;
+    box-shadow:0 1.4vw 3.2vw rgba(31,27,22,.18), 0 0 0 1px rgba(31,27,22,.08);
+  }
+  .unwind-grid{
+    display:grid; grid-template-columns: 1fr 1fr 1fr; gap:2.6vw;
+    align-items:start; position:relative; z-index:2;
+  }
+  .ucard{
+    display:flex;
+    background:var(--uw-card);
+    border:1px solid var(--uw-rule);
+    border-radius:.5vw;
+    color:var(--uw-ink);
+    font-family:var(--mono);
+    overflow:hidden;
+    position:relative;
+    opacity:0; transform:translateY(.4em);
+    transition: opacity .5s ease, transform .5s ease;
+  }
+  .ucard.in{ opacity:1; transform:translateY(0); }
+  .urail{
+    width:1.5vw; flex:0 0 1.5vw;
+    border-right:1px solid var(--uw-rule);
+    display:flex; align-items:center; justify-content:center;
+    background:rgba(255,255,255,.01);
+  }
+  .urail span{
+    writing-mode: vertical-rl; transform: rotate(180deg);
+    font-size:.7vw; letter-spacing:.18em;
+    color:var(--uw-ink-3);
+    text-transform:uppercase;
+  }
+  .ubody{ flex:1; padding:.95vw 1.1vw 1vw; min-width:0; }
+  .uhead{ display:flex; align-items:center; gap:.55vw; }
+  .ustatus{
+    width:1.05vw; height:1.05vw; border-radius:50%;
+    border:1.4px solid var(--uw-pending);
+    display:grid; place-items:center;
+    color:var(--uw-pending); font-size:.62vw;
+    flex:0 0 1.05vw;
+    transition: border-color .3s ease, color .3s ease;
+  }
+  .ustatus.complete{ border-color: var(--uw-green); color:var(--uw-green); }
+  .ustatus.complete::after{ content:"✓"; }
+  .utitle{ flex:1; font-size:1vw; color:var(--uw-ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .uid{ font-size:.78vw; color:var(--uw-ink-3); }
+  .ucontext{
+    margin-top:.7vw;
+    height:.55vw;
+    background:#0A0F13;
+    border:1px solid var(--uw-rule);
+    border-radius:.18vw;
+    display:flex; overflow:hidden;
+  }
+  .ucontext .seg{ height:100%; transition: width .45s ease; }
+  .ucontext .seg.S{ background:#3D5168; }
+  .ucontext .seg.A{ background:#4D6280; }
+  .ucontext .seg.B{ background:#7A6443; }
+  .ucontext .seg.C{ background:#8C5840; }
+  .ucontext .seg.c{ background:var(--orange); }
+  .ucontext .seg.b{ background:#E5A677; }
+  .ucontext .seg.empty{ background:transparent; }
+  .umeta{
+    margin-top:.65vw; color:var(--uw-ink-2); font-size:.78vw;
+    display:flex; align-items:center; gap:.45vw;
+  }
+  .umeta .udot{ width:.45vw; height:.45vw; border-radius:50%; background:#3D7B53; }
+  .uinherit{
+    font-family:var(--mono); font-size:.7vw;
+    color: var(--uw-green);
+    letter-spacing:.05em;
+    margin-bottom:.45vw;
+    display:flex; align-items:center; gap:.35vw;
+  }
+  .uinherit::before{
+    content:"✓"; color:var(--uw-green);
+  }
+  .uchildren{ margin-top:.9vw; display:flex; flex-direction:column; gap:.4vw; }
+  .ucall{
+    background:var(--uw-card-2);
+    border:1px solid var(--uw-blue-border);
+    border-radius:.32vw;
+    padding:.4vw .55vw;
+    display:flex; align-items:center; gap:.6vw;
+    font-size:.82vw; color:#C8D5DD;
+    position:relative;
+    transition: box-shadow .3s ease, border-color .3s ease;
+  }
+  .ucall.calling{
+    border-color: var(--orange);
+    box-shadow: 0 0 0 .2vw rgba(204,120,92,.18);
+  }
+  .upill{
+    font-size:.62vw;
+    background:var(--uw-blue-bg);
+    color:var(--uw-blue);
+    border:1px solid var(--uw-blue-border);
+    padding:.05vw .45ch;
+    border-radius:.18vw;
+    letter-spacing:.04em;
+  }
+  .ucall .uch-id{ margin-left:auto; color:var(--uw-ink-3); font-size:.7vw; }
+  .ucall .ucstat{
+    width:.85vw; height:.85vw; border-radius:50%;
+    border:1.2px solid var(--uw-pending); color:var(--uw-pending);
+    display:grid; place-items:center; font-size:.5vw;
+    flex:0 0 .85vw;
+  }
+  .ucall .ucstat.complete{ border-color:var(--uw-green); color:var(--uw-green); }
+  .ucall .ucstat.complete::after{ content:"✓"; }
+
+  /* connector overlay (SVG) for scene 5 */
+  .connectors{
+    position:absolute; inset:0;
+    width:100%; height:100%;
+    pointer-events:none;
+    z-index:1;
+  }
+  .connectors path{
+    fill:none; stroke:#3D5168; stroke-width:2;
+    opacity: 0;
+    transition: opacity .6s ease;
+  }
+  .connectors path.drawn{ opacity: .9; }
+  .connectors path.return{
+    stroke: var(--orange); stroke-width:2.5; stroke-dasharray: 6 5;
+  }
+
+  /* return-result pill flying from child column to parent context bar */
+  .returnpill{
+    position:absolute; z-index:5;
+    background: var(--orange); color:#fff;
+    font-family:var(--mono); font-size:.72vw;
+    padding:.18vw .5vw; border-radius:.2vw;
+    box-shadow:0 .25vw .8vw rgba(204,120,92,.5);
+    opacity:0;
+    transition: all .9s cubic-bezier(.55,.08,.34,1);
+  }
+
+  /* ============ scene 3 parallel timelines ============ */
+  .ptl-stage{
+    width:94%;
+    background:var(--uw-bg);
+    border-radius:.55vw;
+    padding:1.6vw 2vw 1.4vw;
+    display:grid; grid-template-columns: 1fr 1.4fr 1fr; gap:0;
+    align-items:stretch; position:relative;
+    background-image: radial-gradient(rgba(180,200,210,.05) 1px, transparent 1px);
+    background-size: 14px 14px;
+    box-shadow:0 1.4vw 3.2vw rgba(31,27,22,.18), 0 0 0 1px rgba(31,27,22,.08);
+  }
+  .ptl-col{
+    display:flex; flex-direction:column; align-items:center; gap:.7vw;
+    min-width:0;
+  }
+  .ptl-col .ptl-label{
+    display:flex; align-items:center; gap:.5vw;
+    font-family:var(--mono); font-size:.85vw; color:var(--uw-ink-2);
+  }
+  .ptl-col .ptl-label .upill{ background:var(--uw-blue-bg); color:var(--uw-blue); border:1px solid var(--uw-blue-border); padding:.1vw .55ch; }
+  .ptl-col .ptl-label .upill.sub{ background:#2A1F1A; color:var(--orange); border-color:#5A3A2A; }
+  .ptl-bar{
+    width:6vw; height:18vw;
+    background:#0A0F13;
+    border:1px solid var(--uw-rule);
+    border-radius:.3vw;
+    overflow:hidden;
+    display:flex; flex-direction:column;
+    position:relative;
+  }
+  .ptl-bar .pseg{
+    width:100%;
+    transition: height .5s ease, opacity .4s ease;
+    overflow:hidden;
+    font-family:var(--mono); font-size:.65vw;
+    display:flex; align-items:center; justify-content:center;
+    color:rgba(255,255,255,.5); white-space:nowrap;
+  }
+  .pseg.S{ background:#3D5168; }
+  .pseg.A{ background:#4D6280; }
+  .pseg.B{ background:#7A6443; }
+  .pseg.invoke{ background:rgba(204,120,92,.25); color:var(--orange); border-top:1px solid var(--orange); border-bottom:1px solid var(--orange); }
+  .pseg.pending{ background:repeating-linear-gradient(-45deg,#1A2128,#1A2128 6px,#0E141A 6px,#0E141A 12px); color:var(--uw-ink-3); }
+  .pseg.ret{ background:rgba(93,211,158,.18); color:var(--uw-green); border-top:1px solid var(--uw-green); }
+  .pseg.dump{ background:rgba(204,120,92,.55); color:#fff; font-size:.55vw; }
+  /* Inherited prefix segments — visually identical to parent, with subtle "cached" indicator */
+  .pseg.S, .pseg.A{ /* same colors used in callstack scene to show inheritance */ }
+  .pseg.C{ background:#8C5840; }
+  .pseg.c{ background:var(--orange); color:#fff; font-size:.55vw; }
+  .pseg.b{ background:#E5A677; color:#1F1B16; font-size:.55vw; }
+  /* Inherited zone styling on Scene 5 — slight green tint to indicate cache hit */
+  .pseg.inherited{
+    box-shadow: inset .15vw 0 0 rgba(93,211,158,.55);
+  }
+  /* Stacked column wrapper for Scene 5 with column-fade-in */
+  .ptl-col-fade{
+    opacity:0;
+    transition: opacity .5s ease;
+  }
+  .ptl-col-fade.shown{ opacity:1; }
+  /* "↳ inherited (cache hit)" badge above child columns in Scene 5 */
+  .inherit-badge{
+    font-family:var(--mono); font-size:.7vw; color: var(--uw-green);
+    letter-spacing:.04em;
+    display:flex; align-items:center; gap:.4vw;
+    height:1.1vw;
+  }
+  .inherit-badge::before{ content:"↳"; font-size:.85vw; }
+  .inherit-badge.hidden{ visibility:hidden; }
+  /* Three-column stage for Scene 5 */
+  .stack-stage{
+    display:grid; grid-template-columns: 1fr 1fr 1fr;
+    gap:1.5vw;
+    width:94%;
+    background:var(--uw-bg);
+    border-radius:.55vw;
+    padding:1.4vw 1.6vw;
+    background-image: radial-gradient(rgba(180,200,210,.05) 1px, transparent 1px);
+    background-size: 14px 14px;
+    box-shadow:0 1.4vw 3.2vw rgba(31,27,22,.18), 0 0 0 1px rgba(31,27,22,.08);
+  }
+  .stack-col{
+    display:flex; flex-direction:column; align-items:center; gap:.6vw;
+    min-width:0;
+  }
+  .stack-col .ptl-bar{ width:7vw; height:18vw; }
+  .stack-col .ptl-label{ font-size:.85vw; }
+  .stack-col .ptl-label .upill.cache{
+    background: rgba(93,211,158,.12);
+    color: var(--uw-green);
+    border:1px solid rgba(93,211,158,.4);
+  }
+  /* connecting "/call" line between adjacent columns */
+  .call-link{
+    position:absolute;
+    height:1.2px; background:#3D5168;
+    opacity:0; transition: opacity .4s ease;
+  }
+  .call-link.show{ opacity:.7; }
+  .call-link::after{
+    content:""; position:absolute; right:-.3vw; top:-.3vw;
+    width:0; height:0;
+    border-top:.3vw solid transparent;
+    border-bottom:.3vw solid transparent;
+    border-left:.45vw solid #3D5168;
+  }
+  .call-link .lbl{
+    position:absolute; top:-1.3vw; left:50%; transform:translateX(-50%);
+    font-family:var(--mono); font-size:.65vw;
+    color: var(--uw-green); letter-spacing:.04em;
+    white-space:nowrap;
+    background:var(--uw-bg); padding:0 .4ch;
+  }
+  .pseg.empty{ background:transparent; }
+
+  .ptl-bridge{
+    position:relative;
+    display:flex; flex-direction:column; align-items:center; justify-content:flex-start;
+    padding:1.4vw 0;
+  }
+  /* outbound thick context arrow (parent → subagent) */
+  .arrow-out{
+    position:absolute;
+    top:18%;
+    left:6%; right:6%;
+    display:flex; align-items:center;
+    opacity:0; transition: opacity .5s ease;
+    z-index:2;
+  }
+  .arrow-out .shaft{
+    flex:1; height:1.2vw;
+    background:var(--orange);
+    border-radius:.6vw 0 0 .6vw;
+    box-shadow:0 .35vw 1vw rgba(204,120,92,.4);
+  }
+  .arrow-out .head{
+    width:0; height:0;
+    border-top:1.4vw solid transparent;
+    border-bottom:1.4vw solid transparent;
+    border-left:1.6vw solid var(--orange);
+    margin-left:-.05vw;
+    filter: drop-shadow(0 .35vw 1vw rgba(204,120,92,.4));
+  }
+  .arrow-out-text{
+    position:absolute;
+    top:0; left:50%; transform:translateX(-50%);
+    font-family:var(--mono); font-size:.85vw; color:var(--orange);
+    background:var(--uw-bg); padding:.1vw .55ch;
+    text-align:center; line-height:1.3; white-space:nowrap;
+    opacity:0; transition: opacity .5s ease;
+    z-index:3;
+  }
+  .arrow-out-text small{ display:block; font-size:.7vw; color:#A75A40; letter-spacing:.06em; margin-top:.1vw; }
+  /* inbound thin return arrow (subagent → parent) */
+  .arrow-in{
+    position:absolute;
+    bottom:18%;
+    left:6%; right:6%;
+    display:flex; align-items:center;
+    opacity:0; transition: opacity .5s ease;
+    z-index:2;
+  }
+  .arrow-in .head{
+    width:0; height:0;
+    border-top:.55vw solid transparent;
+    border-bottom:.55vw solid transparent;
+    border-right:.7vw solid #9C8E7B;
+    margin-right:-.05vw;
+  }
+  .arrow-in .shaft{
+    flex:1; height:0; border-top:1.5px dashed #9C8E7B;
+    border-radius:0;
+  }
+  .arrow-in-text{
+    position:absolute;
+    bottom:8%; left:50%; transform:translateX(-50%);
+    font-family:var(--mono); font-size:.75vw; color:var(--uw-ink-2);
+    background:var(--uw-bg); padding:0 .5ch;
+    opacity:0; transition: opacity .5s ease;
+    z-index:3;
+  }
+
+  .ptl-tick{
+    width:100%; padding-top:.4vw;
+    text-align:center; font-family:var(--mono); font-size:.7vw; color:var(--uw-ink-3);
+    letter-spacing:.05em;
+  }
+
+  /* utility: per-row staggered reveal */
+  @keyframes tree-in{ to{ opacity:1; transform:translateX(0);} }
+  @keyframes tag-in{ to{ opacity:1; transform:translateY(0);} }
+
+  /* progress bar at bottom */
+  .progress{
+    position:absolute; left:0; right:0; bottom:0;
+    height:.25vw; background:transparent; z-index:60;
+  }
+  .progress .fill{
+    height:100%; width:0%;
+    background:var(--orange);
+    transition: width .2s linear;
+  }
+
+  /* Replay button (post-end) */
+  .replay{
+    position:absolute; right:3%; bottom:3.5%;
+    background:var(--ink); color:var(--bg);
+    font-family:var(--mono); font-size:.85vw;
+    padding:.55vw .9vw; border-radius:.35vw;
+    border:0; cursor:pointer; opacity:0; transition:opacity .3s;
+    z-index:70;
+  }
+  .replay.on{ opacity:1; }
+
+  /* Slide indicator (presentation mode) */
+  .slide-ind{
+    position:absolute; left:3.5%; bottom:3.5%;
+    font-family:var(--mono); font-size:.85vw;
+    color:var(--ink-2);
+    background:rgba(244,239,232,.85);
+    padding:.5vw .8vw; border-radius:.35vw;
+    border:1px solid var(--rule);
+    display:flex; align-items:center; gap:.6vw;
+    z-index:70; user-select:none;
+    backdrop-filter: blur(4px);
+  }
+  .slide-ind .label{ color:var(--ink); }
+  .slide-ind .num{ color:var(--orange-2); font-weight:600; min-width:3.5ch; }
+  .slide-ind .keys{ color:var(--ink-2); opacity:.6; font-size:.75vw; }
+  .slide-ind .keys kbd{
+    display:inline-block; min-width:1.4em; padding:0 .35ch;
+    border:1px solid var(--rule); border-radius:.18vw;
+    background:var(--bg); font-family:inherit;
+  }
+  .slide-ind.playing .num{ color:var(--green); }
+</style>
+</head>
+<body>
+<div class="stage">
+  <div class="frame" id="frame">
+    <div class="wordmark"><span class="dot"></span><span>callstack</span></div>
+    <div class="timecode" id="tc">00:00</div>
+
+    <!-- ============ SCENE 2: context bloat (now opens the video) ============ -->
+    <section class="scene scene-2" data-start="0" data-end="12">
+      <div class="ctx-wrap">
+        <div class="ctx-meta">
+          <div>context window</div>
+          <div>tokens used: <span class="tokens" id="tok2">0</span></div>
+        </div>
+        <div class="ctx-bar" id="bar2">
+          <div class="seg sys"  style="width:8%">system</div>
+          <div class="seg file" style="width:9%">file</div>
+          <div class="seg tool" style="width:7%">tool</div>
+          <div class="seg ass"  style="width:11%">assistant</div>
+          <div class="seg file" style="width:10%">file</div>
+          <div class="seg tool" style="width:9%">tool</div>
+          <div class="seg ass"  style="width:12%">assistant</div>
+          <div class="seg file" style="width:8%">file</div>
+          <div class="seg tool" style="width:8%">tool</div>
+          <div class="seg rot"  style="width:18%">context rot</div>
+          <div class="overflow-glow"></div>
+        </div>
+        <div class="ctx-tags" id="tags2">
+          <span>slow turns</span>
+          <span>expensive</span>
+          <span>forgets the original goal</span>
+          <span>truncation looms</span>
+        </div>
+        <div class="scene2-caps">
+          <div class="scene2-cap" id="cap2-1">Your agent starts out fine.</div>
+          <div class="scene2-cap" id="cap2-2">
+            As context fills up, it becomes <span class="em">slow, expensive, and suffers context rot.</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ SCENE 3: subagent — parallel timelines ============ -->
+    <section class="scene scene-3" data-start="12" data-end="31">
+      <div style="display:flex; flex-direction:column; align-items:center; gap:1.4vw; width:100%;">
+        <div class="kicker">subagents help — at a cost</div>
+        <div class="ptl-stage">
+          <div class="ptl-col">
+            <div class="ptl-label"><span class="upill">AGENT</span> main · doing your task</div>
+            <div class="ptl-bar" id="bar-main">
+              <div class="pseg S"      data-h="7"></div>
+              <div class="pseg A"      data-h="11"></div>
+              <div class="pseg A"      data-h="9"></div>
+              <div class="pseg A"      data-h="13"></div>
+              <div class="pseg invoke" data-h="0">spawn(subagent)</div>
+              <div class="pseg pending" data-h="0"></div>
+              <div class="pseg ret"    data-h="0">+ result</div>
+              <div class="pseg A"      data-h="0"></div>
+              <div class="pseg empty"  data-h="60"></div>
+            </div>
+            <div class="ptl-tick">time →</div>
+          </div>
+          <div class="ptl-bridge">
+            <div class="arrow-out" id="arrowOut">
+              <div class="shaft"></div>
+              <div class="head"></div>
+            </div>
+            <div class="arrow-out-text" id="arrowOutLabel">
+              ~800 tokens · <b style="color:#E5A677">write</b>
+              <small>slow &amp; expensive</small>
+            </div>
+            <div class="arrow-in" id="arrowIn">
+              <div class="head"></div>
+              <div class="shaft"></div>
+            </div>
+            <div class="arrow-in-text" id="arrowInLabel">return</div>
+          </div>
+          <div class="ptl-col">
+            <div class="ptl-label"><span class="upill sub">SUBAGENT</span> deps auditor · zero context · no cache</div>
+            <div class="ptl-bar" id="bar-sub">
+              <div class="pseg empty" data-h="13"></div>
+              <div class="pseg dump"  data-h="0">context (write)</div>
+              <div class="pseg B"     data-h="0"></div>
+              <div class="pseg B"     data-h="0"></div>
+              <div class="pseg B"     data-h="0"></div>
+              <div class="pseg ret"   data-h="0">return</div>
+              <div class="pseg empty" data-h="87"></div>
+            </div>
+            <div class="ptl-tick">time →</div>
+          </div>
+        </div>
+        <div class="caption" style="font-size:1.7vw; max-width:84%;">
+          Subagents start cold — every needed byte is paid as <span class="em">write tokens</span>.
+          <span style="display:block; font-size:1.05vw; color:var(--ink-2); margin-top:.4vw; font-style:italic;">
+            Fine for independent tasks. Painful when the child needs what you already know.
+          </span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ SCENE 4: /fork footnote ============ -->
+    <section class="scene scene-4" data-start="31" data-end="39">
+      <div class="card">
+        <div class="h">footnote</div>
+        <p>
+          Claude shipped <code style="font-family:var(--mono); background:var(--bg-2); padding:0 .35ch; border-radius:.18vw">/fork</code>.
+          Same context, no extra writes.
+          But forks <span class="nope">can't fork</span>, and <span class="nope">can't talk to you.</span>
+        </p>
+      </div>
+    </section>
+
+    <!-- ============ SCENE 5: callstack — three vertical agent bars ============ -->
+    <section class="scene scene-5" data-start="39" data-end="69">
+      <div style="display:flex; flex-direction:column; align-items:center; gap:1.2vw; width:100%;">
+        <div class="kicker">the callstack solution — children inherit · cache hit · 0 writes</div>
+        <div class="stack-stage">
+          <!-- COLUMN 1: ROOT -->
+          <div class="stack-col">
+            <div class="ptl-label"><span class="upill">ROOT</span> implement app</div>
+            <div class="inherit-badge hidden">&nbsp;</div>
+            <div class="ptl-bar" id="bar5-root">
+              <div class="pseg S"     data-h="0"></div>
+              <div class="pseg A"     data-h="0"></div>
+              <div class="pseg A"     data-h="0"></div>
+              <div class="pseg A"     data-h="0"></div>
+              <div class="pseg pending" data-h="0"></div>
+              <div class="pseg b"     data-h="0">+ b</div>
+              <div class="pseg empty" data-h="100"></div>
+            </div>
+            <div class="ptl-tick">time →</div>
+          </div>
+          <!-- COLUMN 2: AUTH -->
+          <div class="stack-col ptl-col-fade" id="col5-auth">
+            <div class="ptl-label"><span class="upill cache">CALL</span> auth module</div>
+            <div class="inherit-badge">inherited prefix · cache hit</div>
+            <div class="ptl-bar" id="bar5-auth">
+              <div class="pseg S inherited" data-h="0"></div>
+              <div class="pseg A inherited" data-h="0"></div>
+              <div class="pseg A inherited" data-h="0"></div>
+              <div class="pseg A inherited" data-h="0"></div>
+              <div class="pseg B"           data-h="0"></div>
+              <div class="pseg B"           data-h="0"></div>
+              <div class="pseg B"           data-h="0"></div>
+              <div class="pseg pending"     data-h="0"></div>
+              <div class="pseg c"           data-h="0">+ c</div>
+              <div class="pseg empty"       data-h="100"></div>
+            </div>
+            <div class="ptl-tick">time →</div>
+          </div>
+          <!-- COLUMN 3: JWT -->
+          <div class="stack-col ptl-col-fade" id="col5-jwt">
+            <div class="ptl-label"><span class="upill cache">CALL</span> JWT middleware</div>
+            <div class="inherit-badge">inherited prefix · cache hit</div>
+            <div class="ptl-bar" id="bar5-jwt">
+              <div class="pseg S inherited" data-h="0"></div>
+              <div class="pseg A inherited" data-h="0"></div>
+              <div class="pseg A inherited" data-h="0"></div>
+              <div class="pseg A inherited" data-h="0"></div>
+              <div class="pseg B inherited" data-h="0"></div>
+              <div class="pseg B inherited" data-h="0"></div>
+              <div class="pseg B inherited" data-h="0"></div>
+              <div class="pseg C"           data-h="0"></div>
+              <div class="pseg C"           data-h="0"></div>
+              <div class="pseg ret"         data-h="0">return</div>
+              <div class="pseg empty"       data-h="100"></div>
+            </div>
+            <div class="ptl-tick">time →</div>
+          </div>
+        </div>
+        <div class="caption" style="font-size:1.55vw; max-width:88%;">
+          <code style="font-family:var(--mono); color:var(--orange-2)">/call</code> = a fork that can fork. Children appear with the parent's <span class="em">exact prefix</span> already in context — no writes, prompt cache hits. Returns collapse cleanly.
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ SCENE 6: refund tree ============ -->
+    <section class="scene scene-6" data-start="69" data-end="89">
+      <div class="layout">
+        <div class="tree" id="tree6">
+          <div class="root row" data-d="0.0">Orchestrator <span class="user">(interactive with user)</span></div>
+          <div class="row" data-d="0.4"><span class="br">  │</span></div>
+          <div class="row" data-d="0.7"><span class="br">  ├─</span> <span class="call">/call</span> <span class="skill">authenticate-customer</span></div>
+          <div class="row" data-d="1.1"><span class="br">  │    ├──</span> verify_customer_identity</div>
+          <div class="row" data-d="1.4"><span class="br">  │    ├──</span> send_mfa_code</div>
+          <div class="row" data-d="1.8"><span class="br">  │    ├──</span> op: <span class="yield">yield</span> "Enter MFA code"</div>
+          <div class="row" data-d="2.4"><span class="br">  │    │</span>      <span class="user">user: 847291</span></div>
+          <div class="row" data-d="2.9"><span class="br">  │    ├──</span> validate_mfa_code</div>
+          <div class="row" data-d="3.3"><span class="br">  │    └──</span> op: <span class="ret">return</span> "authenticated"</div>
+          <div class="row" data-d="3.8"><span class="br">  │</span></div>
+          <div class="row" data-d="4.0"><span class="br">  ├─</span> <span class="call">/call</span> <span class="skill">lookup-order</span> → <span class="ret">2 items eligible</span></div>
+          <div class="row" data-d="4.4"><span class="br">  │</span></div>
+          <div class="row" data-d="4.6"><span class="br">  └─</span> <span class="call">/call</span> <span class="skill">process-refund</span></div>
+          <div class="row" data-d="5.0"><span class="br">       ├──</span> op: <span class="yield">yield</span> "Item condition?"</div>
+          <div class="row" data-d="5.5"><span class="br">       │</span>      <span class="user">user: damaged</span></div>
+          <div class="row" data-d="5.9"><span class="br">       ├──</span> calculate, charge, email</div>
+          <div class="row" data-d="6.3"><span class="br">       └──</span> op: <span class="ret">return</span> "$82.48 · txn_88291"</div>
+        </div>
+        <div class="right">
+          <div class="kicker">interactivity at any depth</div>
+          <h3>Any frame can pause and <span class="em">ask the user.</span></h3>
+          <p>
+            Even three levels deep. The runtime persists the tree, returns the question to the parent,
+            and resumes from exactly where it paused — no question bubbling, no LLM turn wasted at each level.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ SCENE 7: CTA ============ -->
+    <section class="scene scene-7" data-start="89" data-end="100">
+      <div class="cta">
+        <div class="mark"><span class="dot"></span><span>unwind-labs / callstack</span></div>
+        <h1>callstack</h1>
+        <div class="tag">a true call stack for agents</div>
+        <div class="install">
+          <div><span class="p">/plugin</span> marketplace add unwind-labs/callstack</div>
+          <div><span class="p">/plugin</span> install callstack@unwind-labs</div>
+        </div>
+        <div class="url">github.com/unwind-labs/callstack</div>
+      </div>
+    </section>
+
+    <div class="progress"><div class="fill" id="pfill"></div></div>
+    <button class="replay" id="replay">↻ replay</button>
+    <div class="slide-ind" id="slideInd">
+      <span class="num" id="slideNum">1 / 14</span>
+      <span class="label" id="slideLabel">Cold open</span>
+      <span class="keys"><kbd>↑</kbd><kbd>↓</kbd> nav · <kbd>space</kbd> play</span>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const TOTAL = 100; // seconds
+  const scenes = [...document.querySelectorAll('.scene')].map(el => ({
+    el,
+    start: parseFloat(el.dataset.start),
+    end:   parseFloat(el.dataset.end),
+  }));
+  const tcEl = document.getElementById('tc');
+  const fillEl = document.getElementById('pfill');
+  const replayBtn = document.getElementById('replay');
+  const slideNumEl  = document.getElementById('slideNum');
+  const slideLabelEl= document.getElementById('slideLabel');
+  const slideIndEl  = document.getElementById('slideInd');
+
+  // Slides — checkpoints in the timeline. Each is {t, label}.
+  // Animation plays from t up to the NEXT slide's t, then auto-pauses.
+  // Arrow keys jump between. Space toggles play/pause.
+  const SLIDES = [
+    { t:  0,  label: "Your agent starts out fine" },
+    { t:  3,  label: "Context fills up — slow, expensive, rot" },
+    { t: 12,  label: "Subagent — main accumulates context" },
+    { t: 16,  label: "Subagent — main spawns child (~800 write tokens)" },
+    { t: 24,  label: "Subagent — child does work + returns" },
+    { t: 29,  label: "Subagent — caption" },
+    { t: 31,  label: "/fork footnote" },
+    { t: 39,  label: "Callstack — ROOT alone" },
+    { t: 43,  label: "Callstack — AUTH appears with inherited prefix" },
+    { t: 47,  label: "Callstack — AUTH does its work" },
+    { t: 49,  label: "Callstack — JWT appears with inherited prefix" },
+    { t: 53,  label: "Callstack — JWT works + returns up the stack" },
+    { t: 60,  label: "Callstack — caption" },
+    { t: 69,  label: "Refund example — interactivity at depth" },
+    { t: 89,  label: "Install" },
+  ];
+  const TOTAL_SLIDES = SLIDES.length;
+
+  let currentSlide = 0;
+  let playbackTime = 0;
+  let isPlaying = true;
+  let lastFrameTs = null;
+  let raf = null;
+
+  function fmt(t){
+    const m = String(Math.floor(t/60)).padStart(2,'0');
+    const s = String(Math.floor(t%60)).padStart(2,'0');
+    return `${m}:${s}`;
+  }
+
+  function slideEndTime(idx){
+    return idx < TOTAL_SLIDES - 1 ? SLIDES[idx + 1].t : TOTAL;
+  }
+
+  function updateSlideIndicator(){
+    slideNumEl.textContent = (currentSlide + 1) + ' / ' + TOTAL_SLIDES;
+    slideLabelEl.textContent = SLIDES[currentSlide].label;
+    slideIndEl.classList.toggle('playing', isPlaying);
+  }
+
+  function jumpToSlide(idx){
+    if(idx < 0) idx = 0;
+    if(idx >= TOTAL_SLIDES) idx = TOTAL_SLIDES - 1;
+    currentSlide = idx;
+    playbackTime = SLIDES[idx].t;
+    isPlaying = true;
+    lastFrameTs = null;
+    replayBtn.classList.remove('on');
+    // reset segment heights so animations replay correctly when jumping
+    document.querySelectorAll('.pseg').forEach(el => { el.style.height = ''; });
+    document.querySelectorAll('.ptl-col-fade').forEach(el => el.classList.remove('shown'));
+    updateSlideIndicator();
+    render(playbackTime);
+  }
+
+  function render(t){
+    tcEl.textContent = fmt(Math.min(t, TOTAL));
+    fillEl.style.width = Math.min(100, (t/TOTAL)*100) + '%';
+
+    let active = null;
+    for(const s of scenes){
+      if(t >= s.start && t < s.end){ active = s; break; }
+    }
+    scenes.forEach(s => s.el.classList.toggle('on', s === active));
+
+    driveScene2(t);
+    driveScene3(t);
+    driveScene5(t);
+    driveScene6(t);
+  }
+
+  function tick(now){
+    if(isPlaying){
+      if(lastFrameTs !== null){
+        playbackTime += (now - lastFrameTs) / 1000;
+      }
+      lastFrameTs = now;
+      // auto-advance currentSlide if we cross into next slide's range
+      while(currentSlide < TOTAL_SLIDES - 1 && playbackTime >= SLIDES[currentSlide + 1].t){
+        currentSlide++;
+        updateSlideIndicator();
+      }
+      // hit end of current slide → pause (unless it's the very last, which plays to TOTAL)
+      const endT = slideEndTime(currentSlide);
+      if(playbackTime >= endT && currentSlide < TOTAL_SLIDES - 1){
+        playbackTime = endT - 0.01;
+        isPlaying = false;
+        updateSlideIndicator();
+      }
+      if(playbackTime >= TOTAL){
+        playbackTime = TOTAL;
+        isPlaying = false;
+        replayBtn.classList.add('on');
+        updateSlideIndicator();
+      }
+    } else {
+      lastFrameTs = now;
+    }
+    render(playbackTime);
+    raf = requestAnimationFrame(tick);
+  }
+
+  // ===== Scene 2: JS-driven bar fill + token counter aligned =====
+  // Each segment has its own start time. JS computes scaleX based on playback
+  // time — so seeking lands the bar at the correct visual state.
+  const SEG_DELAYS = [0, 0.45, 0.9, 1.35, 1.8, 2.25, 2.7, 3.15, 3.6, 4.05];
+  const SEG_DUR = 0.48;
+  const TAG_DELAYS = [3.4, 3.7, 4.0, 4.3];
+  const tok2El = document.getElementById('tok2');
+  const cap2_1 = document.getElementById('cap2-1');
+  const cap2_2 = document.getElementById('cap2-2');
+  function driveScene2(t){
+    if(t < 0 || t > 12) return;
+    const local = t;
+
+    // Bar segments — scaleX from 0 to 1 over each segment's window
+    document.querySelectorAll('#bar2 .seg').forEach((s, i) => {
+      if(i >= SEG_DELAYS.length) return; // skip overflow-glow div
+      const p = clamp((local - SEG_DELAYS[i]) / SEG_DUR, 0, 1);
+      s.style.transform = `scaleX(${p})`;
+    });
+
+    // Overflow-glow appears as rot grows in
+    const glow = document.querySelector('#bar2 .overflow-glow');
+    if(glow){
+      const gp = clamp((local - 4.3) / 0.8, 0, 1);
+      glow.style.opacity = (gp * 0.85).toFixed(3);
+    }
+
+    // Tags fade in one by one after bar is mostly full
+    document.querySelectorAll('#tags2 span').forEach((tag, i) => {
+      tag.classList.toggle('in', local >= (TAG_DELAYS[i] || 0));
+    });
+
+    // Token counter — aligned with bar fill (reaches 142k by ~4.8s)
+    //   bar key moments: 0s start → 2.25s ~50% → 4.05s rot starts → 4.5s full
+    //   token targets:   0      → 24k          → 90k             → 142k
+    let v = 0;
+    if(local < 0.3)       v = 0;
+    else if(local < 1.2)  v = lerp(0,     4000,  (local-0.3)/0.9);
+    else if(local < 2.4)  v = lerp(4000,  24000, (local-1.2)/1.2);
+    else if(local < 3.6)  v = lerp(24000, 80000, (local-2.4)/1.2);
+    else if(local < 4.8)  v = lerp(80000, 142000,(local-3.6)/1.2);
+    else                  v = 142000;
+    tok2El.textContent = formatK(v);
+    tok2El.classList.toggle('hot', v > 80000);
+
+    // Caption swap when bar passes ~50% (around 2.25s)
+    cap2_1.classList.toggle('on', local >= 0.3 && local < 2.5);
+    cap2_2.classList.toggle('on', local >= 2.5);
+  }
+
+  // ===== Scene 3: parallel timelines =====
+  // Phases (local time within scene 3, t-27):
+  //   0–4s:  main accumulates [S,A,A,A] (filling its 4 top segments)
+  //   4–7s:  main reaches "spawn(subagent)" — invoke segment grows
+  //   5–7s:  thick context arrow draws main → sub
+  //   7–11s: subagent's "context dump" segment grows huge (paid for in writes)
+  //   11–13s: subagent does its own work (B,B,B segments grow)
+  //   13–14s: subagent return; thin arrow draws back
+  //   14–17s: main's ret + post-result A segment grow
+  function setSeg(barId, idx, hPercent){
+    const segs = document.querySelectorAll(`#${barId} .pseg`);
+    if(segs[idx]) segs[idx].style.height = hPercent + '%';
+  }
+  function driveScene3(t){
+    if(t < 12 || t > 31) return;
+    const local = t - 12;
+    // main agent timeline
+    // segments: 0:S, 1:A, 2:A, 3:A, 4:invoke, 5:pending, 6:ret, 7:A, 8:empty
+    const mainHeights = [
+      [0.5, 7],    // S
+      [1.2, 11],   // A
+      [2.0, 9],    // A
+      [3.0, 13],   // A
+      [4.0, 6],    // invoke
+      [5.0, 19],   // pending while sub runs (5.0 → 13.0)
+      [13.0, 5],   // ret
+      [13.5, 15],  // post A
+    ];
+    let mainTotal = 0;
+    mainHeights.forEach(([startAt, finalH], i) => {
+      const dur = 0.7;
+      const p = clamp((local - startAt) / dur, 0, 1);
+      const h = p * finalH;
+      setSeg('bar-main', i, h);
+      mainTotal += h;
+    });
+    setSeg('bar-main', 8, Math.max(0, 100 - mainTotal)); // empty fills
+
+    // subagent timeline
+    // segments: 0:empty(top spacer), 1:dump, 2:B, 3:B, 4:B, 5:ret, 6:empty
+    // ~800 write tokens — small in count but slow/expensive to write
+    const subHeights = [
+      [4.0, 13],   // empty spacer (waits for spawn)
+      [6.0, 22],   // write the context — small but slow + expensive
+      [9.0, 14],   // B (auditor's actual work)
+      [10.0, 16],  // B
+      [11.0, 14],  // B
+      [12.5, 6],   // ret
+    ];
+    let subTotal = 0;
+    subHeights.forEach(([startAt, finalH], i) => {
+      const dur = 0.7;
+      const p = clamp((local - startAt) / dur, 0, 1);
+      const h = p * finalH;
+      setSeg('bar-sub', i, h);
+      subTotal += h;
+    });
+    setSeg('bar-sub', 6, Math.max(0, 100 - subTotal)); // empty bottom fills
+
+    // arrows (HTML/CSS based, just toggle opacity via class or style)
+    const out = document.getElementById('arrowOut');
+    const outLabel = document.getElementById('arrowOutLabel');
+    const inn = document.getElementById('arrowIn');
+    const innLabel = document.getElementById('arrowInLabel');
+    const showOut = local >= 4.0 ? '1' : '0';
+    const showIn  = local >= 12.5 ? '1' : '0';
+    if(out){ out.style.opacity = showOut; outLabel.style.opacity = showOut; }
+    if(inn){ inn.style.opacity = showIn; innLabel.style.opacity = showIn; }
+  }
+
+  // ===== Scene 5: three vertical agent bars (mirror of Scene 3 layout) =====
+  // Local time (t - 54). Total scene length 30s.
+  // Heights are %s of the bar height. Inherited segments must MATCH parent's heights.
+  //
+  // ROOT bar:                 AUTH bar (appears at local=4):     JWT bar (appears at local=10):
+  //   S(6), A(9), A(8), A(12)   S(6), A(9), A(8), A(12)            S(6), A(9), A(8), A(12)
+  //   pending while child runs    | inherited (match ROOT)            | inherited (match auth/root)
+  //   b(5) (after auth ret)       B(10), B(12), B(10) own              B(10), B(12), B(10) inherited
+  //                               pending while jwt runs                C(8), C(9) own work
+  //                               c(5) (after jwt ret)                  ret(5)
+  //
+  // Sub-timeline:
+  //   0–3s:   ROOT grows S+A+A+A
+  //   3–4s:   ROOT enters "pending" (calling auth)
+  //   4s:     AUTH column FADES IN with prefix already filled (instant)
+  //   4–7s:   AUTH grows B+B+B
+  //   7–8s:   AUTH enters "pending" (calling jwt)
+  //   10s:    JWT column FADES IN with prefix already filled (instant)
+  //   10–13s: JWT grows C+C
+  //   13–14s: JWT 'return' segment grows
+  //   14s:    AUTH's pending ends, "+ c" segment grows
+  //   17s:    AUTH's "+ c" done; AUTH context fully settled
+  //   18s:    ROOT's "+ b" segment grows (auth has returned)
+  //   20–30s: caption hold
+  function driveScene5(t){
+    if(t < 39 || t > 69) return;
+    const local = t - 39;
+
+    // ROOT bar — segments by index: 0:S, 1:A, 2:A, 3:A, 4:pending, 5:b, 6:empty
+    const rootHeights = [
+      [0.5, 6],    // S
+      [1.2, 9],    // A
+      [2.0, 8],    // A
+      [3.0, 12],   // A
+      [4.0, 18],   // pending while children run
+      [18.0, 5],   // + b
+    ];
+    let rt = 0;
+    rootHeights.forEach(([s, h], i) => {
+      const p = clamp((local - s)/0.6, 0, 1);
+      const v = p * h;
+      setSeg('bar5-root', i, v);
+      rt += v;
+    });
+    setSeg('bar5-root', 6, Math.max(0, 100 - rt));
+
+    // AUTH column fade-in at local >= 3.8 (just before its prefix shows up)
+    document.getElementById('col5-auth').classList.toggle('shown', local >= 3.8);
+
+    // AUTH bar — 0..3:inherited prefix, 4..6:B own, 7:pending, 8:c return, 9:empty
+    // Inherited prefix snaps to full at local=4 (no per-segment animation)
+    const authPrefixOn = local >= 4 ? 1 : 0;
+    setSeg('bar5-auth', 0, authPrefixOn * 6);
+    setSeg('bar5-auth', 1, authPrefixOn * 9);
+    setSeg('bar5-auth', 2, authPrefixOn * 8);
+    setSeg('bar5-auth', 3, authPrefixOn * 12);
+    const authBs = [
+      [4.5, 10], [5.5, 12], [6.5, 10],
+    ];
+    let at = authPrefixOn * 35;
+    authBs.forEach(([s, h], i) => {
+      const p = clamp((local - s)/0.6, 0, 1);
+      const v = p * h;
+      setSeg('bar5-auth', 4 + i, v);
+      at += v;
+    });
+    // AUTH pending while jwt runs (8..14s)
+    const authPending = clamp((local - 8.0)/0.6, 0, 1) * (local < 14.5 ? 12 : 0);
+    // We want it to appear during pending (8-14) then disappear (replaced by c)
+    // Simpler: keep it as "active during 8..14"
+    let authPendingH = 0;
+    if (local >= 8.0 && local < 14.0) {
+      authPendingH = clamp((local - 8.0)/0.6, 0, 1) * 12;
+    }
+    setSeg('bar5-auth', 7, authPendingH);
+    at += authPendingH;
+    // AUTH "+ c" appears at local=14
+    const cP = clamp((local - 14.0)/0.6, 0, 1);
+    setSeg('bar5-auth', 8, cP * 5);
+    at += cP * 5;
+    setSeg('bar5-auth', 9, Math.max(0, 100 - at));
+
+    // JWT column fade-in
+    document.getElementById('col5-jwt').classList.toggle('shown', local >= 9.8);
+
+    // JWT bar — 0..3:S+AAA inherited, 4..6:BBB inherited, 7..8:CC own, 9:return, 10:empty
+    const jwtPrefixOn = local >= 10 ? 1 : 0;
+    setSeg('bar5-jwt', 0, jwtPrefixOn * 6);
+    setSeg('bar5-jwt', 1, jwtPrefixOn * 9);
+    setSeg('bar5-jwt', 2, jwtPrefixOn * 8);
+    setSeg('bar5-jwt', 3, jwtPrefixOn * 12);
+    setSeg('bar5-jwt', 4, jwtPrefixOn * 10);
+    setSeg('bar5-jwt', 5, jwtPrefixOn * 12);
+    setSeg('bar5-jwt', 6, jwtPrefixOn * 10);
+    const jwtCs = [
+      [10.5, 8], [11.5, 9],
+    ];
+    let jt = jwtPrefixOn * 67;
+    jwtCs.forEach(([s, h], i) => {
+      const p = clamp((local - s)/0.6, 0, 1);
+      const v = p * h;
+      setSeg('bar5-jwt', 7 + i, v);
+      jt += v;
+    });
+    // ret segment grows at 13s
+    const retP = clamp((local - 13.0)/0.6, 0, 1);
+    setSeg('bar5-jwt', 9, retP * 5);
+    jt += retP * 5;
+    setSeg('bar5-jwt', 10, Math.max(0, 100 - jt));
+  }
+
+  function clamp(v, a, b){ return Math.min(b, Math.max(a, v)); }
+
+  // ===== Scene 6: stagger tree rows =====
+  function driveScene6(t){
+    if(t < 69 || t > 89) return;
+    const local = t - 69;
+    document.querySelectorAll('#tree6 .row').forEach((r,i) => {
+      const d = parseFloat(r.dataset.d || (i*0.3));
+      r.style.animationDelay = d + 's';
+    });
+  }
+
+  function lerp(a,b,p){ return a + (b-a) * Math.max(0, Math.min(1,p)); }
+  function formatK(n){
+    if(n >= 1000) return (n/1000).toFixed(n>=10000?0:1).replace(/\.0$/,'') + 'k';
+    return String(Math.round(n));
+  }
+
+  function start(){
+    cancelAnimationFrame(raf);
+    replayBtn.classList.remove('on');
+    document.querySelectorAll('.row').forEach(r => { r.classList.remove('in'); r.style.animationDelay=''; });
+    document.querySelectorAll('.scene').forEach(s => s.classList.remove('on'));
+    document.querySelectorAll('.pseg').forEach(el => { el.style.height = ''; });
+    document.querySelectorAll('.ptl-col-fade').forEach(el => el.classList.remove('shown'));
+
+    const params = new URLSearchParams(location.search);
+    const seek = parseFloat(params.get('seek') || '0');
+    const slideParam = params.get('slide');
+    const auto = params.get('auto') === '1'; // auto-play across slide boundaries
+
+    if(slideParam !== null){
+      currentSlide = Math.max(0, Math.min(TOTAL_SLIDES-1, parseInt(slideParam, 10)));
+      playbackTime = SLIDES[currentSlide].t;
+    } else if(seek > 0){
+      // find the slide that contains `seek`
+      currentSlide = 0;
+      for(let i = TOTAL_SLIDES-1; i >= 0; i--){
+        if(SLIDES[i].t <= seek){ currentSlide = i; break; }
+      }
+      playbackTime = seek;
+    } else {
+      currentSlide = 0;
+      playbackTime = 0;
+    }
+    isPlaying = true;
+    lastFrameTs = null;
+
+    // auto mode: disable slide-boundary pausing by remapping slideEndTime
+    if(auto){
+      // patch: in auto mode, never pause at slide boundaries
+      window.__autoPlay = true;
+    }
+
+    updateSlideIndicator();
+    raf = requestAnimationFrame(tick);
+  }
+
+  // ------- input handling -------
+  window.addEventListener('keydown', (e) => {
+    // ignore if user is typing in something
+    if(e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    if(e.key === 'ArrowDown' || e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === 'j' || e.key === 'l'){
+      e.preventDefault();
+      jumpToSlide(currentSlide + 1);
+    } else if(e.key === 'ArrowUp' || e.key === 'ArrowLeft' || e.key === 'PageUp' || e.key === 'k' || e.key === 'h'){
+      e.preventDefault();
+      jumpToSlide(currentSlide - 1);
+    } else if(e.key === ' ' || e.key === 'Spacebar'){
+      e.preventDefault();
+      isPlaying = !isPlaying;
+      lastFrameTs = null;
+      updateSlideIndicator();
+    } else if(e.key === 'Home'){
+      e.preventDefault();
+      jumpToSlide(0);
+    } else if(e.key === 'End'){
+      e.preventDefault();
+      jumpToSlide(TOTAL_SLIDES - 1);
+    } else if(e.key === 'r' || e.key === 'R'){
+      e.preventDefault();
+      jumpToSlide(0);
+    }
+  });
+
+  // Click on slide indicator to advance (handy for touch/mouse users)
+  slideIndEl.addEventListener('click', () => jumpToSlide(currentSlide + 1));
+
+  replayBtn.addEventListener('click', () => jumpToSlide(0));
+
+  // In auto mode (?auto=1), patch tick to skip slide-boundary pauses
+  if(new URLSearchParams(location.search).get('auto') === '1'){
+    // Override behavior: never pause at slide boundary
+    const origTick = tick;
+    // we can't easily monkey-patch tick from here without redefining; simplest is
+    // to re-enable isPlaying whenever it stops at a non-final slide.
+    setInterval(() => {
+      if(!isPlaying && currentSlide < TOTAL_SLIDES - 1){
+        isPlaying = true; lastFrameTs = null; updateSlideIndicator();
+      }
+    }, 50);
+  }
+
+  start();
+})();
+</script>
+</body>
+</html>

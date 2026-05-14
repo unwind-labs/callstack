@@ -188,6 +188,7 @@ class Channel(Protocol):
         timeout: int = 300,
         extra_env: Optional[dict] = None,
         on_session_id: Optional[Callable[[str], None]] = None,
+        preallocated_session_id: Optional[str] = None,
     ) -> TurnResult: ...
 
 
@@ -421,6 +422,7 @@ class ClaudeChannel:
         timeout: int = 300,
         extra_env: Optional[dict] = None,
         on_session_id: Optional[Callable[[str], None]] = None,
+        preallocated_session_id: Optional[str] = None,
     ) -> TurnResult:
         # ARCH-11: env precedence is `os.environ < self._env_extra (set at
         # ClaudeChannel construction) < extra_env (per-turn override)`.
@@ -434,6 +436,12 @@ class ClaudeChannel:
             raise ValueError(
                 f"invalid source_session_id {source_session_id!r}; must be a "
                 f"UUID"
+            )
+        if (preallocated_session_id is not None
+                and not _UUID_RE.fullmatch(preallocated_session_id)):
+            raise ValueError(
+                f"invalid preallocated_session_id "
+                f"{preallocated_session_id!r}; must be a UUID"
             )
         effective_cwd = cwd or os.getcwd()
         pool = _get_pool()
@@ -464,6 +472,7 @@ class ClaudeChannel:
             return self._fresh_spawn_turn(
                 source_session_id, prompt, mode, effective_cwd,
                 extra_env, timeout, on_session_id, sem_wait,
+                preallocated_session_id=preallocated_session_id,
             )
         finally:
             _IN_FLIGHT_SEMAPHORE.release()
@@ -493,7 +502,10 @@ class ClaudeChannel:
                           effective_cwd: str, extra_env: Optional[dict],
                           timeout: int,
                           on_session_id: Optional[Callable[[str], None]],
-                          sem_wait: float) -> TurnResult:
+                          sem_wait: float,
+                          *,
+                          preallocated_session_id: Optional[str] = None,
+                          ) -> TurnResult:
         """Spawn a new claude subprocess, run one turn, and pool it on success.
 
         Holds `_SPAWN_SEMAPHORE` for the full first turn — that's the phase
@@ -506,7 +518,10 @@ class ClaudeChannel:
         sem_wait += time.time() - spawn_wait_start
         try:
             try:
-                pooled = self._spawn(source_session_id, mode, effective_cwd, extra_env)
+                pooled = self._spawn(
+                    source_session_id, mode, effective_cwd, extra_env,
+                    preallocated_session_id=preallocated_session_id,
+                )
             except Exception as e:
                 raise RuntimeError(f"Failed to start claude CLI: {e}") from e
 
@@ -516,6 +531,7 @@ class ClaudeChannel:
                     result = self._run_one_turn(
                         pooled, prompt, timeout, on_session_id,
                         do_handshake=True,
+                        preallocated_session_id=preallocated_session_id,
                     )
             except Exception:
                 pooled.close()
@@ -542,10 +558,25 @@ class ClaudeChannel:
     # ---- private: spawn ----
 
     def _spawn(self, source_session_id: str, mode: str,
-               effective_cwd: str, extra_env: Optional[dict]) -> _PooledProcess:
-        cmd = self._build_cmd(source_session_id, mode)
+               effective_cwd: str, extra_env: Optional[dict],
+               *, preallocated_session_id: Optional[str] = None,
+               ) -> _PooledProcess:
+        cmd = self._build_cmd(source_session_id, mode,
+                              preallocated_session_id=preallocated_session_id)
         env = {**os.environ, **self._env_extra, **(extra_env or {})}
-        stem = source_session_id[:8] if source_session_id else "fresh"
+        # Stamp the child's own session UUID into its env so its MCP
+        # server resolves itself deterministically without depending on
+        # Claude Code's env-propagation behavior. Pre-allocated for
+        # fork/fresh (the same UUID is passed to claude via --session-id);
+        # equal to the resumed id for resume mode.
+        own_session = (
+            preallocated_session_id
+            if mode in ("fork", "fresh")
+            else source_session_id
+        )
+        if own_session:
+            env["CALLSTACK_OWN_SESSION"] = own_session
+        stem = (preallocated_session_id or source_session_id or "")[:8] or "fresh"
         log_path = _process_log_path(stem)
         # PERF-I: line-buffered (`buffering=1`) means a single newline flush
         # per write, removing the explicit log.flush() most callers do per
@@ -600,7 +631,9 @@ class ClaudeChannel:
 
     def _run_one_turn(self, entry: _PooledProcess, prompt: str, timeout: int,
                       on_session_id: Optional[Callable[[str], None]],
-                      *, do_handshake: bool) -> TurnResult:
+                      *, do_handshake: bool,
+                      preallocated_session_id: Optional[str] = None,
+                      ) -> TurnResult:
         """Send one user message + read until result. Per-turn watchdog only
         kills the process if THIS turn exceeds `timeout`; otherwise the
         process stays alive for pool reuse."""
@@ -646,6 +679,24 @@ class ClaudeChannel:
                 f"(returncode={entry.proc.returncode}, log={entry.log_path})"
             )
 
+        # Consistency check: when we pre-allocated a UUID and passed it
+        # to claude via `--session-id`, the session id reported on the
+        # wire MUST match. A mismatch means a future Claude Code
+        # changed --session-id semantics (silently ignored, rewritten,
+        # de-duplicated, …) — every downstream locate() in this
+        # subtree would resolve a UUID that doesn't match what
+        # CALLSTACK_OWN_SESSION says, cross-forking siblings. Fail
+        # loud here rather than write a corrupted report.
+        if (preallocated_session_id is not None
+                and session_id != preallocated_session_id):
+            raise RuntimeError(
+                f"claude reported session_id {session_id} but callstack "
+                f"pre-allocated {preallocated_session_id} via "
+                f"--session-id. Refusing to continue: Claude Code's "
+                f"--session-id contract may have changed; nested "
+                f"/calls in this subtree would cross-fork."
+            )
+
         entry.session_id = session_id
         entry.last_used = time.monotonic()
         return TurnResult(
@@ -662,7 +713,9 @@ class ClaudeChannel:
 
     # ---- private: cmd + protocol ----
 
-    def _build_cmd(self, source_session_id: str, mode: str) -> list[str]:
+    def _build_cmd(self, source_session_id: str, mode: str,
+                   *, preallocated_session_id: Optional[str] = None,
+                   ) -> list[str]:
         cmd = [
             "claude",
             "--output-format", "stream-json",
@@ -676,6 +729,14 @@ class ClaudeChannel:
         elif mode == "resume":
             cmd.extend(["--resume", source_session_id])
         # mode == "fresh": no --resume, no --fork-session — brand-new session.
+        # Pin the new session's UUID for fork/fresh so the child's MCP
+        # server can read it back from CALLSTACK_OWN_SESSION env without
+        # mtime guessing. Verified empirically that `--session-id`
+        # composes with `--resume + --fork-session` on Claude Code
+        # 2026 (test in commit msg).
+        if (mode in ("fork", "fresh") and preallocated_session_id
+                and _UUID_RE.fullmatch(preallocated_session_id)):
+            cmd.extend(["--session-id", preallocated_session_id])
         if self._model:
             cmd.extend(["--model", self._model])
         return cmd

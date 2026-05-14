@@ -133,34 +133,80 @@ The `examples/customer_support/` directory demonstrates a complete workflow — 
 ```bash
 cd examples/customer_support
 claude
-# Say: "Process a refund"
-# Say: cust_7829 ord_91847 sarah.chen@example.com +15550142 did not like product
-# Say: 847291
+# Say: "Process a refund for Sarah Chen (cust_7829), order ord_91847.
+#       Email: sarah.chen@example.com, Phone: +1-555-0142."
+# Say: 000000      (wrong on purpose — leaf re-asks)
+# Say: 847291      (correct — leaf validates and unwinds)
+# Say: damaged
 ```
 
 ### What happens
 
+The MFA branch is **4 levels deep**. The leaf skill (`/check-code-expiry`) is the one that actually talks to the user — it yields for the code, validates it, and retries once if wrong. Each yield surfaces all the way up to the root orchestrator (which owns the user's terminal); each resume re-enters at the leaf with the reply already in scope.
+
 ```
-Orchestrator (interactive session with user)
-  │
-  ├─ /call authenticate-customer           16.6s
-  │    ├── verify_customer_identity tool      (inline)
-  │    ├── get_customer tool                  (inline)
-  │    ├── send_mfa_code tool                 (inline)
-  │    └── op: yield   "Enter MFA code"       (ask user)
-  │         user: "847291"
-  │    └── validate_mfa_code tool             (inline)
-  │    └── op: return  "Authenticated, session created"
-  │
-  ├─ /call lookup-order                     27.0s
-  │    └── op: return  "2 items eligible, within return window"
-  │
-  └─ /call process-refund                    9.2s + 24.6s
-       └── op: yield   "Item condition? (unopened/opened/damaged)"
-            user: "damaged"
-       └── calculate_refund, process_payment, send_email
-       └── op: return  "Refund $82.48, txn_ref_88291"
+Orchestrator (root — owns the user's terminal)
+│
+├─ /call authenticate-customer                                       ← depth 1
+│   ├── verify_customer_identity tool
+│   ├── get_customer tool
+│   └─ /call verify-mfa                                              ← depth 2
+│       ├── send_mfa_code tool
+│       └─ /call validate-mfa-code                                   ← depth 3
+│           └─ /call check-code-expiry                               ← depth 4 (leaf)
+│               │
+│               ├── op: yield "Enter the 6-digit MFA code" ─────────┐  yield #1
+│               .                                                   │  surfaces 4 → root
+│               .   (whole subtree snapshotted to .call_tree;       │
+│               .    no intermediate frame wakes)                   │
+│               .                                                   ▼
+│ ╔═══════════════════════════════════════════════════════════════════════╗
+│ ║ ROOT  prompt → user :  "Enter the 6-digit MFA code"                   ║
+│ ║ ROOT  user → prompt :   000000           (wrong on purpose)           ║
+│ ╚═══════════════════════════════════════════════════════════════════════╝
+│               .                                                   │
+│               .   resume root → 4, leaf re-enters mid-procedure   │
+│               ├── resume(user_reply="000000")  ◀──────────────────┘
+│               ├── validate_mfa_code tool        → invalid
+│               │
+│               ├── op: yield "That code was incorrect. Re-enter." ─┐  yield #2
+│               .                                                   │  surfaces 4 → root
+│               .                                                   ▼
+│ ╔═══════════════════════════════════════════════════════════════════════╗
+│ ║ ROOT  prompt → user :  "That code was incorrect. Please re-enter."    ║
+│ ║ ROOT  user → prompt :   847291           (correct)                    ║
+│ ╚═══════════════════════════════════════════════════════════════════════╝
+│               .                                                   │
+│               .   resume root → 4                                 │
+│               ├── resume(user_reply="847291")  ◀──────────────────┘
+│               ├── validate_mfa_code tool        → valid
+│               └── op: return  "MFA validated (2 attempts)"  ──── unwind 4 → 3
+│           └── op: return  "MFA code accepted"               ──── unwind 3 → 2
+│       └── op: return  "MFA verified"                        ──── unwind 2 → 1
+│   └── op: return  "Authenticated, session sess_…"           ──── unwind 1 → root
+│
+├─ /call lookup-order                                                ← depth 1
+│   └── op: return  "2 items eligible, within return window"   ──── unwind 1 → root
+│
+└─ /call process-refund                                              ← depth 1
+    │
+    ├── op: yield "Item condition? (unopened/opened/damaged)" ──────┐  yield #3
+    .                                                               │  surfaces 1 → root
+    .                                                               ▼
+  ╔═══════════════════════════════════════════════════════════════════════╗
+  ║ ROOT  prompt → user :  "Item condition? (unopened/opened/damaged)"    ║
+  ║ ROOT  user → prompt :   damaged                                       ║
+  ╚═══════════════════════════════════════════════════════════════════════╝
+    .                                                               │
+    .   resume root → 1                                             │
+    ├── resume(user_reply="damaged")  ◀─────────────────────────────┘
+    ├── calculate_refund, process_payment, send_email
+    └── op: return  "Refund $82.48, txn_ref_88291"               ──── unwind 1 → root
 ```
+
+Each double-bordered box is the **user's actual terminal**: a prompt printed by the ROOT frame and a reply typed back into the ROOT frame. The user never sees a frame at depth 2, 3, or 4 — those frames are paused on disk while the user is typing. The arrows trace the round-trip: yield surfaces from the originating depth straight to root (skipping every intermediate frame, no LLM turn burned to "relay" the question), and resume re-enters at the exact same depth with the reply in scope.
+
+Notice yields #1 and #2 both originate at depth 4. After the wrong code, depth 4 picks up at the next line of its own procedure (the "retry once" branch in [check-code-expiry/SKILL.md:24-34](examples/customer_support/.claude/skills/check-code-expiry/SKILL.md)) — depths 1, 2, 3 stay frozen the whole time. Only after `validate_mfa_code` finally succeeds does the leaf return, and the stack unwinds four frames in order (4 → 3 → 2 → 1 → root) before the orchestrator issues the next `/call lookup-order`.
 
 ## Example: parallel calls with nested forks
 
@@ -175,31 +221,51 @@ claude
 ### What happens
 
 ```
-A (orchestrator)
-├── B  (weather report — leaf)               ──┐
-├── C  (market brief — fork node)            ──┤ parallel
-│   ├── E  (exchange rates — fork node)  ──┐   │
-│   │   ├── G  (JPY rate — leaf)  ──┐      │   │
-│   │   └── H  (GBP rate — leaf)  ──┘      │ nested parallel inside E
-│   └── F  (news headlines — leaf)      ──┘   │ nested parallel inside C
-└── D  (stock report — leaf)                 ──┘
+Orchestrator (root)
+│
+├── op: call tasks=[task-b, task-c, task-d]            ← parallel fan-out (3 siblings)
+│
+├─ /call task-b   weather report                                  ← depth 1, sibling 1/3
+│   ├── get_weather("Tokyo") tool
+│   ├── get_weather("London") tool
+│   └── op: return  "Tokyo 18°C, London 11°C"                  ──── unwind 1 → root
+│
+├─ /call task-c   market brief                                    ← depth 1, sibling 2/3
+│   │
+│   ├── op: call tasks=[task-e, task-f]          ← nested parallel fan-out (2 siblings)
+│   │
+│   ├─ /call task-e   exchange rates                             ← depth 2, sibling 1/2
+│   │   │
+│   │   ├── op: call tasks=[task-g, task-h]    ← nested parallel fan-out (2 siblings)
+│   │   │
+│   │   ├─ /call task-g   JPY rate                              ← depth 3, sibling 1/2
+│   │   │   ├── get_exchange_rate("JPY") tool
+│   │   │   └── op: return  "JPY 152.3"                      ──── unwind 3 → 2
+│   │   │
+│   │   └─ /call task-h   GBP rate                              ← depth 3, sibling 2/2
+│   │       ├── get_exchange_rate("GBP") tool
+│   │       └── op: return  "GBP 0.79"                       ──── unwind 3 → 2
+│   │   │
+│   │   └── op: return  "JPY=152.3, GBP=0.79"                ──── unwind 2 → 1
+│   │
+│   └─ /call task-f   news headlines                             ← depth 2, sibling 2/2
+│       ├── get_news_headline("tech") tool
+│       ├── get_news_headline("finance") tool
+│       └── op: return  "tech: …, finance: …"                 ──── unwind 2 → 1
+│   │
+│   └── op: return  "rates + headlines combined"               ──── unwind 1 → root
+│
+└─ /call task-d   stock report                                    ← depth 1, sibling 3/3
+    ├── get_stock_price("AAPL") tool
+    ├── get_stock_price("GOOGL") tool
+    └── op: return  "AAPL $189.4, GOOGL $142.1"                ──── unwind 1 → root
 
-A calls {B, C, D} in parallel via --tasks
-  B calls get_weather("Tokyo"), get_weather("London"), returns
-  C calls {E, F} in parallel via --tasks (nested fork)
-    E calls {G, H} in parallel via --tasks (3-level deep nested fork)
-      G calls get_exchange_rate("JPY"), returns
-      H calls get_exchange_rate("GBP"), returns
-    E combines G+H results, returns
-    F calls get_news_headline("tech"), get_news_headline("finance"), returns
-  C combines E+F results, returns
-  D calls get_stock_price("AAPL"), get_stock_price("GOOGL"), returns
-A validates all 6 expected values: PASS
+Orchestrator validates all 6 expected values across the three returned summaries: PASS
 ```
 
-Each parallel branch independently supports the full `call`/`yield`/`return` protocol — a branch can delegate further, pause for user input, or return, without blocking its siblings.
+Every `op: call tasks=[…]` with multiple entries is a **parallel fan-out** — the runtime spawns one forked subprocess per sibling and runs them concurrently under the `CALLSTACK_MAX_CONCURRENT_FORKS` semaphore. Each sibling independently supports the full `call`/`yield`/`return` protocol, so a parallel branch can itself fan out (depth 2 inside `task-c`), pause for user input, or return — without blocking its siblings. The 3-level deep nesting under `task-c` (orchestrator → c → e → {g, h}) shows that parallel batches compose: a sibling at any depth can become the parent of its own parallel batch.
 
-**This is how you compose a deep call stack out of Claude Code Skills.** Each node in the tree (B, C, D, E, F, G, H) is a Claude Code Skill defined in `examples/parallel_calls/.claude/skills/task-*/SKILL.md`. `/call` invokes them by name, and any Skill is free to itself `/call` other Skills — that's how depth grows. Skills become the "functions" in the call stack: small, named, composable units the orchestrator wires together.
+Each `task-*` node is a Claude Code Skill at `examples/parallel_calls/.claude/skills/task-*/SKILL.md`. `/call` invokes them by name, and any Skill is free to itself `/call` other Skills — Skills become the "functions" in the call stack: small, named, composable units the orchestrator wires together.
 
 ## How it works
 

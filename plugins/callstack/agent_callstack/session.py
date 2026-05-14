@@ -24,9 +24,26 @@ _UUID_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Env vars that may contain the parent session, in priority order.
-_ENV_PARENT_PATH = "CALLSTACK_PARENT_SESSION"   # absolute file path
+# Env vars that may identify the current session, in priority order.
+#
+# CALLSTACK_OWN_SESSION is stamped by `ClaudeChannel._spawn()` itself,
+# alongside `--session-id <uuid>` on the child's claude argv, so the
+# spawned process's MCP server reads back exactly the UUID claude was
+# told to use — deterministic and unaffected by what claude does or
+# doesn't propagate into its own MCP children's env.
+#
+# CLAUDE_CODE_SESSION_ID is what Claude Code exports per process. We
+# read it as a fallback for processes the plugin didn't spawn (chiefly
+# the user's top-level interactive `claude` session, where the user
+# launched claude themselves and CALLSTACK_OWN_SESSION can't have been
+# set by us).
+_ENV_OWN_SESSION = "CALLSTACK_OWN_SESSION"       # UUID stamped by callstack at spawn
 _ENV_PARENT_UUID = "CLAUDE_CODE_SESSION_ID"      # UUID set by Claude Code per process
+# When set, we're running inside a callstack-managed nested invocation.
+# Used to decide whether the mtime fallback is safe: under concurrent
+# sibling /calls the project dir's most-recently-touched .jsonl races,
+# so we MUST refuse it rather than silently produce a wrong fork.
+_ENV_ROOT_INVOKE_ID = "CALLSTACK_ROOT_INVOKE_ID"
 
 
 def encode_project_dir(cwd: str) -> str:
@@ -69,40 +86,56 @@ class SessionLocator:
     ) -> SessionRef:
         """Discover the active session.
 
-        Priority: explicit (UUID or file path) → env vars → mtime heuristic.
+        Priority: explicit → CALLSTACK_OWN_SESSION (callstack-stamped) →
+        CLAUDE_CODE_SESSION_ID (Claude Code per-process) → mtime heuristic.
+
+        The mtime heuristic is REFUSED when we're running inside a
+        callstack-managed nested invocation (CALLSTACK_ROOT_INVOKE_ID is
+        set): under concurrent sibling /calls the project dir's
+        most-recently-touched .jsonl races, so silently picking it
+        produces cross-forks (each sibling resolves a different sibling
+        as its parent). Mtime stays available for top-level use only,
+        where the cwd-matching dir has at most the user's one active
+        session.
+
         Raises RuntimeError if nothing is found.
         """
         if explicit:
             return self._from_explicit(explicit, cwd)
 
-        # Priority: per-process CLAUDE_SESSION_ID before inherited
-        # CALLSTACK_PARENT_SESSION. The path env is set by a parent for its
-        # spawned child and gets inherited downward; without this order, a
-        # grandchild would resolve its parent as the *root* (the value its
-        # immediate parent originally inherited and never overwrote).
-        # CLAUDE_SESSION_ID is set fresh per claude subprocess and always
-        # identifies *this* process correctly.
-        for env_var in (_ENV_PARENT_UUID, _ENV_PARENT_PATH):
+        # The legacy CALLSTACK_PARENT_SESSION env (an inherited path that
+        # got "stuck" pointing at the root through arbitrary nesting depth)
+        # was removed: it was a known cross-fork trigger and is no longer
+        # propagated by `__init__.py:_driver_for`. Reading it back would
+        # only resurrect that bug; we drop it from the priority chain
+        # entirely.
+        for env_var in (_ENV_OWN_SESSION, _ENV_PARENT_UUID):
             value = os.environ.get(env_var)
             if not value:
-                continue
-            # SEC-002: when the env supplies an absolute file path, require
-            # it to resolve under PROJECTS_DIR. An attacker who controls the
-            # environment (CI leak, shared box) could otherwise point us at
-            # arbitrary readable files, whose recorded `cwd` then propagates
-            # into subprocess.Popen(cwd=...). UUID-form values fall through
-            # to `resolve()` which already scans only PROJECTS_DIR.
-            if env_var == _ENV_PARENT_PATH and not self._env_path_under_projects(value):
-                print(
-                    f"[callstack] {env_var} rejected: not under "
-                    f"{self._projects_dir}",
-                    file=sys.stderr,
-                )
                 continue
             ref = self._from_value(value, cwd)
             if ref:
                 print(f"[callstack] Found session via {env_var}", file=sys.stderr)
                 return ref
+
+        # Nested-invocation mtime guard. Without this, three sibling
+        # /calls running concurrently each fall through to mtime and
+        # race on whichever sibling's jsonl was most-recently touched at
+        # millisecond resolution — producing cross-forks like the
+        # interior_1 → interior_2's-session bug. Fail loud so the
+        # contract breach is visible at first /call instead of cascading
+        # into a malformed deeper tree.
+        if os.environ.get(_ENV_ROOT_INVOKE_ID):
+            raise RuntimeError(
+                "callstack: cannot identify own session inside a nested "
+                "invocation. Neither "
+                f"{_ENV_OWN_SESSION} (stamped by the spawning parent) "
+                f"nor {_ENV_PARENT_UUID} (Claude Code per-process) was "
+                "set. The mtime fallback is unsafe under concurrent "
+                "sibling /calls — refusing to guess. This usually means "
+                "the spawning parent is running an older callstack "
+                "build; rebuild the plugin or check the spawn env."
+            )
 
         print("[callstack] Falling back to mtime heuristic", file=sys.stderr)
         ref = self._most_recent(cwd)
@@ -111,7 +144,7 @@ class SessionLocator:
 
         raise RuntimeError(
             f"Could not discover active Claude Code session. Searched {self._projects_dir}.\n"
-            "Pass an explicit session_id or set CALLSTACK_PARENT_SESSION."
+            f"Set {_ENV_PARENT_UUID} or pass an explicit session_id."
         )
 
     def resolve(self, session_id: str, cwd: Optional[str] = None) -> Optional[Path]:
@@ -179,26 +212,12 @@ class SessionLocator:
             f"Explicit session '{value}' not found in {self._projects_dir}"
         )
 
-    def _env_path_under_projects(self, value: str) -> bool:
-        """True iff `value` is a file path that resolves under PROJECTS_DIR.
-
-        Non-path values (e.g. bare UUIDs) return True — they don't escape
-        the projects dir on their own (`resolve()` only scans inside it)."""
-        p = Path(value)
-        if not p.is_absolute() and "/" not in value:
-            return True  # bare UUID-like string, no path to validate
-        try:
-            resolved = p.resolve(strict=True)
-            projects = self._projects_dir.resolve()
-        except (OSError, RuntimeError):
-            return False
-        try:
-            return resolved.is_relative_to(projects)
-        except AttributeError:  # Python < 3.9 fallback (unused here, defensive)
-            return str(resolved).startswith(str(projects) + os.sep)
-
     def _from_value(self, value: str, cwd: Optional[str]) -> Optional[SessionRef]:
-        """Accept either a file path or a UUID."""
+        """Accept a UUID. Path-form values are no longer supported via env
+        (the legacy `CALLSTACK_PARENT_SESSION` path env was removed); a
+        UUID-or-path is still accepted from the `explicit=` caller arg,
+        since that path enters under the caller's authority, not via an
+        inherited env that could be stale or hostile."""
         p = Path(value)
         if p.is_file():
             return SessionRef(session_id=p.stem, file=p)

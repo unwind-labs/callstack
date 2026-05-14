@@ -67,7 +67,6 @@ __all__ = [
 # ---------- Env constants ----------
 
 ENV_DEPTH = "CALLSTACK_DEPTH"
-ENV_PARENT_SESSION = "CALLSTACK_PARENT_SESSION"
 # Propagate the root invocation identity into every spawned claude subprocess,
 # so a nested MCP `invoke`/`invoke_parallel` call can merge its tree into the
 # root's report instead of starting a fresh top-level invocation.
@@ -77,6 +76,13 @@ ENV_ROOT_LOG_DIR = "CALLSTACK_ROOT_LOG_DIR"
 # the spawned node's id. A nested MCP invoke inside that subprocess reads
 # it back to identify its frame deterministically (no session-id guessing).
 ENV_FRAME_KEY = "CALLSTACK_FRAME_KEY"
+# Stamped by `ClaudeChannel._spawn()` into every spawned child's env,
+# alongside `--session-id <uuid>` on the child's claude argv. Lets the
+# child's MCP server identify its own session UUID deterministically,
+# without relying on Claude Code's own env-propagation behavior (which
+# is opaque/unspecified for stdio MCP children of a --fork-session
+# subprocess). Highest-priority signal in `SessionLocator.locate()`.
+ENV_OWN_SESSION = "CALLSTACK_OWN_SESSION"
 # Set by Claude CLI inside a forked session; identifies the caller node.
 # Used only as a fallback when `CALLSTACK_FRAME_KEY` is absent.
 ENV_CLAUDE_SESSION = "CLAUDE_CODE_SESSION_ID"
@@ -203,11 +209,10 @@ class Caller:
         fresh calls where `self._cwd` is the child's target, not the parent's
         project. Falls back through env, explicit cwd, then os.getcwd()."""
         # We're inside a nested invocation iff the parent stamped its root
-        # identity into our env. Previously this was keyed off
-        # ENV_PARENT_SESSION, but that var is no longer propagated to spawned
-        # children (its inherited value caused the regression where
+        # identity into our env. ENV_ROOT_INVOKE_ID is the canonical
+        # "we're nested" signal; the legacy ENV_PARENT_SESSION env var
+        # was removed (its inherited value caused the regression where
         # grandchildren forked from root instead of their immediate parent).
-        # ENV_ROOT_INVOKE_ID serves the same "we're nested" signal.
         if os.environ.get(ENV_ROOT_INVOKE_ID):
             try:
                 # MCP server's os.getcwd() is reliably the caller's project
@@ -271,12 +276,13 @@ class Caller:
         # Root identity propagates so nested MCP invokes can find and merge
         # into this same invocation's report.
         #
-        # We deliberately do NOT propagate CALLSTACK_PARENT_SESSION here. Each
-        # spawned claude subprocess gets its own CLAUDE_SESSION_ID from Claude
-        # Code, which is the authoritative per-process identifier. Stamping
-        # the parent's session path into the child's env caused grandchildren
-        # to resolve the parent's parent (i.e. root) as their parent, because
-        # the inherited value was never overwritten by the intermediate claude.
+        # We deliberately do NOT propagate CALLSTACK_PARENT_SESSION (legacy
+        # env removed) — its inherited value caused grandchildren to
+        # resolve the *root* as their parent. The child's own session
+        # UUID is instead stamped by `ClaudeChannel._spawn()` as
+        # CALLSTACK_OWN_SESSION, paired with `--session-id <uuid>` on
+        # the spawned claude's argv, so it's deterministic and immune
+        # to env inheritance across spawn depth.
         env = {
             ENV_DEPTH: str(depth_base + 1),
             ENV_ROOT_INVOKE_ID: ctx.invoke_id,
