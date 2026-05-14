@@ -80,12 +80,19 @@ class TestPromptHelpers:
         p = starting_prompt("do X", task_id="abc12345")
         assert SYSTEM_INSTRUCTION in p
         assert "## Starting Task [abc12345]" in p
-        assert p.endswith("do X")
+        assert p.endswith("Task: do X")
 
     def test_starting_prompt_no_task_id(self):
         p = starting_prompt("just do it")
         assert "## Starting Task\n\n" in p
         assert "[" not in p.split("Starting Task")[1].split("\n")[0]
+
+    def test_starting_prompt_is_compact(self):
+        # Guardrail: the per-fork preamble is duplicated on every nested
+        # fork (inherited via --fork-session), so it must stay small.
+        # Bumping this past 1000 chars should be a deliberate decision.
+        p = starting_prompt("x", task_id="abc12345")
+        assert len(p) < 1000, f"starting_prompt grew to {len(p)} chars"
 
     def test_child_returned_string(self):
         assert child_returned_prompt("hello") == \

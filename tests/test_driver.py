@@ -182,8 +182,8 @@ class TestParallel:
         # Order across threads is non-deterministic; key on the unique tail of the
         # prompt (which always ends with the task text after a "\n\n").
         marker_to_response = {
-            "task ALPHA": _envelope("return", result="ALPHA done"),
-            "task BRAVO": _envelope("return", result="BRAVO done"),
+            "Task: task ALPHA": _envelope("return", result="ALPHA done"),
+            "Task: task BRAVO": _envelope("return", result="BRAVO done"),
         }
         def respond(_src, prompt, _fork):
             tail = prompt.rsplit("\n\n", 1)[-1]

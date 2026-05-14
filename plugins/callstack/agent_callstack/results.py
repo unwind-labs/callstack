@@ -15,6 +15,33 @@ from typing import Any, Optional
 from .driver import Node, Tree
 
 
+# ---------- Helpers ----------
+
+def _find_task_start_line(log_path: Path, task_id: str) -> Optional[int]:
+    """1-based line in `log_path` where this node's task begins.
+
+    Scans for `## Starting Task [<task_id>]` and returns the LAST match.
+    Claude Code's CLI writes the prompt twice into a forked JSONL — once
+    as a `queue-operation` bookkeeping row near the top, then again as
+    the actual `user` message after the inherited transcript replays.
+    The model sees the user message, so the last occurrence is the
+    meaningful "child's work starts here" pointer.
+
+    Returns None if the file is unreadable or the marker is absent;
+    callers fall back to the approximate `parent_lines + 1`.
+    """
+    marker = f"## Starting Task [{task_id}]"
+    try:
+        last: Optional[int] = None
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f, start=1):
+                if marker in line:
+                    last = i
+        return last
+    except OSError:
+        return None
+
+
 # ---------- Public value types ----------
 
 @dataclass(frozen=True)
@@ -89,11 +116,19 @@ def _result_from_node(node: Node):
     """Convert a finished node into Result / CallYielded / CallFailed."""
     s = node.state
     if s.kind == "done":
+        log_path = Path(node.clone_path) if node.clone_path else None
+        # Prefer a precise scan for `## Starting Task [<id>]` over the
+        # approximate parent_lines count: the parent's file length doesn't
+        # line up exactly with where the new turn lands in the child's file
+        # (CLI bookkeeping + replay re-encoding both shift the offset).
+        precise = (
+            _find_task_start_line(log_path, node.id[:8]) if log_path else None
+        )
         return Result(
             value=node.result, summary=node.summary, next=node.suggested_next,
             duration=round(node.duration, 2),
-            log=Path(node.clone_path) if node.clone_path else None,
-            log_start=node.parent_lines + 1,
+            log=log_path,
+            log_start=precise if precise is not None else node.parent_lines + 1,
         )
     if s.kind == "failed":
         return CallFailed(error=node.error or "unknown error", partial=node.result)

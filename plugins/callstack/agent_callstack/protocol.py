@@ -17,48 +17,13 @@ from typing import Any, Optional, Union
 
 
 SYSTEM_INSTRUCTION = """\
-You are running in a forked session — a child process that inherited the full context of \
-your parent agent. Execute the task below.
+You are running in a forked session — a child process that inherited the full \
+context of your parent agent. When finished with the task, end your turn by \
+emitting EXACTLY ONE JSON envelope wrapped in a fenced ```json code block.
 
-End your turn by emitting EXACTLY ONE JSON envelope wrapped in a fenced \
-```json code block. That envelope is how you communicate back to the \
-runtime. Any other fenced JSON earlier in your response is ignored; only \
-the last one is parsed. Pick exactly one of three operations:
-
-1) CALL — hand off work to a child process.
-```json
-{"op": "call", "task": "<what to accomplish>"}
-```
-Use CALL when the task ahead is multi-step, may involve its own chain of \
-calls or user interaction, and you want only the result back — not the \
-intermediate work. The child inherits your full context. Its execution \
-trace is discarded; only its return value comes back to you. Do your own \
-work first, then CALL when you reach a point requiring a child. Don't \
-CALL simple things you can do in one or two tool calls.
-
-2) YIELD — pause for user input.
-```json
-{"op": "yield", "question": "<question for user>"}
-```
-Only when you MUST have information that only the user can provide (e.g. \
-MFA codes, passwords, confirmations). Do not guess.
-
-3) RETURN — finish and hand results to the parent.
-```json
-{"op": "return", "result": "...", "summary": "...", "next": "..."}
-```
-- `result` — the deliverable/answer for the parent. Structure it however \
-is appropriate for the task.
-- `summary` — COMPACT brain-dump of everything the parent needs to \
-execute upcoming tasks: sub-calls made and their outcomes, key decisions \
-and assumptions, side effects (files touched, commands run, external \
-state changed), dead ends not worth retrying. Optimize for tokens — \
-terse bullets or prose, no filler. The parent should NOT need to read \
-your session log. Omit this field or set null if there is genuinely \
-nothing beyond `result` worth carrying forward.
-- `next` — advisory one-line suggestion for what should happen next. \
-Optional. The parent has broader context and decides; this just aligns \
-your summary toward what matters.
+- {"op": "call", "task": "<what to accomplish>"}
+- {"op": "yield", "question": "<question for user>"}
+- {"op": "return", "result": "...", "summary": "...", "next": "..."}
 """
 
 
@@ -142,7 +107,7 @@ def parse_envelope(output: str) -> Envelope:
 
 def starting_prompt(task: str, task_id: Optional[str] = None) -> str:
     tag = f" [{task_id}]" if task_id else ""
-    return SYSTEM_INSTRUCTION + f"\n\n## Starting Task{tag}\n\n" + task
+    return f"## Starting Task{tag}\n\n" + SYSTEM_INSTRUCTION + f"\nTask: {task}"
 
 
 def child_returned_prompt(child_result: Any) -> str:

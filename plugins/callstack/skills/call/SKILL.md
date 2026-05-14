@@ -78,9 +78,11 @@ call(tasks=["List the top-level files and summarize the README"],
   assumptions, side effects, dead ends. Optimized for tokens. May be `null`
   when the child has nothing worth carrying beyond `result`.
 - `session_log` — file path to the forked session's JSONL log.
-- `session_log_start_line` — 1-based line where the child's additions begin.
-  The session log starts with `## Starting Task [<id>]` at this point.
-  Lines before it are inherited parent context.
+- `session_log_start_line` — 1-based line in `session_log` where this
+  child's own task begins. Found by scanning for the `## Starting Task
+  [<id>]` marker. Lines before it are CLI bookkeeping (queue-operation,
+  attachment rows from SessionStart hooks) and the inherited parent
+  transcript that `--fork-session` replays into the child's JSONL.
 
 #### Yield
 When the forked session needs a user input
@@ -94,6 +96,54 @@ Resume with the user's answer using the `resume` MCP tool:
 ```
 resume(resume_session="abc-123", user_reply="847291", timeout=300)
 ```
+
+## Protocol — what a forked child emits
+
+Every forked session ends its turn by emitting EXACTLY ONE fenced ```json
+envelope. If multiple fenced ```json blocks appear, only the **last** one
+is parsed — earlier ones are ignored, so you can think aloud in JSON
+mid-response without confusing the runtime. Pick one of three ops:
+
+### CALL — hand off work to a child process
+
+```json
+{"op": "call", "task": "<what to accomplish>"}
+```
+
+Use CALL when the task ahead is multi-step, may involve its own chain of
+calls or user interaction, and you want only the result back — not the
+intermediate work. The child inherits your full context. Its execution
+trace is discarded; only its return value comes back to you. Do your own
+work first, then CALL when you reach a point requiring a child. Don't
+CALL simple things you can do in one or two tool calls.
+
+### YIELD — pause for user input
+
+```json
+{"op": "yield", "question": "<question for user>"}
+```
+
+Only when you MUST have information that only the user can provide (e.g.
+MFA codes, passwords, confirmations). Do not guess.
+
+### RETURN — finish and hand results to the parent
+
+```json
+{"op": "return", "result": "...", "summary": "...", "next": "..."}
+```
+
+- `result` — the deliverable/answer for the parent. Structure it however
+  is appropriate for the task.
+- `summary` — COMPACT brain-dump of everything the parent needs to
+  execute upcoming tasks: sub-calls made and their outcomes, key
+  decisions and assumptions, side effects (files touched, commands run,
+  external state changed), dead ends not worth retrying. Optimize for
+  tokens — terse bullets or prose, no filler. The parent should NOT need
+  to read your session log. Omit this field or set `null` if there is
+  genuinely nothing beyond `result` worth carrying forward.
+- `next` — advisory one-line suggestion for what should happen next.
+  Optional. The parent has broader context and decides; this just aligns
+  your summary toward what matters.
 
 ## Critical rules
 
