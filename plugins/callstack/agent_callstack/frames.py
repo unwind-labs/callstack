@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 
@@ -33,11 +34,23 @@ _ROOT_FRAME_KEY = "root"
 # written by a given invocation (each fresh write produces a strictly
 # newer (mtime_ns, size) tuple via atomic rename). Re-parsing the same
 # bytes on every reporter tick is wasted work — yaml.safe_load is
-# ~10–100× slower than dict equality. Keyed by absolute path; entries
-# never expire (files in `_frames/<invoke_id>/` are removed when the
-# invocation dir is cleaned up, after which subsequent stats miss).
-_FRAMES_PARSED_CACHE: dict[Path, tuple[int, int, dict]] = {}
+# ~10–100× slower than dict equality.
+#
+# PERF-103: bounded LRU. Long-lived MCP server processes were growing
+# unboundedly because frames from each new nested invocation pile up.
+# OrderedDict gives O(1) move-to-end / popitem(last=False).
+_FRAMES_PARSED_CACHE_MAX = 2048
+_FRAMES_PARSED_CACHE: "OrderedDict[Path, tuple[int, int, dict]]" = OrderedDict()
 _FRAMES_PARSED_CACHE_LOCK = threading.Lock()
+
+# PERF-104: dir-mtime fast-path. The reporter calls `_load_frames` on
+# every tick; for a typical invocation the frames_dir has a few files
+# and the directory mtime only advances when a new frame lands. When
+# nothing has changed we can skip the glob + per-file stat entirely
+# and reuse the last aggregated result.
+_FRAMES_DIR_CACHE_MAX = 64
+_FRAMES_DIR_CACHE: "OrderedDict[Path, tuple[int, dict]]" = OrderedDict()
+_FRAMES_DIR_CACHE_LOCK = threading.Lock()
 
 # SEC-006: safety bounds on the frames-dir scan. A stray or hostile
 # process that drops files into a known frames_dir can otherwise stall
@@ -48,9 +61,27 @@ _FRAME_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 def _frames_cache_clear() -> None:
-    """Test hook: drop the parsed-frame cache."""
+    """Test hook: drop both parsed-frame and dir-mtime caches."""
     with _FRAMES_PARSED_CACHE_LOCK:
         _FRAMES_PARSED_CACHE.clear()
+    with _FRAMES_DIR_CACHE_LOCK:
+        _FRAMES_DIR_CACHE.clear()
+
+
+def _cache_put_parsed(path: Path, value: tuple[int, int, dict]) -> None:
+    """LRU put for `_FRAMES_PARSED_CACHE`. Caller holds the lock."""
+    _FRAMES_PARSED_CACHE[path] = value
+    _FRAMES_PARSED_CACHE.move_to_end(path)
+    while len(_FRAMES_PARSED_CACHE) > _FRAMES_PARSED_CACHE_MAX:
+        _FRAMES_PARSED_CACHE.popitem(last=False)
+
+
+def _cache_put_dir(path: Path, value: tuple[int, dict]) -> None:
+    """LRU put for `_FRAMES_DIR_CACHE`. Caller holds the lock."""
+    _FRAMES_DIR_CACHE[path] = value
+    _FRAMES_DIR_CACHE.move_to_end(path)
+    while len(_FRAMES_DIR_CACHE) > _FRAMES_DIR_CACHE_MAX:
+        _FRAMES_DIR_CACHE.popitem(last=False)
 
 
 def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
@@ -68,6 +99,20 @@ def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
     out: dict[str, list[dict]] = {}
     if not frames_dir.is_dir():
         return out
+    # PERF-104: dir-mtime fast-path. If the directory mtime hasn't
+    # advanced since our last successful aggregation, no file was
+    # atomically renamed in or out — return the cached result.
+    try:
+        dir_mtime = frames_dir.stat().st_mtime_ns
+    except OSError:
+        dir_mtime = None
+    if dir_mtime is not None:
+        with _FRAMES_DIR_CACHE_LOCK:
+            cached = _FRAMES_DIR_CACHE.get(frames_dir)
+            if cached is not None and cached[0] == dir_mtime:
+                _FRAMES_DIR_CACHE.move_to_end(frames_dir)
+                # Copy dict + value lists so callers can mutate freely.
+                return {k: list(v) for k, v in cached[1].items()}
     loaded = 0
     for p in frames_dir.glob("*.yaml"):
         if loaded >= _MAX_FRAMES_PER_LOAD:
@@ -85,13 +130,15 @@ def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
                   file=sys.stderr)
             continue
         stat_key = (st.st_mtime_ns, st.st_size)
+        d: Optional[dict] = None
         with _FRAMES_PARSED_CACHE_LOCK:
             cached = _FRAMES_PARSED_CACHE.get(p)
-        if cached is not None and (cached[0], cached[1]) == stat_key:
-            d = cached[2]
-        else:
+            if cached is not None and (cached[0], cached[1]) == stat_key:
+                _FRAMES_PARSED_CACHE.move_to_end(p)
+                d = cached[2]
+        if d is None:
             try:
-                d = yaml.safe_load(p.read_text())
+                parsed = yaml.safe_load(p.read_text())
             except Exception as e:
                 # Parse failed (corrupt/partially-written file). Skip to
                 # preserve forward progress; the producer's next atomic
@@ -100,12 +147,14 @@ def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
                 print(f"[callstack] ignoring malformed frame file {p}: "
                       f"{type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
                 continue
-            if not isinstance(d, dict):
+            if not isinstance(parsed, dict):
                 continue
+            d = parsed
             with _FRAMES_PARSED_CACHE_LOCK:
-                _FRAMES_PARSED_CACHE[p] = (stat_key[0], stat_key[1], d)
-        if not isinstance(d, dict):
-            continue
+                _cache_put_parsed(p, (stat_key[0], stat_key[1], d))
+        # `d` is non-None here: cache-hit set it, or the parse branch
+        # set it (else `continue` exited the iteration).
+        assert d is not None
         key = d.get("frame_key")
         # SEC-006: reject frames whose key doesn't match the expected
         # shape (root frame, hex uuid, or hex-uuid-instance pair).
@@ -115,6 +164,13 @@ def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
         loaded += 1
     for key in out:
         out[key].sort(key=lambda f: str(f.get("started_at") or ""))
+    # PERF-104: cache the aggregated result under the dir's mtime so a
+    # quiet tick reuses it. Deep-copy lists so a caller mutating its
+    # result can't corrupt the cached snapshot.
+    if dir_mtime is not None:
+        snapshot = {k: list(v) for k, v in out.items()}
+        with _FRAMES_DIR_CACHE_LOCK:
+            _cache_put_dir(frames_dir, (dir_mtime, snapshot))
     return out
 
 

@@ -710,10 +710,109 @@ def test_frames_cache_skips_yaml_safe_load_when_stat_unchanged(
     assert out2.keys() == out1.keys()
 
     # Rewrite the same file with a new mtime; cache must invalidate and
-    # safe_load is called again.
+    # safe_load is called again. In production atomic-replace bumps BOTH
+    # the file mtime and the directory mtime — the dir-mtime fast-path
+    # (PERF-104) would otherwise short-circuit before we reach the
+    # per-file cache check. Simulate that by bumping both.
     import os as _os
     import time as _time
     new_mtime = _time.time() + 10  # bump mtime forward
     _os.utime(frames_dir / "root.yaml", (new_mtime, new_mtime))
+    _os.utime(frames_dir, (new_mtime, new_mtime))
     ac._load_frames(frames_dir)
     assert safe_load_count["n"] > after_first
+
+
+def test_load_frames_dir_mtime_fast_path_skips_glob(tmp_path, monkeypatch):
+    """PERF-104: when the frames-dir mtime is unchanged, `_load_frames`
+    should reuse the cached aggregate and skip the per-file glob + stat
+    entirely."""
+    import agent_callstack as ac
+    from agent_callstack import frames as frames_mod
+
+    ac._frames_cache_clear()
+
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    frame = {
+        "frame_key": _ROOT_FRAME_KEY, "is_nested": False, "kind": "call",
+        "tasks": ["t"], "cwd": "/cwd",
+        "started_at": "s", "ended_at": "e",
+        "tree": {"schema_version": "2", "root_session_id": "r",
+                 "root_session_file": "/r.jsonl", "base_depth": 0,
+                 "nodes": []},
+    }
+    ac._atomic_yaml_write(frames_dir / "root.yaml", frame)
+
+    # Prime the dir cache.
+    out1 = ac._load_frames(frames_dir)
+    assert _ROOT_FRAME_KEY in out1
+
+    # Spy on the glob — second call must NOT iterate frames_dir.
+    glob_calls = {"n": 0}
+    real_glob = frames_mod.Path.glob
+
+    def counting_glob(self, pattern):
+        if self == frames_dir:
+            glob_calls["n"] += 1
+        return real_glob(self, pattern)
+
+    monkeypatch.setattr(frames_mod.Path, "glob", counting_glob)
+
+    out2 = ac._load_frames(frames_dir)
+    assert glob_calls["n"] == 0, (
+        f"expected dir-mtime fast-path to skip glob, but glob was called "
+        f"{glob_calls['n']} times"
+    )
+    assert out2.keys() == out1.keys()
+
+
+def test_load_frames_dir_cache_returns_independent_copy(tmp_path):
+    """The dir-mtime cache must hand back a copy callers can mutate
+    without poisoning the cached snapshot for the next call."""
+    import agent_callstack as ac
+    ac._frames_cache_clear()
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    ac._atomic_yaml_write(frames_dir / "root.yaml", {
+        "frame_key": _ROOT_FRAME_KEY, "is_nested": False, "kind": "call",
+        "tasks": ["t"], "cwd": "/cwd", "started_at": "s", "ended_at": "e",
+        "tree": {"schema_version": "2", "root_session_id": "r",
+                 "root_session_file": "/r.jsonl", "base_depth": 0,
+                 "nodes": []},
+    })
+
+    out1 = ac._load_frames(frames_dir)
+    out1[_ROOT_FRAME_KEY].clear()  # corrupt the returned dict
+    out2 = ac._load_frames(frames_dir)
+    assert out2[_ROOT_FRAME_KEY], (
+        "the dir cache returned the same list object twice — a caller "
+        "that mutates the result corrupts the cache for the next call"
+    )
+
+
+def test_parsed_frame_cache_lru_eviction(tmp_path):
+    """PERF-103: `_FRAMES_PARSED_CACHE` is bounded — past the cap,
+    least-recently-used entries are evicted instead of growing
+    monotonically across long-lived MCP server lifetimes."""
+    from agent_callstack import frames as frames_mod
+    import agent_callstack as ac
+    ac._frames_cache_clear()
+
+    # Temporarily shrink the cap so the test stays small.
+    original = frames_mod._FRAMES_PARSED_CACHE_MAX
+    frames_mod._FRAMES_PARSED_CACHE_MAX = 3
+    try:
+        with frames_mod._FRAMES_PARSED_CACHE_LOCK:
+            for i in range(5):
+                p = tmp_path / f"f{i}.yaml"
+                frames_mod._cache_put_parsed(p, (i, i, {"frame_key": str(i)}))
+        with frames_mod._FRAMES_PARSED_CACHE_LOCK:
+            assert len(frames_mod._FRAMES_PARSED_CACHE) == 3
+            keys = list(frames_mod._FRAMES_PARSED_CACHE.keys())
+            # The three most recently inserted (2, 3, 4) survive; 0 and 1 evicted.
+            assert keys[-1] == tmp_path / "f4.yaml"
+            assert tmp_path / "f0.yaml" not in frames_mod._FRAMES_PARSED_CACHE
+    finally:
+        frames_mod._FRAMES_PARSED_CACHE_MAX = original
+        ac._frames_cache_clear()
