@@ -62,3 +62,53 @@ one at a time, top-down.
 - [x] **ARCH-12** Replace `call` / `call_many` / `resume` wrapper boilerplate with one private `_dispatch` helper. `plugins/callstack/agent_callstack/__init__.py:306-346` — commit `7755206`.
 - [x] **ARCH-13** Delete or move legacy `_write_invocation_report` to `tests/_helpers.py` after `git grep` confirms callers. `plugins/callstack/agent_callstack/__init__.py:852-884` — commit `7755206`.
 - [x] **ARCH-14** Rename internal `node.result` → `node.payload`; keep `Result.value` as public; map at the boundary. `plugins/callstack/agent_callstack/__init__.py:57,351` — **skipped**: rename churns every read site for marginal clarity gain.
+
+---
+
+# Architecture review — 2026-05-15
+
+From [the full review plan](~/.claude/plans/do-deep-architecural-review-polished-peach.md).
+Four parallel review forks (security / perf / DRY-simplicity / correctness)
+read the runtime modules read-only and reported. Items below cite file:line
+and are grouped by tier. Execute top-down; commit each independently.
+
+## Tier 0 — runtime deadlocks reachable today
+
+- [ ] **CONC-1** Nested-CALL semaphore deadlock: `_IN_FLIGHT_SEMAPHORE` is held for a parent's entire turn; if that turn issues `/call`, the child needs the same module-global semaphore. 16 parents all calling deadlock the host. `plugins/callstack/agent_callstack/channel.py:114-119,463`. Fix: detect nested-CALL via a thread-local depth counter and release+reacquire (or use a separate semaphore for forked children).
+- [ ] **CONC-2** `_RUN_POOL` worker-pool starvation: module-level `ThreadPoolExecutor` is shared across nested `call_many` invocations; recursive fan-out exhausts it, parents wait on children that can't get a slot. `plugins/callstack/agent_callstack/driver.py:46-67,271-283`. Fix: detect "nested" submissions and run inline on the caller's thread, or use a per-depth pool.
+- [ ] **CONC-3** `_propagate_up` is not thread-safe under sibling `_drive` calls; mutates ancestor `Node.state` / `children` without a lock. `plugins/callstack/agent_callstack/driver.py:388-416,271-277`. Fix: tree-level `threading.Lock` around the propagate path.
+
+## Tier 1 — security holes worth fixing before any release
+
+- [ ] **SEC-101** MCP boundary has no auth (FastMCP stdio); any reachable client can spawn `claude` with caller-controlled `permission_mode`. Defense-in-depth: validate `permission_mode` against an allowlist at MCP boundary, drop unknown values. `plugins/callstack/mcp_server.py:178,254`.
+- [ ] **SEC-102** Cap `len(tasks)` at MCP boundary (currently unbounded — combined with 0.5–2 GB RSS per child, one MCP call can OOM). `plugins/callstack/mcp_server.py:178`. Suggested cap: 64 with env override `CALLSTACK_MAX_FANOUT`.
+- [ ] **SEC-103** `CALLSTACK_MAX_DEPTH` is read from caller env, so a caller raises its own cap. Move to a config that's stamped onto spawned children and rejects increases past the root's cap. `plugins/callstack/agent_callstack/__init__.py:91-102,303-306`.
+- [ ] **SEC-104** TOCTOU + symlink race in `_resolve_cwd` → spawn: resolve happens long before `Popen(..., cwd=...)`. Fix: resolve once, then `os.open(dir, O_DIRECTORY|O_NOFOLLOW)` and pass `fd` (or re-validate just before spawn under a lock). `plugins/callstack/mcp_server.py:113-159` → `channel.py:591-594`.
+- [ ] **SEC-105** Sensitive-prefix list is incomplete (missing `~/Library`, `~/Documents`, `~/Desktop`, `/private/tmp`, `~/.claude` itself); also the parent-project-under-prefix bypass opens the entire prefix tree. `plugins/callstack/mcp_server.py:106-110,148-152`.
+- [ ] **SEC-106** YAML/JSON log injection: caller-controlled task strings and LLM-controlled child output flow verbatim into `report.yaml`. Use `yaml.safe_dump(default_style="|")` for arbitrary strings, or truncate + sanitize control chars. `plugins/callstack/agent_callstack/driver.py:588-598`.
+
+## Tier 2 — correctness bugs that won't fire under happy-path tests
+
+- [ ] **CORR-101** `max_depth` not stamped onto spawn env; grandchild reverts to default. Stamp `ENV_MAX_DEPTH` on every spawn alongside `ENV_DEPTH`. `plugins/callstack/agent_callstack/__init__.py:303-306`.
+- [ ] **CORR-102** `_last_json_object` prefers the LAST fenced block: a child that emits real YIELD then fake RETURN in plaintext bypasses yielding. Fix: refuse parse when both YIELD and RETURN appear; prefer first valid envelope; or reject when more than one is found. `plugins/callstack/agent_callstack/protocol.py:55-84`.
+- [ ] **CORR-103** Resume token has no nonce/version; replay reachable from a stale tree snapshot. Add `(invoke_id, leaf_node_id, version)` tuple to `YieldToken` and verify on resume. `plugins/callstack/agent_callstack/driver.py:303-322`.
+- [ ] **CORR-104** Partial-failure swallowed in `call_many`: first raised exception aborts the loop, siblings' results not collected. Wrap each `fut.result()` in try/except and surface as `CallFailed` for that slot. `plugins/callstack/agent_callstack/driver.py:266-283`.
+- [ ] **CORR-105** No SIGINT handler: Ctrl-C leaves worker threads and pooled subprocesses running. Install a handler in `Driver.run` that cancels futures and tears down the pool.
+
+## Tier 3 — performance hot-paths
+
+- [ ] **PERF-101** Hash-skip in `_do_merge` is dead: `ended_at` always perturbs the doc so the content hash never matches. Hash the doc WITHOUT `ended_at`, or drop `ended_at` from quiet ticks. **Biggest single CPU win.** `plugins/callstack/agent_callstack/reporter.py:189-212`.
+- [ ] **PERF-102** YAML emit held under `_interprocess_lock`. Move serialization outside the lock; lock only around the atomic rename. `plugins/callstack/agent_callstack/reporter.py:189-212`.
+- [ ] **PERF-103** Module-level caches (`_FRAMES_PARSED_CACHE`, `_mru_cache`, `_SHARED_LOCATOR`) never evict. Long-lived MCP server → unbounded RSS. Add size-bounded LRU. `plugins/callstack/agent_callstack/frames.py:39,309`, `session.py:80`.
+- [ ] **PERF-104** `_load_frames` re-globs every tick; with `instance_id=uuid4` per nested invoke, frame count grows unboundedly *within one invocation*. Stat-based fast-path: skip glob when dir mtime unchanged. `plugins/callstack/agent_callstack/reporter.py:194`.
+- [ ] **PERF-105** Per-eviction `sorted(processes.items())` is O(n log n) per evicted entry. Use a heap or pre-sort once. `plugins/callstack/agent_callstack/channel.py:347`.
+- [ ] **PERF-106** No backpressure on `on_progress`: a fast child fires 100s/sec; transition log + frame write are synchronous. Coalesce by debounce window. `plugins/callstack/agent_callstack/driver.py:326`.
+
+## Tier 4 — DRY / simplicity wins
+
+- [ ] **DRY-101** Extract `env.py` with all `CALLSTACK_*` env constants + typed readers (`root_identity()`, `debounce_secs()`, `max_depth()`). Eliminates duplicated string keys across `__init__.py`, `session.py`, `channel.py`, `reporter.py`, `mcp_server.py`, `frames.py`. **Highest-leverage cleanup.**
+- [ ] **DRY-102** Collapse `mcp_server._invocation_identity` + `_report_path` into `_InvocationContext`. ~60 LOC removed, one source of drift gone. `plugins/callstack/mcp_server.py:47,51` ↔ `agent_callstack/__init__.py:249`.
+- [ ] **DRY-103** Delete three replicas of Claude Code's session internals now that `--session-id` preallocation is authoritative: `_extract_cwd`, `_load/_save_session_index`, `count_lines`. `plugins/callstack/agent_callstack/session.py:288,308-352,354`. Matches standing memory note "don't replicate Claude Code internals".
+- [ ] **DRY-104** Consolidate six DFS variants behind `_TreeIndex`: `_depth_of`, `_parent_file_for`, `_find_parent`, `_find`, `Tree.find_by_session`, `_chain_to_session`, `_walk_tree`. `plugins/callstack/agent_callstack/driver.py:355,370,418,730,191`, `frames.py:288,227`.
+- [ ] **DRY-105** Trivial dedups: UUID regex (`session.py:22-25` ↔ `channel.py:133-136`), `_utc_now` (`driver.py:26` ↔ `invocation_ctx.py:28`), atomic-write (`reporter.py:365` ↔ `session.py:332`); delete `_wrap` identity (`results.py:165`); inline `_stringify` (`protocol.py:123`).
+- [ ] **DRY-106** Pick one error-logging policy: first-occurrence-only / always / silent are all in use across modules. Standardize on "log first occurrence per source, suppress repeats."
