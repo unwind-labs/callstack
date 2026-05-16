@@ -166,3 +166,47 @@ class TestResume:
         ch.respond(_envelope("return", result="ok"), "00000000-0000-0000-0000-0000000000d5")
         r = caller.resume(token, "847291")
         assert r.value == "ok"
+
+
+class TestEnvPropagation:
+    """The Caller stamps env onto every spawned `claude` subprocess via
+    the ClaudeChannel constructed in ``_driver_for``. Grandchildren read
+    these vars to discover their depth and budget."""
+
+    def test_max_depth_is_stamped_onto_child_env(self, tmp_path):
+        """CORR-101: a Caller built with ``max_depth=N`` must stamp
+        ``CALLSTACK_MAX_DEPTH=N`` onto the spawn env.
+
+        Without this, a grandchild's Driver falls back to the default cap
+        (10) — silently exceeding a budget the root explicitly chose."""
+        from agent_callstack.session import SessionRef
+        caller = Caller(max_depth=3)
+        parent = SessionRef(
+            session_id="00000000-0000-0000-0000-0000000000aa",
+            file=tmp_path / "p.jsonl",
+        )
+        ctx = caller._resolve_invocation_context(parent)
+        driver = caller._driver_for(parent, ctx=ctx)
+
+        env = driver.channel._env_extra
+        assert env.get("CALLSTACK_MAX_DEPTH") == "3", (
+            f"expected CALLSTACK_MAX_DEPTH=3 on spawn env, got "
+            f"{env.get('CALLSTACK_MAX_DEPTH')!r}; without this, a "
+            f"grandchild reverts to the default cap and exceeds the "
+            f"budget the root chose"
+        )
+
+    def test_default_max_depth_also_stamped(self, tmp_path):
+        """Even when the user doesn't set max_depth explicitly, the env
+        carries the effective value — so the cap is uniform across the
+        whole subtree rather than dependent on whether each child happens
+        to inherit ENV_MAX_DEPTH from its shell."""
+        from agent_callstack.session import SessionRef
+        caller = Caller()  # max_depth defaults to 10
+        parent = SessionRef(
+            session_id="00000000-0000-0000-0000-0000000000bb",
+            file=tmp_path / "p.jsonl",
+        )
+        ctx = caller._resolve_invocation_context(parent)
+        driver = caller._driver_for(parent, ctx=ctx)
+        assert driver.channel._env_extra.get("CALLSTACK_MAX_DEPTH") == "10"

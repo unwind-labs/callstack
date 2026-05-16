@@ -302,6 +302,15 @@ class Caller:
             ENV_DEPTH: str(depth_base + 1),
             ENV_ROOT_INVOKE_ID: ctx.invoke_id,
             ENV_ROOT_LOG_DIR: str(ctx.log_dir),
+            # CORR-101: stamp the effective max_depth onto every spawned
+            # child so a grandchild doesn't silently revert to the default
+            # cap when the root explicitly chose a smaller one. Without
+            # this, ENV_MAX_DEPTH is only honored if the caller (or a
+            # human's shell) happened to export it — a per-Caller
+            # max_depth=3 would be ignored by claude subprocesses that
+            # inherit only the unset env, and ENV_DEPTH alone would
+            # compare against the child's default 10.
+            ENV_MAX_DEPTH: str(self._max_depth),
         }
         channel = ClaudeChannel(
             model=self._model,
