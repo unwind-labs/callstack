@@ -48,11 +48,16 @@ class TestParseEnvelope:
 
     # ---- Edge cases ----
 
-    def test_no_envelope_returns_empty_return(self):
-        assert parse_envelope("nothing here") == Return()
+    def test_no_envelope_returns_none(self):
+        # No JSON object → None (driver maps this to TurnFailed). An
+        # explicit `{"op":"return"}` is still a legitimate empty Return —
+        # see test_return_empty above.
+        assert parse_envelope("nothing here") is None
 
-    def test_unknown_op_returns_empty_return(self):
-        assert parse_envelope(_fenced({"op": "explode"})) == Return()
+    def test_unknown_op_returns_none(self):
+        # Unknown opcode is a protocol violation, not a successful empty
+        # return — surface as None so the driver fails the turn loudly.
+        assert parse_envelope(_fenced({"op": "explode"})) is None
 
     def test_last_envelope_wins(self):
         text = (
@@ -62,7 +67,9 @@ class TestParseEnvelope:
         assert parse_envelope(text) == Return(result="winner")
 
     def test_malformed_fenced_falls_through(self):
-        assert parse_envelope("```json\n{not json}\n```") == Return()
+        # The fenced block fails to JSON-parse and there's no other JSON
+        # object anywhere in the text → None.
+        assert parse_envelope("```json\n{not json}\n```") is None
 
     def test_braces_in_strings_handled(self):
         text = _fenced({"op": "return", "result": "has {braces} inside"})

@@ -155,6 +155,14 @@ class _LiveReporter:
             self._write_frame(tree, ended_at=ended_at)
             self._latest_ended_at = ended_at
             self._do_merge(force=True, ended_at=ended_at)
+            # If we're a nested invocation and the root frame still isn't on
+            # disk by finalize time (root never ticked again, or root crashed
+            # before its first tick), `_do_merge` silently skipped. Write a
+            # `report.partial.yaml` so post-mortem consumers have *something*
+            # to read about this nested call's tree — `report.yaml` is
+            # left untouched (it's the root's responsibility to write).
+            if self._ctx.is_nested:
+                self._write_partial_if_no_root(tree, ended_at=ended_at)
             self._append_transitions(tree, ended_at)
         # SEC-009: never unlink the lock file. Re-creating it between
         # acquirers races with the unlink and hands different inodes to
@@ -202,6 +210,46 @@ class _LiveReporter:
                 return
             _atomic_write_bytes(self._ctx.report_path, payload)
             self._last_merged_hash = new_hash
+
+    def _write_partial_if_no_root(self, tree: Tree, *, ended_at: str) -> None:
+        """Write `report.partial.yaml` for a nested invocation when no root
+        frame exists yet.
+
+        Called only from ``finalize``, only when ``ctx.is_nested`` is true,
+        and only writes if `report.yaml` is still missing. This guarantees
+        the nested invocation's tree is recoverable post-mortem even when
+        the root reporter never ticked again to merge it. ``report.yaml``
+        itself is left to the root reporter — a stale partial would
+        otherwise mask a later real merge."""
+        if self._ctx.report_path.is_file():
+            return
+        with _interprocess_lock(self._ctx.lock_path):
+            frames = _load_frames(self._ctx.frames_dir)
+            if frames.get(_ROOT_FRAME_KEY):
+                # A root frame landed between our root-check above and the
+                # lock acquisition — let `_do_merge` handle it on the next
+                # tick (or it already did).
+                return
+            doc = {
+                "invoke_id": self._ctx.invoke_id,
+                "kind": self._kind,
+                "cwd": self._ctx.cwd,
+                "started_at": self._started_at,
+                "ended_at": ended_at,
+                "status": "partial",
+                "partial_reason": (
+                    "root frame not on disk at nested-invocation finalize; "
+                    "the root reporter never ticked again to merge this nested tree"
+                ),
+                "nested_frame_key": self._ctx.frame_key,
+                "tree": tree.to_dict(),
+            }
+            payload = yaml.safe_dump(
+                doc, sort_keys=False, default_flow_style=False,
+                width=120, allow_unicode=True,
+            ).encode("utf-8")
+            partial_path = self._ctx.invocation_dir / "report.partial.yaml"
+            _atomic_write_bytes(partial_path, payload)
 
     # ---- shared append-only log ----
 

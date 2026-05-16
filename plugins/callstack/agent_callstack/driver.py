@@ -596,7 +596,17 @@ class Driver:
             started_at_utc=started_at, ended_at_utc=_utc_now(),
             seed=self.seed,
         )
-        return st.TurnCompleted(envelope=parse_envelope(result.text),
+        envelope = parse_envelope(result.text)
+        if envelope is None:
+            # No parseable envelope — child crashed mid-thought, was cut off,
+            # or emitted an unknown opcode. Surface as a turn failure rather
+            # than silently mapping to Done(result=None).
+            return st.TurnFailed(
+                error="child emitted no parseable envelope",
+                session_id=result.session_id,
+                partial=result.text,
+            )
+        return st.TurnCompleted(envelope=envelope,
                                 session_id=result.session_id)
 
     def _spawn_child(self, effect: st.SpawnChild, node: Node,

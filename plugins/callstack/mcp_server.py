@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Optional
 
@@ -53,11 +54,30 @@ def _invocation_identity(cwd: str) -> tuple[str, Path]:
     If the process env carries `CALLSTACK_ROOT_*` it means we're running
     inside an already-live invocation (nested MCP call) — reuse that root's
     identity so our work merges into its report.yaml rather than spawning
-    a fresh top-level invocation. Otherwise mint a new id."""
+    a fresh top-level invocation. Otherwise mint a new id.
+
+    Validation: an env-supplied root must point at a real, writable invocation
+    directory. A stale shell that leaked these vars from a prior run would
+    otherwise silently misroute the new top-level call into a nonexistent
+    or unrelated dir. On validation failure we fall through to minting a
+    fresh id and log a warning to stderr."""
     root_id = os.environ.get(ENV_ROOT_INVOKE_ID)
     root_dir = os.environ.get(ENV_ROOT_LOG_DIR)
     if root_id and root_dir:
-        return root_id, Path(root_dir)
+        root_dir_path = Path(root_dir)
+        invocation_dir = root_dir_path / root_id
+        # The invocation subdir is created at root start-up by the reporter;
+        # its presence proves these env vars came from a live parent rather
+        # than a stale shell export.
+        if root_dir_path.is_dir() and invocation_dir.is_dir():
+            return root_id, root_dir_path
+        print(
+            f"[callstack] WARN: ignoring inherited "
+            f"{ENV_ROOT_INVOKE_ID}={root_id!r} / "
+            f"{ENV_ROOT_LOG_DIR}={root_dir!r} — invocation dir "
+            f"{invocation_dir!s} does not exist; minting a fresh invoke_id",
+            file=sys.stderr,
+        )
     return _new_invoke_id(), _log_dir(cwd)
 
 
@@ -214,11 +234,21 @@ async def call(tasks: list[str], timeout: int = 300, session_id: str = "",
     multi: MultiResult = await asyncio.to_thread(
         caller.call_many, tasks, context=context,
     )
-    return json.dumps({
+    report_path = _report_path(log_dir, invoke_id)
+    envelope: dict = {
         "invoke_id": invoke_id,
-        "report_path": _report_path(log_dir, invoke_id),
+        "report_path": report_path,
         "results": [_result_to_dict(r) for r in multi.results],
-    }, indent=2)
+    }
+    # The reporter swallows write failures internally; verify here so the
+    # parent agent knows the `report_path` it just received is unreliable
+    # rather than silently consuming a stale or missing file.
+    if not Path(report_path).is_file():
+        envelope["report_warning"] = (
+            f"report file at {report_path!r} does not exist on disk; "
+            f"the live reporter may have failed to write it"
+        )
+    return json.dumps(envelope, indent=2)
 
 
 @mcp.tool()

@@ -84,11 +84,17 @@ def _last_json_object(output: str) -> Optional[dict]:
     return last
 
 
-def parse_envelope(output: str) -> Envelope:
-    """Parse the agent's last JSON envelope. Missing/unknown → empty Return."""
+def parse_envelope(output: str) -> Optional[Envelope]:
+    """Parse the agent's last JSON envelope.
+
+    Returns ``None`` when no JSON object was found OR when an unknown opcode
+    is present — the caller (driver) treats this as a turn failure rather
+    than a successful empty Return. An explicit ``{"op":"return"}`` with no
+    ``result`` is still a legitimate empty success and returns ``Return()``.
+    """
     obj = _last_json_object(output)
     if obj is None:
-        return Return()
+        return None
     op = obj.get("op")
     if op == "call":
         return Call(task=obj.get("task", ""))
@@ -100,7 +106,7 @@ def parse_envelope(output: str) -> Envelope:
             summary=obj.get("summary"),
             suggested_next=obj.get("next"),
         )
-    return Return()
+    return None
 
 
 # ---------- Prompt construction ----------

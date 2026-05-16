@@ -177,8 +177,13 @@ class Caller:
             tasks=[n.task for n in tree.nodes], started_at=started_at,
         )
         driver.on_progress = reporter
-        driver.resume(tree, token.session_id, reply)
-        reporter.finalize(tree)
+        # Same try/finally guarantee as `_invoke`: `tree` is already a valid
+        # snapshot loaded above, so even a mid-resume exception leaves a
+        # consistent on-disk report reflecting the partial progress.
+        try:
+            driver.resume(tree, token.session_id, reply)
+        finally:
+            reporter.finalize(tree)
         return _unwrap_single(_results_from_tree(tree)[0])
 
     # ---- internal ----
@@ -200,8 +205,20 @@ class Caller:
         reporter = _LiveReporter(ctx=ctx, kind=kind, tasks=list(tasks),
                                  started_at=started_at)
         driver.on_progress = reporter
-        tree = driver.run(parent, tasks, base_depth=depth, context=context)
-        reporter.finalize(tree)
+        # Try/finally ensures `report.yaml` is always finalized, even if
+        # `driver.run` raises. Without this, a debounced merge could be
+        # left scheduled and the on-disk report would be up to ~250ms
+        # stale relative to the actual final state.
+        tree: Optional[Tree] = None
+        try:
+            tree = driver.run(parent, tasks, base_depth=depth, context=context)
+        finally:
+            if tree is not None:
+                reporter.finalize(tree)
+        # `tree is None` only when `driver.run` raised — the finally above
+        # already ran, and the exception is propagating; we never reach here
+        # in that case. The assert is for type narrowing.
+        assert tree is not None
         return _results_from_tree(tree)
 
     def _parent_project_cwd(self) -> Optional[str]:

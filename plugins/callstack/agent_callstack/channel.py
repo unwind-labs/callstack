@@ -678,6 +678,28 @@ class ClaudeChannel:
                 f"claude CLI exited without reporting a session id "
                 f"(returncode={entry.proc.returncode}, log={entry.log_path})"
             )
+        # Subprocess exit-code check. `returncode is None` means the process
+        # is still alive (the normal happy path — we pool it for reuse).
+        # A non-None, non-zero rc means claude exited with an error after
+        # emitting `result`; with no text to parse there's nothing the
+        # driver can do, so raise here. If text is present, the driver's
+        # envelope parser will decide whether the turn succeeded — we just
+        # log a warning so the failure is visible in the per-process log.
+        rc = entry.proc.returncode
+        if rc is not None and rc != 0:
+            if not text:
+                raise RuntimeError(
+                    f"claude CLI exited with returncode={rc} and no output "
+                    f"(log={entry.log_path})"
+                )
+            try:
+                entry.log.write(
+                    f"WARN: claude CLI exited with returncode={rc} after "
+                    f"emitting output; envelope parsing will decide turn outcome\n"
+                )
+                entry.log.flush()
+            except (OSError, ValueError):
+                pass
 
         # Consistency check: when we pre-allocated a UUID and passed it
         # to claude via `--session-id`, the session id reported on the
