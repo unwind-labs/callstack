@@ -51,22 +51,30 @@ Envelope = Union[Call, Yield, Return]
 
 _FENCED_JSON_RE = re.compile(r"```json\s*\n(.*?)\n```", re.DOTALL)
 
+# Opcodes that constitute a control envelope. Used by parse_envelope to
+# distinguish a real envelope from incidental JSON snippets the model
+# may emit in prose.
+_ENVELOPE_OPS = frozenset({"call", "yield", "return"})
 
-def _last_json_object(output: str) -> Optional[dict]:
-    """Last JSON dict in `output`, preferring fenced ```json blocks.
 
-    Falls back to a forward scan for any `{...}` substring that the JSON
-    decoder accepts — this correctly handles braces inside string literals
-    because we use the standard JSON tokenizer, not hand-rolled brace matching.
-    """
-    for match in reversed(list(_FENCED_JSON_RE.finditer(output))):
+def _fenced_envelope_dicts(output: str) -> list[dict]:
+    """All fenced JSON dicts in `output` that look like envelopes (have a
+    recognized `op` field), in source order."""
+    envelopes: list[dict] = []
+    for match in _FENCED_JSON_RE.finditer(output):
         try:
             obj = json.loads(match.group(1))
-            if isinstance(obj, dict):
-                return obj
         except json.JSONDecodeError:
             continue
+        if isinstance(obj, dict) and obj.get("op") in _ENVELOPE_OPS:
+            envelopes.append(obj)
+    return envelopes
 
+
+def _last_json_object(output: str) -> Optional[dict]:
+    """Fallback: last JSON dict anywhere in `output` when no fenced
+    envelope is present. Forward scan via the standard JSON tokenizer
+    correctly handles braces inside string literals."""
     decoder = json.JSONDecoder()
     last: Optional[dict] = None
     i, n = 0, len(output)
@@ -84,17 +92,7 @@ def _last_json_object(output: str) -> Optional[dict]:
     return last
 
 
-def parse_envelope(output: str) -> Optional[Envelope]:
-    """Parse the agent's last JSON envelope.
-
-    Returns ``None`` when no JSON object was found OR when an unknown opcode
-    is present — the caller (driver) treats this as a turn failure rather
-    than a successful empty Return. An explicit ``{"op":"return"}`` with no
-    ``result`` is still a legitimate empty success and returns ``Return()``.
-    """
-    obj = _last_json_object(output)
-    if obj is None:
-        return None
+def _build_envelope(obj: dict) -> Optional[Envelope]:
     op = obj.get("op")
     if op == "call":
         return Call(task=obj.get("task", ""))
@@ -107,6 +105,36 @@ def parse_envelope(output: str) -> Optional[Envelope]:
             suggested_next=obj.get("next"),
         )
     return None
+
+
+def parse_envelope(output: str) -> Optional[Envelope]:
+    """Parse the agent's last JSON envelope.
+
+    Returns ``None`` on protocol violation: no JSON, unknown opcode, OR
+    multiple fenced envelopes with conflicting opcodes (e.g. a YIELD
+    followed by a RETURN). The driver treats ``None`` as a turn failure
+    rather than collapsing to a silent empty Return.
+
+    Conflict rule (CORR-102): the protocol mandates exactly one envelope.
+    A child that emits a YIELD then a RETURN is either confused or
+    attempting to hijack control flow — neither warrants honoring the
+    last one. Same-opcode duplicates are allowed (treated as model retry)
+    and the last is returned.
+    """
+    envelopes = _fenced_envelope_dicts(output)
+    if envelopes:
+        ops = {env["op"] for env in envelopes}
+        if len(ops) > 1:
+            # Mixed opcodes — refuse to guess intent.
+            return None
+        return _build_envelope(envelopes[-1])
+
+    # No fenced envelope — fall back to bare JSON anywhere in the text
+    # (legacy behavior for models that forget the fence).
+    obj = _last_json_object(output)
+    if obj is None:
+        return None
+    return _build_envelope(obj)
 
 
 # ---------- Prompt construction ----------

@@ -59,12 +59,47 @@ class TestParseEnvelope:
         # return — surface as None so the driver fails the turn loudly.
         assert parse_envelope(_fenced({"op": "explode"})) is None
 
-    def test_last_envelope_wins(self):
+    def test_mixed_opcodes_rejected(self):
+        # CORR-102: a child that emits a YIELD followed by a RETURN is
+        # either confused or attempting control-flow hijack. The
+        # protocol mandates exactly one envelope; refuse to pick a
+        # winner and let the driver fail the turn loudly.
         text = (
-            "first thoughts " + _fenced({"op": "call", "task": "ignored"})
-            + "\nfinal: " + _fenced({"op": "return", "result": "winner"})
+            "first " + _fenced({"op": "yield", "question": "?"})
+            + "\nthen: " + _fenced({"op": "return", "result": "hijacked"})
         )
-        assert parse_envelope(text) == Return(result="winner")
+        assert parse_envelope(text) is None
+
+    def test_call_then_return_rejected(self):
+        # Same mixed-opcode rule for CALL→RETURN: a child can't smuggle
+        # a result past the spawn step.
+        text = (
+            _fenced({"op": "call", "task": "ignored"})
+            + "\n" + _fenced({"op": "return", "result": "winner"})
+        )
+        assert parse_envelope(text) is None
+
+    def test_same_opcode_duplicate_uses_last(self):
+        # Duplicates of the SAME opcode are treated as model retry —
+        # last wins. This is the "double-emitted final answer" case,
+        # not a hijack attempt.
+        text = (
+            _fenced({"op": "return", "result": "first"})
+            + "\n" + _fenced({"op": "return", "result": "final"})
+        )
+        assert parse_envelope(text) == Return(result="final")
+
+    def test_non_envelope_fenced_json_ignored(self):
+        # A model may show a code snippet in a fenced ```json block
+        # while emitting its real envelope separately. Only blocks with
+        # a recognized `op` count as envelopes.
+        text = (
+            "Here's the schema:\n"
+            + _fenced({"name": "Alice", "age": 30})
+            + "\nAnd here's my answer:\n"
+            + _fenced({"op": "return", "result": "ok"})
+        )
+        assert parse_envelope(text) == Return(result="ok")
 
     def test_malformed_fenced_falls_through(self):
         # The fenced block fails to JSON-parse and there's no other JSON
