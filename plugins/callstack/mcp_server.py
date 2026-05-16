@@ -114,6 +114,13 @@ def _invocation_identity(cwd: str) -> tuple[str, Path]:
             f"{invocation_dir!s} does not exist; minting a fresh invoke_id",
             file=sys.stderr,
         )
+        # DRY-102: clear the stale env so the downstream Caller's
+        # `_resolve_invocation_context` (which reads env directly)
+        # agrees with our decision. Otherwise Caller would treat the
+        # invocation as nested under the dead root and try to write
+        # frames into a nonexistent dir.
+        os.environ.pop(_env.ENV_ROOT_INVOKE_ID, None)
+        os.environ.pop(_env.ENV_ROOT_LOG_DIR, None)
     return _new_invoke_id(), _log_dir(cwd)
 
 

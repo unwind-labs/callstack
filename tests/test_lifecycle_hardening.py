@@ -286,6 +286,25 @@ class TestFix5EnvValidation:
         assert invoke_id == live_invoke_id
         assert log_dir == live_root
 
+    def test_stale_env_is_cleared_so_caller_agrees(self, tmp_path, monkeypatch):
+        """DRY-102: when _invocation_identity rejects stale env and mints a
+        fresh id, it must also clear the stale env vars. Otherwise the
+        downstream `Caller._resolve_invocation_context` (which reads env
+        directly) would still treat the invocation as nested under the
+        dead root and try to write frames into a nonexistent dir."""
+        import mcp_server  # type: ignore
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("CALLSTACK_ROOT_INVOKE_ID", "stale-id")
+        monkeypatch.setenv("CALLSTACK_ROOT_LOG_DIR", str(tmp_path / "gone"))
+
+        mcp_server._invocation_identity(str(tmp_path))
+
+        # After rejection, the env must be cleared so Caller agrees.
+        import os
+        assert "CALLSTACK_ROOT_INVOKE_ID" not in os.environ
+        assert "CALLSTACK_ROOT_LOG_DIR" not in os.environ
+
 
 # ---------- Fix #7 — partial report when nested has no root ----------
 
