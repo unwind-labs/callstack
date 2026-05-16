@@ -386,5 +386,18 @@ def _most_recent_session(cwd: str) -> Optional[str]:
 
 
 def _one_line(s: str, limit: int) -> str:
-    s = s.replace("\n", " ").replace("\r", " ").replace('"', "'")
+    # SEC-106: strip ASCII control chars (incl. ANSI escape ESC=\x1b) so a
+    # malicious task or LLM-controlled `result` can't smuggle terminal
+    # escape sequences into `tail -f progress.log`. Newline / tab collapse
+    # to space (the old behavior — friendly for one-line display);
+    # everything else in 0x00–0x1F or 0x7F becomes `?`. 0x80+ stays so
+    # Unicode strings pass through.
+    def sanitize(c: str) -> str:
+        o = ord(c)
+        if c in ("\n", "\r", "\t"):
+            return " "
+        if o < 0x20 or o == 0x7F:
+            return "?"
+        return c
+    s = "".join(sanitize(c) for c in s).replace('"', "'")
     return s if len(s) <= limit else s[: limit - 1] + "…"
