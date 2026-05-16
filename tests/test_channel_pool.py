@@ -109,6 +109,26 @@ class TestClaudePool:
         # The evicted process was terminated.
         p1.proc.terminate.assert_called()
 
+    def test_lru_eviction_handles_multiple_excess_entries(self):
+        """PERF-105: the loop sorts once and pops several entries in a row.
+        Verify multi-entry eviction still picks the oldest first."""
+        pool = ClaudePool(max_size=2)
+        entries: list = []
+        for i in range(6):
+            p = _mock_pooled_process()
+            entries.append(p)
+            pool.register(f"s{i}", p)
+            time.sleep(0.001)
+        # Only the last two registered (s4, s5) should survive.
+        assert pool.size() == 2
+        assert pool.acquire("s5") is entries[5]
+        assert pool.acquire("s4") is entries[4]
+        for i in range(4):
+            assert pool.acquire(f"s{i}") is None, (
+                f"expected s{i} to be evicted as LRU but it survived"
+            )
+            entries[i].proc.terminate.assert_called()
+
     def test_in_use_entries_are_skipped_during_eviction(self):
         pool = ClaudePool(max_size=1)
         p1 = _mock_pooled_process()

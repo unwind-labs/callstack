@@ -331,27 +331,34 @@ class ClaudePool:
         `protect` is a session_id whose entry will not be selected even if
         it is the least-recently-used — used by register() to guarantee
         the just-added process survives at least until another turn
-        bumps an older entry."""
+        bumps an older entry.
+
+        PERF-105: sorts the pool ONCE per call instead of once per evicted
+        entry. The previous implementation's `sorted()` inside the while
+        loop was O((N-max+1) × N log N) — fine for the default cap of 8,
+        bad if pool size grows. Now O(N log N) total."""
         to_close: list[_PooledProcess] = []
-        while len(self._processes) > self._max_size:
-            ranked = sorted(self._processes.items(),
-                            key=lambda kv: kv[1].last_used)
-            chosen_key: Optional[str] = None
-            for k, v in ranked:
-                if k == protect:
-                    continue
-                # Try-acquire; release immediately. Skipping in-use entries
-                # avoids tearing down a process mid-turn.
-                if v.lock.acquire(blocking=False):
-                    v.lock.release()
-                    chosen_key = k
-                    break
-            if chosen_key is None:
-                # All entries are busy (or protected). Accept temporary
-                # overage — once a turn finishes the next register()
-                # will catch up.
-                return to_close
-            to_close.append(self._processes.pop(chosen_key))
+        if len(self._processes) <= self._max_size:
+            return to_close
+        # One-shot LRU ordering: oldest `last_used` first.
+        ranked = sorted(self._processes.items(),
+                        key=lambda kv: kv[1].last_used)
+        for k, v in ranked:
+            if len(self._processes) <= self._max_size:
+                break
+            if k == protect:
+                continue
+            # Try-acquire; release immediately. Skipping in-use entries
+            # avoids tearing down a process mid-turn.
+            if not v.lock.acquire(blocking=False):
+                continue
+            v.lock.release()
+            entry = self._processes.pop(k, None)
+            if entry is not None:
+                to_close.append(entry)
+        # If we couldn't reach `max_size` (every remaining entry is busy or
+        # protected), accept the temporary overage — the next register()
+        # after a turn finishes will catch up.
         return to_close
 
 
