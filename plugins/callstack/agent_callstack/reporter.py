@@ -41,23 +41,9 @@ from .frames import (
 from .invocation_ctx import _InvocationContext, _utc_now_iso
 
 
-_DEFAULT_REPORT_DEBOUNCE_SECS = 0.25
-
-
-def _report_debounce_secs() -> float:
-    """How long _LiveReporter waits before flushing a merged report write.
-
-    Coalesces bursty Driver._notify() calls so the heavy YAML emit + atomic
-    rewrite happens at most ~1/INTERVAL Hz. Tests can override via env.
-    """
-    raw = os.environ.get("CALLSTACK_REPORT_DEBOUNCE_SECS")
-    if raw is None:
-        return _DEFAULT_REPORT_DEBOUNCE_SECS
-    try:
-        v = float(raw)
-        return v if v >= 0 else _DEFAULT_REPORT_DEBOUNCE_SECS
-    except ValueError:
-        return _DEFAULT_REPORT_DEBOUNCE_SECS
+# Re-exports for backwards-compatible test access; the parsing policy
+# lives in `agent_callstack.env`.
+from .env import _DEFAULT_REPORT_DEBOUNCE_SECS, report_debounce_secs as _report_debounce_secs  # noqa: E402, F401
 
 
 class _LiveReporter:

@@ -25,25 +25,25 @@ _UUID_RE = re.compile(
 )
 
 # Env vars that may identify the current session, in priority order.
+# Names live in `agent_callstack.env`; imported aliases here keep the
+# call-sites readable and unify naming with the rest of the runtime.
 #
-# CALLSTACK_OWN_SESSION is stamped by `ClaudeChannel._spawn()` itself,
+# ENV_OWN_SESSION is stamped by `ClaudeChannel._spawn()` itself,
 # alongside `--session-id <uuid>` on the child's claude argv, so the
 # spawned process's MCP server reads back exactly the UUID claude was
 # told to use — deterministic and unaffected by what claude does or
 # doesn't propagate into its own MCP children's env.
 #
-# CLAUDE_CODE_SESSION_ID is what Claude Code exports per process. We
+# ENV_CLAUDE_SESSION is what Claude Code exports per process. We
 # read it as a fallback for processes the plugin didn't spawn (chiefly
 # the user's top-level interactive `claude` session, where the user
-# launched claude themselves and CALLSTACK_OWN_SESSION can't have been
-# set by us).
-_ENV_OWN_SESSION = "CALLSTACK_OWN_SESSION"       # UUID stamped by callstack at spawn
-_ENV_PARENT_UUID = "CLAUDE_CODE_SESSION_ID"      # UUID set by Claude Code per process
-# When set, we're running inside a callstack-managed nested invocation.
-# Used to decide whether the mtime fallback is safe: under concurrent
-# sibling /calls the project dir's most-recently-touched .jsonl races,
-# so we MUST refuse it rather than silently produce a wrong fork.
-_ENV_ROOT_INVOKE_ID = "CALLSTACK_ROOT_INVOKE_ID"
+# launched claude themselves and ENV_OWN_SESSION can't have been set by
+# us).
+from .env import (
+    ENV_OWN_SESSION as _ENV_OWN_SESSION,
+    ENV_CLAUDE_SESSION as _ENV_PARENT_UUID,
+    ENV_ROOT_INVOKE_ID as _ENV_ROOT_INVOKE_ID,
+)
 
 
 def encode_project_dir(cwd: str) -> str:

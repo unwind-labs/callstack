@@ -63,52 +63,21 @@ __all__ = [
 ]
 
 
-# ---------- Env constants ----------
+# ---------- Env constants (re-exported from env.py for compatibility) ----------
 
-ENV_DEPTH = "CALLSTACK_DEPTH"
-# Propagate the root invocation identity into every spawned claude subprocess,
-# so a nested MCP `invoke`/`invoke_parallel` call can merge its tree into the
-# root's report instead of starting a fresh top-level invocation.
-ENV_ROOT_INVOKE_ID = "CALLSTACK_ROOT_INVOKE_ID"
-ENV_ROOT_LOG_DIR = "CALLSTACK_ROOT_LOG_DIR"
-# The parent Driver stamps each forked subprocess with this env — equal to
-# the spawned node's id. A nested MCP invoke inside that subprocess reads
-# it back to identify its frame deterministically (no session-id guessing).
-ENV_FRAME_KEY = "CALLSTACK_FRAME_KEY"
-# Stamped by `ClaudeChannel._spawn()` into every spawned child's env,
-# alongside `--session-id <uuid>` on the child's claude argv. Lets the
-# child's MCP server identify its own session UUID deterministically,
-# without relying on Claude Code's own env-propagation behavior (which
-# is opaque/unspecified for stdio MCP children of a --fork-session
-# subprocess). Highest-priority signal in `SessionLocator.locate()`.
-ENV_OWN_SESSION = "CALLSTACK_OWN_SESSION"
-# Set by Claude CLI inside a forked session; identifies the caller node.
-# Used only as a fallback when `CALLSTACK_FRAME_KEY` is absent.
-ENV_CLAUDE_SESSION = "CLAUDE_CODE_SESSION_ID"
-# Optional override for the default max_depth — picked up at Caller
-# construction time. Inherited by forked subprocesses unchanged.
-ENV_MAX_DEPTH = "CALLSTACK_MAX_DEPTH"
-
-
-# SEC-103: defensive ceiling on the depth budget. A caller (or stale
-# shell env) setting `CALLSTACK_MAX_DEPTH=1_000_000` would let a
-# runaway tree fork itself into oblivion before any other safety net
-# catches it. 32 is far above any legitimate workflow and still leaves
-# the host healthy if depth-bombs are attempted.
-_MAX_DEPTH_CEILING = 32
-
-
-def _default_max_depth() -> int:
-    raw = os.environ.get(ENV_MAX_DEPTH)
-    if raw is None:
-        return 10
-    try:
-        v = int(raw)
-        if v <= 0:
-            return 10
-        return min(v, _MAX_DEPTH_CEILING)
-    except ValueError:
-        return 10
+# DRY-101: the constants and the parsing policy live in `env.py`.
+# Re-exported here so external consumers (mcp_server, tests, downstream
+# code) continue importing from `agent_callstack` without churn.
+from .env import (  # noqa: E402
+    ENV_DEPTH,
+    ENV_ROOT_INVOKE_ID,
+    ENV_ROOT_LOG_DIR,
+    ENV_FRAME_KEY,
+    ENV_OWN_SESSION,
+    ENV_CLAUDE_SESSION,
+    ENV_MAX_DEPTH,
+)
+from .env import max_depth as _default_max_depth  # noqa: E402
 
 
 # ---------- Caller (power-user entry point) ----------

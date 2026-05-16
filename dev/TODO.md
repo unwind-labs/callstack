@@ -98,7 +98,7 @@ and are grouped by tier. Execute top-down; commit each independently.
 ## Tier 3 — performance hot-paths
 
 - [ ] **PERF-101** Hash-skip in `_do_merge` is dead: `ended_at` always perturbs the doc so the content hash never matches. Hash the doc WITHOUT `ended_at`, or drop `ended_at` from quiet ticks. **Biggest single CPU win.** `plugins/callstack/agent_callstack/reporter.py:189-212`.
-- [ ] **PERF-102** YAML emit held under `_interprocess_lock`. Move serialization outside the lock; lock only around the atomic rename. `plugins/callstack/agent_callstack/reporter.py:189-212`.
+- [x] **PERF-102** YAML emit held under `_interprocess_lock`. — **skipped**: after PERF-101 landed the hash-skip actually triggers on quiet ticks, so `yaml.safe_dump` no longer runs on every merge. The remaining "move dump out of lock" optimization introduces TOCTOU (process B could publish a newer report between our hash-check and our atomic-write) for marginal wall-clock savings under contention. Worth revisiting only if a perf profile shows the dump dominating with the hash-skip fix in place.
 - [ ] **PERF-103** Module-level caches (`_FRAMES_PARSED_CACHE`, `_mru_cache`, `_SHARED_LOCATOR`) never evict. Long-lived MCP server → unbounded RSS. Add size-bounded LRU. `plugins/callstack/agent_callstack/frames.py:39,309`, `session.py:80`.
 - [ ] **PERF-104** `_load_frames` re-globs every tick; with `instance_id=uuid4` per nested invoke, frame count grows unboundedly *within one invocation*. Stat-based fast-path: skip glob when dir mtime unchanged. `plugins/callstack/agent_callstack/reporter.py:194`.
 - [ ] **PERF-105** Per-eviction `sorted(processes.items())` is O(n log n) per evicted entry. Use a heap or pre-sort once. `plugins/callstack/agent_callstack/channel.py:347`.

@@ -64,6 +64,8 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Callable, Optional, Protocol
 
+from . import env as _env
+
 
 def _process_log_path(stem: str) -> str:
     """Private log path for a `claude` subprocess (SEC-004).
@@ -74,9 +76,9 @@ def _process_log_path(stem: str) -> str:
     the OS already keeps in the user's private home. Fall back to a
     mode-0600 NamedTemporaryFile when the env isn't set (CLI / library
     use outside an active invocation)."""
-    root_dir = os.environ.get("CALLSTACK_ROOT_LOG_DIR")
-    invoke_id = os.environ.get("CALLSTACK_ROOT_INVOKE_ID")
-    if root_dir and invoke_id:
+    root = _env.root_identity()
+    if root is not None:
+        invoke_id, root_dir = root
         proc_dir = Path(root_dir) / invoke_id / "process_logs"
         proc_dir.mkdir(parents=True, exist_ok=True)
         return str(proc_dir / f"callstack_{stem}_{uuid.uuid4().hex[:8]}.log")
@@ -110,10 +112,8 @@ def _process_log_path(stem: str) -> str:
 # pool-hit (no spawn) still had to wait for a "spawn slot" even though no
 # spawn was happening. Splitting raises usable parallelism for resume-mode
 # turns without raising peak RSS.
-_MAX_CONCURRENT_FORKS = int(os.environ.get("CALLSTACK_MAX_CONCURRENT_FORKS", "8"))
-_MAX_IN_FLIGHT_TURNS = int(os.environ.get(
-    "CALLSTACK_MAX_IN_FLIGHT_TURNS", str(_MAX_CONCURRENT_FORKS * 2),
-))
+_MAX_CONCURRENT_FORKS = _env.max_concurrent_forks()
+_MAX_IN_FLIGHT_TURNS = _env.max_in_flight_turns()
 _SPAWN_SEMAPHORE = threading.BoundedSemaphore(value=_MAX_CONCURRENT_FORKS)
 _IN_FLIGHT_SEMAPHORE = threading.BoundedSemaphore(value=_MAX_IN_FLIGHT_TURNS)
 
@@ -574,7 +574,7 @@ class ClaudeChannel:
             else source_session_id
         )
         if own_session:
-            env["CALLSTACK_OWN_SESSION"] = own_session
+            env[_env.ENV_OWN_SESSION] = own_session
         stem = (preallocated_session_id or source_session_id or "")[:8] or "fresh"
         log_path = _process_log_path(stem)
         # PERF-I: line-buffered (`buffering=1`) means a single newline flush

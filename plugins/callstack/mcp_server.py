@@ -27,7 +27,7 @@ from agent_callstack import (
     Caller, CallFailed, CallYielded, MultiResult, Result, YieldToken,
     _new_invoke_id,
 )
-from agent_callstack import ENV_ROOT_INVOKE_ID, ENV_ROOT_LOG_DIR
+from agent_callstack import env as _env
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("call")
@@ -45,18 +45,11 @@ def _result_to_dict(item: Any) -> dict:
 # subprocess (RSS 0.5–2 GB), so even one MCP call with a 10k-element
 # array can OOM the host. The cap can be widened via env for users
 # with legitimate batch needs, but never silently exceeded.
-_DEFAULT_MAX_FANOUT = 64
-
 
 def _max_fanout() -> int:
-    raw = os.environ.get("CALLSTACK_MAX_FANOUT")
-    if raw is None:
-        return _DEFAULT_MAX_FANOUT
-    try:
-        v = int(raw)
-        return v if v > 0 else _DEFAULT_MAX_FANOUT
-    except ValueError:
-        return _DEFAULT_MAX_FANOUT
+    """Thin wrapper kept for backwards-compatible test access; the
+    parsing policy lives in `agent_callstack.env.max_fanout`."""
+    return _env.max_fanout()
 
 
 def _validate_tasks(tasks: Any) -> Optional[str]:
@@ -104,9 +97,9 @@ def _invocation_identity(cwd: str) -> tuple[str, Path]:
     otherwise silently misroute the new top-level call into a nonexistent
     or unrelated dir. On validation failure we fall through to minting a
     fresh id and log a warning to stderr."""
-    root_id = os.environ.get(ENV_ROOT_INVOKE_ID)
-    root_dir = os.environ.get(ENV_ROOT_LOG_DIR)
-    if root_id and root_dir:
+    root = _env.root_identity()
+    if root is not None:
+        root_id, root_dir = root
         root_dir_path = Path(root_dir)
         invocation_dir = root_dir_path / root_id
         # The invocation subdir is created at root start-up by the reporter;
@@ -116,8 +109,8 @@ def _invocation_identity(cwd: str) -> tuple[str, Path]:
             return root_id, root_dir_path
         print(
             f"[callstack] WARN: ignoring inherited "
-            f"{ENV_ROOT_INVOKE_ID}={root_id!r} / "
-            f"{ENV_ROOT_LOG_DIR}={root_dir!r} — invocation dir "
+            f"{_env.ENV_ROOT_INVOKE_ID}={root_id!r} / "
+            f"{_env.ENV_ROOT_LOG_DIR}={root_dir!r} — invocation dir "
             f"{invocation_dir!s} does not exist; minting a fresh invoke_id",
             file=sys.stderr,
         )
