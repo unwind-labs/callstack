@@ -206,6 +206,61 @@ class TestParallel:
         assert {n.result for n in tree.nodes} == {"ALPHA done", "BRAVO done"}
         assert all(n.status == "complete" for n in tree.nodes)
 
+    def test_propagate_up_serializes_concurrent_callers(
+            self, tmp_path, parent_session):
+        """CONC-3: ``_propagate_up`` is guarded by an RLock so concurrent
+        producers of ChildDone/ChildFailed can't double-step the same
+        ancestor. Verify the lock actually serializes — only one thread
+        inside the critical section at a time."""
+        import threading
+        ch = ScriptedChannel().respond(_envelope("return", result="ok"), "x-fork")
+        driver = _make_driver(tmp_path, ch)
+        tree = Tree(root_session=parent_session, nodes=[], base_depth=0)
+        # Spy: count concurrent occupants of `_propagate_up`. The lock
+        # is acquired at function entry; this hook fires AFTER the
+        # acquire, so seeing concurrent>1 here means the lock failed.
+        concurrent = 0
+        peak = 0
+        cond = threading.Lock()
+        gate = threading.Event()
+
+        real_build = _TreeIndex.build
+
+        def slow_build(t):
+            nonlocal concurrent, peak
+            with cond:
+                concurrent += 1
+                peak = max(peak, concurrent)
+            gate.wait(timeout=0.5)
+            try:
+                return real_build(t)
+            finally:
+                with cond:
+                    concurrent -= 1
+
+        import agent_callstack.driver as drv_mod
+        orig = drv_mod._TreeIndex.build
+        drv_mod._TreeIndex.build = staticmethod(slow_build)  # type: ignore[assignment]
+        try:
+            t1 = threading.Thread(
+                target=lambda: driver._propagate_up(tree, None),  # type: ignore[arg-type]
+            )
+            t2 = threading.Thread(
+                target=lambda: driver._propagate_up(tree, None),  # type: ignore[arg-type]
+            )
+            t1.start()
+            t2.start()
+            gate.set()
+            t1.join()
+            t2.join()
+        finally:
+            drv_mod._TreeIndex.build = orig  # type: ignore[assignment]
+
+        assert peak == 1, (
+            f"_propagate_up allowed {peak} concurrent threads inside; "
+            f"the CONC-3 lock failed to serialize."
+        )
+
     def test_one_sibling_raises_others_still_return(
             self, tmp_path, parent_session):
         """CORR-104: when one sibling's `_drive` raises (e.g. unexpected

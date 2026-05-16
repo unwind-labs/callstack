@@ -15,6 +15,7 @@ from __future__ import annotations
 import atexit
 import concurrent.futures as cf
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -237,6 +238,17 @@ class Driver:
     # policy as `_notify_failed` so a wave of similar resolver failures
     # doesn't drown stderr.
     _sibling_exception_logged: bool = field(default=False, init=False, repr=False)
+    # CONC-3: serializes `_propagate_up` so concurrent producers of
+    # ChildDone/ChildFailed can't double-step the same ancestor. Today
+    # `_propagate_up` is only reached from `resume()` and the recursive
+    # `_spawn_child` path is single-threaded, but the lock is cheap
+    # defense-in-depth for future code paths (parallel resume of
+    # sibling yields, for example). RLock so a re-entry from
+    # `_continue → _perform → _spawn_child` inside the propagate loop
+    # doesn't self-deadlock.
+    _propagate_lock: threading.RLock = field(
+        default_factory=threading.RLock, init=False, repr=False,
+    )
 
     # ---- entry points ----
 
@@ -411,30 +423,37 @@ class Driver:
         events to each ancestor that is AwaitingChild on it.
 
         Ancestor lookups go through a one-shot index built at entry so the
-        loop is O(depth) instead of O(depth · N) (ARCH-3)."""
-        index = _TreeIndex.build(tree)
-        node = leaf
-        while True:
-            parent = index.parent_of.get(id(node))
-            if parent is None:
-                return
-            if not isinstance(parent.state, st.AwaitingChild):
-                return
-            if isinstance(node.state, st.Done):
-                event: st.Event = st.ChildDone(
-                    child_id=parent.state.child_id, result=node.state.result,
-                )
-            elif isinstance(node.state, st.Failed):
-                event = st.ChildFailed(
-                    child_id=parent.state.child_id, error=node.state.error,
-                )
-            else:
-                # Parent stays parked; nothing to do.
-                return
-            depth = index.depth_of[id(parent)]
-            parent_file = index.parent_file_of[id(parent)]
-            self._continue(parent, event, depth, parent_file)
-            node = parent
+        loop is O(depth) instead of O(depth · N) (ARCH-3).
+
+        CONC-3: serialized via ``self._propagate_lock`` so two threads
+        that both observe ``AwaitingChild`` on the same ancestor can't
+        double-step it. Today only `resume()` reaches this method and
+        the recursive `_spawn_child` path is single-threaded; the lock
+        is cheap defense-in-depth for future parallel-resume paths."""
+        with self._propagate_lock:
+            index = _TreeIndex.build(tree)
+            node = leaf
+            while True:
+                parent = index.parent_of.get(id(node))
+                if parent is None:
+                    return
+                if not isinstance(parent.state, st.AwaitingChild):
+                    return
+                if isinstance(node.state, st.Done):
+                    event: st.Event = st.ChildDone(
+                        child_id=parent.state.child_id, result=node.state.result,
+                    )
+                elif isinstance(node.state, st.Failed):
+                    event = st.ChildFailed(
+                        child_id=parent.state.child_id, error=node.state.error,
+                    )
+                else:
+                    # Parent stays parked; nothing to do.
+                    return
+                depth = index.depth_of[id(parent)]
+                parent_file = index.parent_file_of[id(parent)]
+                self._continue(parent, event, depth, parent_file)
+                node = parent
 
     @staticmethod
     def _find_parent(tree: Tree, target: Node) -> Optional[Node]:
