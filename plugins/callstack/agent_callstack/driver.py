@@ -14,17 +14,12 @@ from __future__ import annotations
 
 import atexit
 import concurrent.futures as cf
-import datetime as dt
 import os
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional, cast
-
-
-def _utc_now() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
 CALL_TREE_SCHEMA_VERSION = "2"
@@ -34,6 +29,7 @@ from .channel import (
     Channel, TurnTimeout,
     _MAX_IN_FLIGHT_TURNS as _CHANNEL_MAX_IN_FLIGHT,
 )
+from .invocation_ctx import _utc_now_iso as _utc_now
 from .protocol import parse_envelope
 from .session import SessionRef, count_lines
 from .trace import TraceWriter, TreeStore

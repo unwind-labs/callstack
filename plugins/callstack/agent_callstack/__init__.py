@@ -51,7 +51,6 @@ from .results import (
     _result_from_node,
     _results_from_tree,
     _unwrap_single,
-    _wrap,
 )
 from .session import PROJECTS_DIR, SessionLocator, SessionRef, encode_project_dir
 from .trace import TraceWriter, TreeStore
@@ -143,8 +142,7 @@ class Caller:
 
     def call_many(self, tasks: Sequence[str], *,
                   context: str = "fork") -> MultiResult:
-        wrapped = [_wrap(item) for item in self._invoke(list(tasks), context=context)]
-        return MultiResult(results=wrapped)
+        return MultiResult(results=self._invoke(list(tasks), context=context))
 
     def close(self) -> None:
         """Tear down every pooled `claude` subprocess. The pool is a

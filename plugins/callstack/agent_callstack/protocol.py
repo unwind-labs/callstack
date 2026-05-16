@@ -117,12 +117,10 @@ def starting_prompt(task: str, task_id: Optional[str] = None) -> str:
 
 
 def child_returned_prompt(child_result: Any) -> str:
-    return "Your child completed. Here is the result:\n\n" + _stringify(child_result)
-
-
-def _stringify(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, ensure_ascii=False)
+    if child_result is None:
+        body = ""
+    elif isinstance(child_result, str):
+        body = child_result
+    else:
+        body = json.dumps(child_result, ensure_ascii=False)
+    return "Your child completed. Here is the result:\n\n" + body

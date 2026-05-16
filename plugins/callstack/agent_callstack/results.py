@@ -160,8 +160,3 @@ def _unwrap_single(item) -> Result:
     if isinstance(item, (CallYielded, CallFailed)):
         raise item
     raise CallFailed(error=f"unexpected result type: {type(item).__name__}")
-
-
-def _wrap(item):
-    """Identity for serialization; kept as a hook for future shaping."""
-    return item

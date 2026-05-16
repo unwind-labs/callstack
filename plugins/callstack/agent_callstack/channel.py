@@ -54,7 +54,6 @@ from __future__ import annotations
 import atexit
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -130,10 +129,10 @@ _STDERR_LOG_CAP = 16 * 1024 * 1024            # 16 MiB per turn before truncate
 _VALID_PERMISSION_MODES = frozenset({
     "default", "acceptEdits", "plan", "bypassPermissions",
 })
-_UUID_RE = re.compile(
-    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-    re.IGNORECASE,
-)
+# UUID shape regex is owned by `session.py` (the lowest-level module that
+# knows what a session id looks like); import it here so the same pattern
+# governs both `--session-id` argv validation and on-disk session lookups.
+from .session import _UUID_RE  # noqa: E402
 
 
 @dataclass(frozen=True)
