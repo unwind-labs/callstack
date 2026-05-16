@@ -206,6 +206,45 @@ class TestParallel:
         assert {n.result for n in tree.nodes} == {"ALPHA done", "BRAVO done"}
         assert all(n.status == "complete" for n in tree.nodes)
 
+    def test_one_sibling_raises_others_still_return(
+            self, tmp_path, parent_session):
+        """CORR-104: when one sibling's `_drive` raises (e.g. unexpected
+        resolver / OS error), the others must still complete and their
+        results survive in the tree. The failing sibling lands in
+        ``Failed`` state with the exception text — not lost on the
+        worker thread."""
+        def respond(_src, prompt, _fork):
+            tail = prompt.rsplit("\n\n", 1)[-1]
+            if "EXPLODE" in tail:
+                raise RuntimeError("simulated worker crash")
+            return TurnResult(
+                text=_envelope("return", result="ok"),
+                session_id="ok-fork", duration=0.0,
+                api_request_id="", input_tokens=0, output_tokens=0,
+                cache_read_tokens=0, cache_creation_tokens=0,
+                total_cost_usd=0.0,
+            )
+        ch = (ScriptedChannel()
+              .respond_with(respond)
+              .respond_with(respond)
+              .respond_with(respond))
+        driver = _make_driver(tmp_path, ch)
+
+        tree = driver.run(parent_session,
+                          ["task ALPHA", "task EXPLODE", "task BRAVO"])
+
+        # Three nodes, exactly one failed. The other two return real
+        # results — regression-flag for the bug where the first raised
+        # exception aborted the result-collection loop.
+        statuses = [n.status for n in tree.nodes]
+        assert statuses.count("error") == 1, (
+            f"expected exactly one error node, got {statuses}"
+        )
+        assert statuses.count("complete") == 2
+
+        failed = next(n for n in tree.nodes if n.status == "error")
+        assert "simulated worker crash" in (failed.error or "")
+
 
 # ---------- parent-session invariant ----------
 

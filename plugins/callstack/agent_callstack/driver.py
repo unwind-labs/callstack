@@ -232,6 +232,11 @@ class Driver:
     # stderr in identical errors on every state transition while still
     # surfacing the first occurrence for debugging.
     _notify_failed: bool = field(default=False, init=False, repr=False)
+    # CORR-104: log the first sibling-task exception in `call_many` with
+    # full traceback, suppress subsequent occurrences. Same first-occurrence
+    # policy as `_notify_failed` so a wave of similar resolver failures
+    # doesn't drown stderr.
+    _sibling_exception_logged: bool = field(default=False, init=False, repr=False)
 
     # ---- entry points ----
 
@@ -266,17 +271,37 @@ class Driver:
             # fresh ThreadPoolExecutor per call_many.
             pool = _get_run_pool()
             futures = [
-                pool.submit(self._drive, n, parent.session_id, parent.file,
-                            base_depth + 1)
+                (n, pool.submit(self._drive, n, parent.session_id, parent.file,
+                                base_depth + 1))
                 for n in nodes
             ]
-            cf.wait(futures)
-            for fut in futures:
-                # Surface any exception so it doesn't get lost on the pool's
-                # background thread. _drive doesn't raise on normal node
-                # failures (those land in Node.state), so an exception here
-                # is genuinely unexpected.
-                fut.result()
+            cf.wait([fut for _n, fut in futures])
+            # CORR-104: collect exceptions per-future so one sibling's
+            # unexpected error doesn't strand the others' results.
+            # `_drive` doesn't raise on normal node failures (those land in
+            # Node.state); an exception here means something deeper broke
+            # (resolver, OSError, etc.). Mark the node as Failed and keep
+            # going — the caller still gets siblings' real results.
+            for n, fut in futures:
+                exc = fut.exception()
+                if exc is None:
+                    continue
+                err_msg = f"{type(exc).__name__}: {exc}"
+                # Preserve any state the node already reached (e.g. it had
+                # completed before a stray exception slipped past) by only
+                # overwriting non-terminal states.
+                if not st.is_terminal(n.state):
+                    n.state = st.Failed(error=err_msg)
+                    n.error = err_msg
+                if not self._sibling_exception_logged:
+                    import sys as _sys
+                    import traceback as _tb
+                    print(f"[callstack] sibling task raised "
+                          f"(further occurrences suppressed): {err_msg}",
+                          file=_sys.stderr)
+                    _tb.print_exception(type(exc), exc, exc.__traceback__,
+                                        file=_sys.stderr)
+                    self._sibling_exception_logged = True
 
         self._persist_if_yielded(tree)
         self._notify()
