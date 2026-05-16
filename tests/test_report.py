@@ -613,6 +613,61 @@ def test_content_hash_skip_avoids_duplicate_writes(tmp_path, monkeypatch):
     assert write_count["n"] == 1
 
 
+def test_content_hash_skip_ignores_ended_at_drift(tmp_path, monkeypatch):
+    """PERF-101: the skip-hash must ignore ``ended_at`` so quiet ticks
+    don't rewrite report.yaml just because wall-clock advanced.
+
+    Companion to ``test_content_hash_skip_avoids_duplicate_writes`` —
+    that one pinned ``_utc_now_iso`` to a constant. This one lets time
+    advance between ticks (the real production behavior) and verifies
+    the second tick is still skipped because content is otherwise
+    unchanged."""
+    monkeypatch.setenv("CALLSTACK_REPORT_DEBOUNCE_SECS", "0")
+
+    from agent_callstack import reporter as rep_mod
+
+    write_count = {"n": 0}
+    real_atomic_write_bytes = rep_mod._atomic_write_bytes
+
+    def counting(path, payload):
+        if path.name == "report.yaml":
+            write_count["n"] += 1
+        return real_atomic_write_bytes(path, payload)
+
+    monkeypatch.setattr(rep_mod, "_atomic_write_bytes", counting)
+
+    log_dir = tmp_path / "log"
+    parent = SessionRef(session_id="root", file=tmp_path / "r.jsonl")
+    ctx = _InvocationContext(
+        invoke_id="inv-drift", log_dir=log_dir, cwd="/cwd",
+        frame_key=_ROOT_FRAME_KEY, is_nested=False,
+    )
+    reporter = _LiveReporter(ctx=ctx, kind="call", tasks=["t"],
+                             started_at="s")
+    node = _done_node("b0000000", "t", "r")
+    tree = Tree(root_session=parent, nodes=[node], base_depth=0)
+
+    # Advance the mocked clock on every tick to simulate production.
+    times = iter([
+        "2026-05-13T00:00:00+00:00",
+        "2026-05-13T00:00:00.250000+00:00",
+        "2026-05-13T00:00:00.500000+00:00",
+    ])
+    monkeypatch.setattr(rep_mod, "_utc_now_iso", lambda: next(times))
+
+    reporter(tree)
+    assert write_count["n"] == 1
+    # Tree contents unchanged; only ended_at moves forward. Without the
+    # ended_at-stripping hash, this would rewrite — regression-flag for
+    # the dead skip-hash bug.
+    reporter(tree)
+    reporter(tree)
+    assert write_count["n"] == 1, (
+        f"expected hash-skip to suppress quiet-tick rewrites but saw "
+        f"{write_count['n']} writes; the ended_at-stripping hash regressed"
+    )
+
+
 def test_frames_cache_skips_yaml_safe_load_when_stat_unchanged(
     tmp_path, monkeypatch,
 ):

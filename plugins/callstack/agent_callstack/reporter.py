@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import hashlib
+import json
 import os
 import sys
 import tempfile
@@ -189,7 +190,12 @@ class _LiveReporter:
     def _do_merge(self, *, force: bool, ended_at: str) -> None:
         """Rebuild the merged report and atomically write it, skipping the
         write when the document is identical to what we last wrote (and
-        ``force`` is False). Must be called with ``self._thread_lock``."""
+        ``force`` is False). Must be called with ``self._thread_lock``.
+
+        The skip-hash is computed over the doc WITHOUT ``ended_at`` —
+        ``ended_at`` is recomputed from ``_utc_now_iso()`` on every tick,
+        so including it would perturb the hash on every quiet tick and
+        defeat the skip (PERF-101)."""
         with _interprocess_lock(self._ctx.lock_path):
             frames = _load_frames(self._ctx.frames_dir)
             root_frames = frames.get(_ROOT_FRAME_KEY)
@@ -201,13 +207,13 @@ class _LiveReporter:
                 invoke_id=self._ctx.invoke_id, frames=frames,
                 root_frame=root_frames[0], ended_at=ended_at,
             )
+            new_hash = _content_hash_ignoring_ended_at(doc)
+            if not force and new_hash == self._last_merged_hash:
+                return
             payload = yaml.safe_dump(
                 doc, sort_keys=False, default_flow_style=False,
                 width=120, allow_unicode=True,
             ).encode("utf-8")
-            new_hash = hashlib.sha256(payload).digest()
-            if not force and new_hash == self._last_merged_hash:
-                return
             _atomic_write_bytes(self._ctx.report_path, payload)
             self._last_merged_hash = new_hash
 
@@ -360,6 +366,20 @@ def _atomic_yaml_write(path: Path, doc: Any) -> None:
         width=120, allow_unicode=True,
     )
     _atomic_write_bytes(path, payload.encode("utf-8"))
+
+
+def _content_hash_ignoring_ended_at(doc: dict) -> bytes:
+    """SHA-256 over a JSON canonicalization of `doc` with ``ended_at``
+    stripped at the top level.
+
+    ``ended_at`` is recomputed from wall-clock on every reporter tick;
+    folding it into the hash would defeat the skip-if-unchanged check.
+    Hashing the canonicalized dict (sort_keys + default=str) is faster
+    than dumping YAML and avoids quoting-style perturbations. PERF-101."""
+    stable = {k: v for k, v in doc.items() if k != "ended_at"}
+    return hashlib.sha256(
+        json.dumps(stable, sort_keys=True, default=str).encode("utf-8")
+    ).digest()
 
 
 def _atomic_write_bytes(path: Path, payload: bytes) -> None:
