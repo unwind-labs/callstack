@@ -149,3 +149,82 @@ class TestCallToolGuards:
         env = json.loads(raw)
         assert env["results"][0]["status"] == "error"
         assert "cannot be combined" in env["results"][0]["error"]
+
+
+class TestTaskValidation:
+    """SEC-102: the MCP boundary caps `len(tasks)` and rejects malformed
+    inputs before any subprocess gets spawned. These checks return error
+    envelopes without ever calling `caller.call_many`."""
+
+    @pytest.mark.asyncio
+    async def test_empty_tasks_returns_error(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        raw = await mcp_server.call(tasks=[])
+        env = json.loads(raw)
+        assert env["results"][0]["status"] == "error"
+        assert "empty" in env["results"][0]["error"]
+
+    @pytest.mark.asyncio
+    async def test_oversize_tasks_returns_error(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("CALLSTACK_MAX_FANOUT", "3")
+        raw = await mcp_server.call(tasks=["a", "b", "c", "d"])
+        env = json.loads(raw)
+        assert env["results"][0]["status"] == "error"
+        msg = env["results"][0]["error"]
+        assert "max fanout is 3" in msg
+        assert "CALLSTACK_MAX_FANOUT" in msg
+
+    @pytest.mark.asyncio
+    async def test_non_string_task_returns_error(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        raw = await mcp_server.call(tasks=["ok", 42])  # type: ignore[list-item]
+        env = json.loads(raw)
+        assert env["results"][0]["status"] == "error"
+        assert "must be a string" in env["results"][0]["error"]
+
+    @pytest.mark.asyncio
+    async def test_whitespace_only_task_returns_error(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        raw = await mcp_server.call(tasks=["real task", "   "])
+        env = json.loads(raw)
+        assert env["results"][0]["status"] == "error"
+        assert "empty or whitespace-only" in env["results"][0]["error"]
+
+    def test_max_fanout_default(self, monkeypatch):
+        monkeypatch.delenv("CALLSTACK_MAX_FANOUT", raising=False)
+        assert mcp_server._max_fanout() == 64
+
+    def test_max_fanout_invalid_falls_back(self, monkeypatch):
+        monkeypatch.setenv("CALLSTACK_MAX_FANOUT", "not-a-number")
+        assert mcp_server._max_fanout() == 64
+        monkeypatch.setenv("CALLSTACK_MAX_FANOUT", "0")
+        assert mcp_server._max_fanout() == 64
+        monkeypatch.setenv("CALLSTACK_MAX_FANOUT", "-5")
+        assert mcp_server._max_fanout() == 64
+
+
+class TestDefaultMaxDepthCeiling:
+    """SEC-103: `CALLSTACK_MAX_DEPTH` can be widened by env, but the
+    runtime ceiling clamps absurd values to keep depth-bombs from OOM'ing
+    the host before any other safety net catches them."""
+
+    def test_ceiling_clamps_huge_values(self, monkeypatch):
+        from agent_callstack import _default_max_depth
+        monkeypatch.setenv("CALLSTACK_MAX_DEPTH", "1000000")
+        assert _default_max_depth() == 32
+
+    def test_legitimate_value_passes_through(self, monkeypatch):
+        from agent_callstack import _default_max_depth
+        monkeypatch.setenv("CALLSTACK_MAX_DEPTH", "20")
+        assert _default_max_depth() == 20
+
+    def test_unset_returns_default(self, monkeypatch):
+        from agent_callstack import _default_max_depth
+        monkeypatch.delenv("CALLSTACK_MAX_DEPTH", raising=False)
+        assert _default_max_depth() == 10
+
+    def test_invalid_returns_default(self, monkeypatch):
+        from agent_callstack import _default_max_depth
+        monkeypatch.setenv("CALLSTACK_MAX_DEPTH", "abc")
+        assert _default_max_depth() == 10

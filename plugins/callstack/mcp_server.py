@@ -40,6 +40,49 @@ def _result_to_dict(item: Any) -> dict:
     raise TypeError(f"unknown result type: {type(item).__name__}")
 
 
+# SEC-102: defense-in-depth against a hostile or buggy MCP client
+# submitting unbounded task lists. Each task forks a `claude`
+# subprocess (RSS 0.5–2 GB), so even one MCP call with a 10k-element
+# array can OOM the host. The cap can be widened via env for users
+# with legitimate batch needs, but never silently exceeded.
+_DEFAULT_MAX_FANOUT = 64
+
+
+def _max_fanout() -> int:
+    raw = os.environ.get("CALLSTACK_MAX_FANOUT")
+    if raw is None:
+        return _DEFAULT_MAX_FANOUT
+    try:
+        v = int(raw)
+        return v if v > 0 else _DEFAULT_MAX_FANOUT
+    except ValueError:
+        return _DEFAULT_MAX_FANOUT
+
+
+def _validate_tasks(tasks: Any) -> Optional[str]:
+    """Return an error message if `tasks` is unusable, else None.
+
+    Rejects: non-list, empty list, list over the fanout cap, list
+    containing non-string or empty entries. All checks are at the MCP
+    boundary so they apply uniformly to every client."""
+    if not isinstance(tasks, list):
+        return f"tasks must be a list, got {type(tasks).__name__}"
+    if not tasks:
+        return "tasks list is empty; pass at least one task"
+    cap = _max_fanout()
+    if len(tasks) > cap:
+        return (
+            f"tasks list has {len(tasks)} entries; max fanout is {cap}. "
+            f"Set CALLSTACK_MAX_FANOUT in env to widen the cap."
+        )
+    for i, t in enumerate(tasks):
+        if not isinstance(t, str):
+            return f"tasks[{i}] must be a string, got {type(t).__name__}"
+        if not t.strip():
+            return f"tasks[{i}] is empty or whitespace-only"
+    return None
+
+
 def _log_dir(cwd: str) -> Path:
     return Path(cwd or os.getcwd()) / ".claude" / "callstack" / "log"
 
@@ -207,6 +250,12 @@ async def call(tasks: list[str], timeout: int = 300, session_id: str = "",
             "results": [{"status": "error",
                          "error": f"invalid context: {context!r} "
                                   f"(must be 'fork' or 'fresh')"}],
+        }, indent=2)
+    tasks_err = _validate_tasks(tasks)
+    if tasks_err:
+        return json.dumps({
+            "invoke_id": "", "report_path": "",
+            "results": [{"status": "error", "error": tasks_err}],
         }, indent=2)
     resolved_cwd, cwd_err = _resolve_cwd(cwd)
     if cwd_err:

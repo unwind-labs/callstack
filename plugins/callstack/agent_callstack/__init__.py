@@ -90,13 +90,23 @@ ENV_CLAUDE_SESSION = "CLAUDE_CODE_SESSION_ID"
 ENV_MAX_DEPTH = "CALLSTACK_MAX_DEPTH"
 
 
+# SEC-103: defensive ceiling on the depth budget. A caller (or stale
+# shell env) setting `CALLSTACK_MAX_DEPTH=1_000_000` would let a
+# runaway tree fork itself into oblivion before any other safety net
+# catches it. 32 is far above any legitimate workflow and still leaves
+# the host healthy if depth-bombs are attempted.
+_MAX_DEPTH_CEILING = 32
+
+
 def _default_max_depth() -> int:
     raw = os.environ.get(ENV_MAX_DEPTH)
     if raw is None:
         return 10
     try:
         v = int(raw)
-        return v if v > 0 else 10
+        if v <= 0:
+            return 10
+        return min(v, _MAX_DEPTH_CEILING)
     except ValueError:
         return 10
 
