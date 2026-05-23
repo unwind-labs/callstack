@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ if str(_PLUGIN) not in sys.path:
     sys.path.insert(0, str(_PLUGIN))
 
 import mcp_server  # type: ignore  # noqa: E402
+from agent_callstack import MultiResult, Result  # type: ignore  # noqa: E402
 
 
 class TestResolveCwd:
@@ -228,3 +230,323 @@ class TestDefaultMaxDepthCeiling:
         from agent_callstack import _default_max_depth
         monkeypatch.setenv("CALLSTACK_MAX_DEPTH", "abc")
         assert _default_max_depth() == 10
+
+
+def _ok_result(value: str = "ok") -> Result:
+    return Result(value=value, summary=None, next=None,
+                  duration=0.01, log=None, log_start=0)
+
+
+class _StubCaller:
+    """Drop-in replacement for `agent_callstack.Caller` that bypasses the
+    claude subprocess machinery so we can exercise the run_in_background
+    code paths without spawning anything. The `gate` (a threading.Event)
+    lets a test hold `call_many` open long enough to observe the
+    "pending" branch in `await_call`."""
+
+    def __init__(self, *, results: list, gate: threading.Event | None = None):
+        self._results = results
+        self._gate = gate
+
+    def call_many(self, tasks, *, context: str = "fork") -> MultiResult:
+        if self._gate is not None:
+            # Block in the worker thread until the test releases us.
+            self._gate.wait(timeout=5.0)
+        return MultiResult(results=self._results)
+
+
+@pytest.fixture(autouse=True)
+def _clear_background_registry():
+    """Tests share module-level `_background_tasks` — wipe it both sides
+    of every test so a leak in one doesn't cascade."""
+    mcp_server._background_tasks.clear()
+    yield
+    mcp_server._background_tasks.clear()
+
+
+class TestFinalizeAtBoundary:
+    """REVIEW-203: `_finalize_own_frames` is the MCP boundary's escape
+    hatch for force-terminating non-terminal frames when something went
+    wrong upstream. On the happy path it would be a guaranteed no-op
+    (the call_many → driver → reporter.finalize chain already produces
+    terminal frames) but still costs a glob + fcntl lock + per-frame
+    parse on every tool call. Restrict it to the exception path."""
+
+    @pytest.mark.asyncio
+    async def test_happy_path_does_not_invoke_finalize_own_frames(
+        self, tmp_path, monkeypatch,
+    ):
+        """Sync `call` returning normally must not call the boundary guard."""
+        monkeypatch.chdir(tmp_path)
+        calls = []
+        monkeypatch.setattr(
+            mcp_server, "_finalize_own_frames",
+            lambda *a, **kw: calls.append((a, kw)),
+        )
+        monkeypatch.setattr(
+            mcp_server, "_build_caller",
+            lambda *a, **kw: _StubCaller(results=[_ok_result()]),
+        )
+        env = json.loads(await mcp_server.call(tasks=["x"]))
+        assert env["results"][0]["status"] == "complete"
+        assert calls == [], (
+            "happy path must not invoke _finalize_own_frames — the "
+            "upstream finalize chain is already responsible for terminal "
+            "state and the guard was measurable I/O for a guaranteed no-op"
+        )
+
+    @pytest.mark.asyncio
+    async def test_exception_path_invokes_finalize_own_frames(
+        self, tmp_path, monkeypatch,
+    ):
+        """If call_many raises, the boundary guard must fire so the parent
+        sees status='abandoned' rather than a stuck spinner."""
+        monkeypatch.chdir(tmp_path)
+        calls = []
+        monkeypatch.setattr(
+            mcp_server, "_finalize_own_frames",
+            lambda *a, **kw: calls.append((a, kw)),
+        )
+
+        class _ExplodingCaller:
+            def call_many(self, *_a, **_kw):
+                raise RuntimeError("boom")
+
+        monkeypatch.setattr(mcp_server, "_build_caller",
+                            lambda *a, **kw: _ExplodingCaller())
+        with pytest.raises(RuntimeError, match="boom"):
+            await mcp_server.call(tasks=["x"])
+        assert len(calls) == 1, (
+            "exception path must invoke _finalize_own_frames exactly once"
+        )
+
+    @pytest.mark.asyncio
+    async def test_await_call_happy_path_does_not_invoke_finalize(
+        self, tmp_path, monkeypatch,
+    ):
+        """await_call returning a normal envelope must not call the guard."""
+        monkeypatch.chdir(tmp_path)
+        calls = []
+        monkeypatch.setattr(
+            mcp_server, "_finalize_own_frames",
+            lambda *a, **kw: calls.append((a, kw)),
+        )
+        monkeypatch.setattr(
+            mcp_server, "_build_caller",
+            lambda *a, **kw: _StubCaller(results=[_ok_result()]),
+        )
+        started = json.loads(
+            await mcp_server.call(tasks=["x"], run_in_background=True),
+        )
+        env = json.loads(
+            await mcp_server.await_call(started["invoke_id"], timeout=5),
+        )
+        assert env["results"][0]["status"] == "complete"
+        assert calls == []
+
+
+class TestRunInBackground:
+    """`run_in_background=True` returns immediately with a 'started'
+    envelope; `await_call` reconciles the eventual result. Together they
+    let callers avoid the MCP_TOOL_TIMEOUT for long fan-outs without
+    losing the structured results envelope."""
+
+    @pytest.mark.asyncio
+    async def test_returns_started_envelope_immediately(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        gate = threading.Event()
+        monkeypatch.setattr(
+            mcp_server, "_build_caller",
+            lambda *a, **kw: _StubCaller(results=[_ok_result()], gate=gate),
+        )
+        raw = await mcp_server.call(tasks=["x"], run_in_background=True)
+        env = json.loads(raw)
+        assert env["status"] == "started"
+        assert env["invoke_id"]
+        assert env["report_path"]
+        # Task is parked in the registry waiting for the gate.
+        assert env["invoke_id"] in mcp_server._background_tasks
+        # Release and drain so pytest doesn't leave a thread alive past
+        # this test. (autouse fixture clears the registry; the task itself
+        # needs to be unblocked.)
+        gate.set()
+        await mcp_server.await_call(env["invoke_id"], timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_await_call_returns_full_envelope_when_done(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(
+            mcp_server, "_build_caller",
+            lambda *a, **kw: _StubCaller(results=[_ok_result("done")]),
+        )
+        started = json.loads(
+            await mcp_server.call(tasks=["x"], run_in_background=True),
+        )
+        invoke_id = started["invoke_id"]
+        env = json.loads(await mcp_server.await_call(invoke_id, timeout=5))
+        # Final envelope matches the sync `call` shape: results list + ids.
+        assert env["invoke_id"] == invoke_id
+        assert env["report_path"] == started["report_path"]
+        assert env["results"][0]["status"] == "complete"
+        assert env["results"][0]["result"] == "done"
+        # Reconciled tasks are popped so memory doesn't grow unbounded.
+        assert invoke_id not in mcp_server._background_tasks
+
+    @pytest.mark.asyncio
+    async def test_await_call_timeout_returns_pending(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        gate = threading.Event()
+        monkeypatch.setattr(
+            mcp_server, "_build_caller",
+            lambda *a, **kw: _StubCaller(results=[_ok_result()], gate=gate),
+        )
+        started = json.loads(
+            await mcp_server.call(tasks=["x"], run_in_background=True),
+        )
+        invoke_id = started["invoke_id"]
+        # Stub is still blocked on the gate — wait_for should time out.
+        env = json.loads(
+            await mcp_server.await_call(invoke_id, timeout=0.1),
+        )
+        assert env["status"] == "pending"
+        assert env["invoke_id"] == invoke_id
+        # Pending reconciliations keep the entry so the caller can poll.
+        assert invoke_id in mcp_server._background_tasks
+        # Drain.
+        gate.set()
+        await mcp_server.await_call(invoke_id, timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_await_call_unknown_id_returns_error(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        env = json.loads(
+            await mcp_server.await_call("does-not-exist", timeout=1),
+        )
+        assert env["status"] == "error"
+        assert "no background call" in env["error"]
+        assert env["invoke_id"] == "does-not-exist"
+
+    @pytest.mark.asyncio
+    async def test_validation_errors_still_surface_synchronously(
+        self, tmp_path, monkeypatch,
+    ):
+        """Bad input in background mode must NOT silently park a doomed
+        task — the orchestrator needs to react immediately, the same way
+        it would for a synchronous call."""
+        monkeypatch.chdir(tmp_path)
+        raw = await mcp_server.call(
+            tasks=[], run_in_background=True,
+        )
+        env = json.loads(raw)
+        assert env["results"][0]["status"] == "error"
+        # Nothing should have been parked.
+        assert not mcp_server._background_tasks
+
+    @pytest.mark.asyncio
+    async def test_background_exception_surfaced_via_await(
+        self, tmp_path, monkeypatch,
+    ):
+        """If `call_many` raises (i.e. an unexpected internal error, not a
+        per-task CallFailed), `await_call` must surface it instead of
+        hanging or losing it. CallFailed-per-task is handled by the normal
+        MultiResult envelope; this test covers the top-level crash path."""
+        monkeypatch.chdir(tmp_path)
+
+        class BoomCaller:
+            def call_many(self, tasks, *, context="fork"):
+                raise RuntimeError("simulated internal failure")
+
+        monkeypatch.setattr(
+            mcp_server, "_build_caller", lambda *a, **kw: BoomCaller(),
+        )
+        started = json.loads(
+            await mcp_server.call(tasks=["x"], run_in_background=True),
+        )
+        invoke_id = started["invoke_id"]
+        env = json.loads(await mcp_server.await_call(invoke_id, timeout=5))
+        assert env["status"] == "error"
+        assert "simulated internal failure" in env["error"]
+        # Errored reconciliations also drop the entry — orchestrator has
+        # the final word; a second await would only return a stale error.
+        assert invoke_id not in mcp_server._background_tasks
+
+
+class TestBackgroundRegistryCap:
+    """A leaking orchestrator that fires `run_in_background` calls and
+    never reconciles them would grow the registry without bound. The cap
+    fails loud instead of silently evicting, so the leak gets noticed."""
+
+    @pytest.mark.asyncio
+    async def test_cap_rejects_when_full(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("CALLSTACK_MAX_BACKGROUND", "2")
+        gate = threading.Event()
+        monkeypatch.setattr(
+            mcp_server, "_build_caller",
+            lambda *a, **kw: _StubCaller(results=[_ok_result()], gate=gate),
+        )
+        # Park two in the registry.
+        e1 = json.loads(
+            await mcp_server.call(tasks=["x"], run_in_background=True),
+        )
+        e2 = json.loads(
+            await mcp_server.call(tasks=["x"], run_in_background=True),
+        )
+        assert e1["status"] == "started" and e2["status"] == "started"
+        # Third must be rejected with a clear error pointing at the env knob.
+        e3 = json.loads(
+            await mcp_server.call(tasks=["x"], run_in_background=True),
+        )
+        assert e3["results"][0]["status"] == "error"
+        msg = e3["results"][0]["error"]
+        assert "cap=2" in msg
+        assert "CALLSTACK_MAX_BACKGROUND" in msg
+        # Drain.
+        gate.set()
+        await mcp_server.await_call(e1["invoke_id"], timeout=5)
+        await mcp_server.await_call(e2["invoke_id"], timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_finished_unawaited_tasks_are_reaped(
+        self, tmp_path, monkeypatch,
+    ):
+        """A short-lived background call the orchestrator never `await`ed
+        should not occupy a registry slot once it finishes — otherwise an
+        agent that fires lots of fast background calls would trip the cap
+        even though nothing is actually outstanding."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("CALLSTACK_MAX_BACKGROUND", "1")
+        # First stub returns instantly (no gate).
+        monkeypatch.setattr(
+            mcp_server, "_build_caller",
+            lambda *a, **kw: _StubCaller(results=[_ok_result()]),
+        )
+        e1 = json.loads(
+            await mcp_server.call(tasks=["x"], run_in_background=True),
+        )
+        assert e1["status"] == "started"
+        # Wait for the underlying task to actually finish so the reaper
+        # has something to reap. Using the task handle directly rather
+        # than await_call lets us observe the pre-reap state too.
+        task = mcp_server._background_tasks[e1["invoke_id"]]["task"]
+        await task
+        # Slot is still nominally occupied — the reaper runs on the next
+        # background call.
+        assert e1["invoke_id"] in mcp_server._background_tasks
+        # Second background call would otherwise hit cap=1, but the
+        # reaper drops the done-but-unawaited entry first.
+        e2 = json.loads(
+            await mcp_server.call(tasks=["x"], run_in_background=True),
+        )
+        assert e2["status"] == "started"
+        assert e1["invoke_id"] not in mcp_server._background_tasks
+        # Drain.
+        await mcp_server.await_call(e2["invoke_id"], timeout=5)
