@@ -86,6 +86,13 @@ ENV_FINALIZE_WAIT_SECS = "CALLSTACK_FINALIZE_WAIT_SECONDS"
 # seconds of no JSONL writes before giving up on its envelope.
 ENV_QUIESCENCE_GRACE_SECS = "CALLSTACK_QUIESCENCE_GRACE_SECONDS"
 
+# Wall-clock TTL on a frame's `writer_pid` liveness check
+# (frames._reconcile_orphan_states). A frame older than this wall-clock
+# age is treated as abandoned regardless of `os.kill(pid, 0)` — defense
+# against macOS PID reuse, where a dead writer's pid is recycled by an
+# unrelated process and the signal-0 probe falsely reports "alive."
+ENV_ORPHAN_TTL_SECS = "CALLSTACK_ORPHAN_TTL_SECONDS"
+
 
 # ---------- Defaults ----------
 
@@ -98,6 +105,10 @@ _DEFAULT_FINALIZE_WAIT_SECS = 120.0
 _MAX_FINALIZE_WAIT_SECS = 600.0
 _DEFAULT_QUIESCENCE_GRACE_SECS = 2.0
 _MAX_QUIESCENCE_GRACE_SECS = 60.0
+# 2 × Claude Code's default MCP tool timeout (~10 min) — past this point
+# we declare a writer dead regardless of what `os.kill(pid, 0)` says.
+_DEFAULT_ORPHAN_TTL_SECS = 1200.0
+_MAX_ORPHAN_TTL_SECS = 24 * 60 * 60.0
 
 # SEC-103: defensive ceiling on the depth budget. A caller (or stale
 # shell env) setting `CALLSTACK_MAX_DEPTH=1_000_000` would let a runaway
@@ -194,6 +205,26 @@ def read_finalize_wait_seconds() -> float:
     if v < 0:
         return _DEFAULT_FINALIZE_WAIT_SECS
     return min(v, _MAX_FINALIZE_WAIT_SECS)
+
+
+def read_orphan_ttl_seconds() -> float:
+    """Wall-clock age past which a frame's `writer_pid` is considered
+    abandoned regardless of `os.kill(pid, 0)`. Belt-and-suspenders against
+    PID reuse on macOS / busy hosts. Clamped to `[0, _MAX_ORPHAN_TTL_SECS]`.
+
+    Setting `CALLSTACK_ORPHAN_TTL_SECONDS=0` opts out of the TTL fallback
+    entirely (relies on `_pid_alive` alone — restores the pre-fix
+    behavior for tests that want to pin it)."""
+    raw = os.environ.get(ENV_ORPHAN_TTL_SECS)
+    if raw is None:
+        return _DEFAULT_ORPHAN_TTL_SECS
+    try:
+        v = float(raw)
+    except ValueError:
+        return _DEFAULT_ORPHAN_TTL_SECS
+    if v < 0:
+        return _DEFAULT_ORPHAN_TTL_SECS
+    return min(v, _MAX_ORPHAN_TTL_SECS)
 
 
 def read_quiescence_grace_seconds() -> float:

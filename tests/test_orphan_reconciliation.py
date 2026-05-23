@@ -284,6 +284,75 @@ def test_reconcile_runs_on_dir_mtime_cache_hit(tmp_path, monkeypatch):
     )
 
 
+def test_ttl_fallback_treats_old_frame_as_abandoned(tmp_path, monkeypatch):
+    """REVIEW-204: even when `_pid_alive` returns True, a frame whose
+    wall-clock age exceeds the orphan TTL must be reconciled. Defends
+    against PID reuse — a dead writer's pid getting recycled by an
+    unrelated long-running process would otherwise keep its frame
+    "alive-looking" forever.
+
+    Monkey-patch `_pid_alive` to True (simulating the PID-reuse hit) and
+    set a tiny TTL so a freshly-written frame trips the wall-clock
+    branch. Reconciliation must still fire."""
+    ac._frames_cache_clear()
+    frames_dir = tmp_path / "_frames"
+    frames_dir.mkdir()
+
+    parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
+    tree = Tree(root_session=parent,
+                nodes=[_running_node("tttttttt", "stuck")], base_depth=0)
+    # Frame from "an hour ago" — `started_at` is far older than the TTL
+    # we'll configure below.
+    frame = {
+        "frame_key": _ROOT_FRAME_KEY, "is_nested": False,
+        "kind": "call", "tasks": ["t"], "cwd": "/cwd",
+        "started_at": "2020-01-01T00:00:00+00:00", "ended_at": "e",
+        "tree": tree.to_dict(),
+        "writer_pid": os.getpid(),
+    }
+    (frames_dir / "root.yaml").write_text(yaml.safe_dump(frame))
+
+    monkeypatch.setattr(frames_mod, "_pid_alive", lambda _pid: True)
+    monkeypatch.setenv("CALLSTACK_ORPHAN_TTL_SECONDS", "1")
+
+    loaded = _load_frames(frames_dir)
+    [node] = loaded[_ROOT_FRAME_KEY][0]["tree"]["nodes"]
+    assert node["state"]["kind"] == "abandoned", (
+        "TTL fallback should mark the frame abandoned even when pid is "
+        "(falsely) reported alive — defense against PID reuse"
+    )
+
+
+def test_ttl_fallback_disabled_with_zero(tmp_path, monkeypatch):
+    """Setting CALLSTACK_ORPHAN_TTL_SECONDS=0 opts out of the TTL check
+    entirely so old frames are kept "running" as long as `_pid_alive`
+    says so. Regression guard that the opt-out actually works."""
+    ac._frames_cache_clear()
+    frames_dir = tmp_path / "_frames"
+    frames_dir.mkdir()
+    parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
+    tree = Tree(root_session=parent,
+                nodes=[_running_node("zzzzzzzz", "ancient")], base_depth=0)
+    frame = {
+        "frame_key": _ROOT_FRAME_KEY, "is_nested": False,
+        "kind": "call", "tasks": ["t"], "cwd": "/cwd",
+        "started_at": "2020-01-01T00:00:00+00:00", "ended_at": "e",
+        "tree": tree.to_dict(),
+        "writer_pid": os.getpid(),
+    }
+    (frames_dir / "root.yaml").write_text(yaml.safe_dump(frame))
+
+    monkeypatch.setattr(frames_mod, "_pid_alive", lambda _pid: True)
+    monkeypatch.setenv("CALLSTACK_ORPHAN_TTL_SECONDS", "0")
+
+    loaded = _load_frames(frames_dir)
+    [node] = loaded[_ROOT_FRAME_KEY][0]["tree"]["nodes"]
+    assert node["state"]["kind"] == "awaiting_turn", (
+        "TTL=0 must restore pre-fix behavior: live pid keeps the frame "
+        "running regardless of age"
+    )
+
+
 def test_cache_returns_independent_copies(tmp_path):
     """`_load_frames` promises callers can mutate the returned dict and
     nested frame contents freely. The internal dir-mtime + parsed-frame

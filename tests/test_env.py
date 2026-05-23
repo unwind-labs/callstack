@@ -127,6 +127,30 @@ class TestQuiescenceGraceSeconds:
         assert env.read_quiescence_grace_seconds() == pytest.approx(2.0)
 
 
+class TestOrphanTtlSeconds:
+    def test_default(self, monkeypatch):
+        monkeypatch.delenv(env.ENV_ORPHAN_TTL_SECS, raising=False)
+        assert env.read_orphan_ttl_seconds() == pytest.approx(1200.0)
+
+    def test_explicit_value(self, monkeypatch):
+        monkeypatch.setenv(env.ENV_ORPHAN_TTL_SECS, "300")
+        assert env.read_orphan_ttl_seconds() == pytest.approx(300.0)
+
+    def test_zero_opts_out(self, monkeypatch):
+        # Documented: 0 = "restore pre-fix behavior" (PID liveness alone).
+        monkeypatch.setenv(env.ENV_ORPHAN_TTL_SECS, "0")
+        assert env.read_orphan_ttl_seconds() == 0
+
+    def test_huge_value_clamped(self, monkeypatch):
+        monkeypatch.setenv(env.ENV_ORPHAN_TTL_SECS, "999999999")
+        assert env.read_orphan_ttl_seconds() == 24 * 60 * 60.0
+
+    @pytest.mark.parametrize("bad", ["-1", "abc"])
+    def test_invalid_returns_default(self, bad, monkeypatch):
+        monkeypatch.setenv(env.ENV_ORPHAN_TTL_SECS, bad)
+        assert env.read_orphan_ttl_seconds() == pytest.approx(1200.0)
+
+
 def test_env_constants_match_string_literals():
     """Lock in the variable names — a rename would break every shell
     integration that exports these. If you intentionally rename one,
@@ -144,3 +168,4 @@ def test_env_constants_match_string_literals():
     assert env.ENV_REPORT_DEBOUNCE_SECS == "CALLSTACK_REPORT_DEBOUNCE_SECS"
     assert env.ENV_FINALIZE_WAIT_SECS == "CALLSTACK_FINALIZE_WAIT_SECONDS"
     assert env.ENV_QUIESCENCE_GRACE_SECS == "CALLSTACK_QUIESCENCE_GRACE_SECONDS"
+    assert env.ENV_ORPHAN_TTL_SECS == "CALLSTACK_ORPHAN_TTL_SECONDS"

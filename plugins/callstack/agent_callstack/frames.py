@@ -19,7 +19,9 @@ import copy
 import os
 import re
 import threading
+import time
 from collections import OrderedDict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -27,6 +29,7 @@ import yaml
 
 from . import session
 from .driver import Node, Tree
+from .env import read_orphan_ttl_seconds
 from .state import TERMINAL as _TERMINAL_KINDS
 
 
@@ -108,10 +111,59 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _frame_age_seconds(frame: dict, *, now: Optional[float] = None) -> Optional[float]:
+    """Wall-clock age of a frame in seconds, derived from its
+    ``started_at`` ISO-8601 field. Returns None when the field is missing
+    or unparseable — callers must treat that as "age unknown" rather than
+    "definitely young." Tolerates the trailing ``Z`` shorthand the rest
+    of the codebase emits via :func:`invocation_ctx._utc_now_iso`."""
+    started_at = frame.get("started_at")
+    if not isinstance(started_at, str) or not started_at:
+        return None
+    iso = started_at.rstrip()
+    if iso.endswith("Z"):
+        iso = iso[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        # Treat naive timestamps as UTC — the producer (`_utc_now_iso`)
+        # always emits a timezone, so this only fires for externally-
+        # produced frames; choosing UTC is the safe default.
+        dt = dt.replace(tzinfo=timezone.utc)
+    wall_now = time.time() if now is None else now
+    return wall_now - dt.timestamp()
+
+
+def _frame_writer_is_dead(frame: dict, *, ttl_seconds: float,
+                           now: Optional[float] = None) -> bool:
+    """True iff the frame's `writer_pid` is no longer alive OR its
+    wall-clock age exceeds ``ttl_seconds``.
+
+    The TTL fallback is the defense against PID reuse: macOS recycles
+    PIDs within a few thousand spawns, so a writer that died and had its
+    PID reclaimed by an unrelated process would otherwise stay
+    "alive-looking" forever. Setting ``ttl_seconds=0`` opts out of the
+    TTL check entirely (PID liveness alone)."""
+    pid = frame.get("writer_pid")
+    if not isinstance(pid, int):
+        return False
+    if not _pid_alive(pid):
+        return True
+    if ttl_seconds <= 0:
+        return False
+    age = _frame_age_seconds(frame, now=now)
+    if age is None:
+        return False
+    return age > ttl_seconds
+
+
 def _reconcile_orphan_states(frames_by_key: dict[str, list[dict]]) -> None:
     """Walk every frame; if its `writer_pid` field names a process that is
-    no longer alive, promote any non-terminal node state inside that frame
-    to the synthetic terminal kind ``"abandoned"``.
+    no longer alive (or the frame is older than the orphan TTL, defense
+    against PID reuse), promote any non-terminal node state inside that
+    frame to the synthetic terminal kind ``"abandoned"``.
 
     Mutates the frame dicts in place. Idempotent — once a frame is
     reconciled, subsequent passes are no-ops (dead pids stay dead;
@@ -120,13 +172,15 @@ def _reconcile_orphan_states(frames_by_key: dict[str, list[dict]]) -> None:
     Frames with no `writer_pid` field (older runs, externally-produced
     frames) are skipped: we can't decide liveness, so we leave the frame
     alone."""
+    ttl_seconds = read_orphan_ttl_seconds()
+    now = time.time()
     for frames in frames_by_key.values():
         for frame in frames:
+            if not _frame_writer_is_dead(frame, ttl_seconds=ttl_seconds,
+                                          now=now):
+                continue
             pid = frame.get("writer_pid")
-            if not isinstance(pid, int):
-                continue
-            if _pid_alive(pid):
-                continue
+            assert isinstance(pid, int)  # _frame_writer_is_dead enforces this
             tree = frame.get("tree")
             if not isinstance(tree, dict):
                 continue
