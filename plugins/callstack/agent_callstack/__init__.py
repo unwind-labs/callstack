@@ -53,8 +53,18 @@ from .results import (
     _unwrap_single,
 )
 from .session import PROJECTS_DIR, SessionLocator, SessionRef, encode_project_dir
+from .shutdown import install_shutdown_hooks as _install_shutdown_hooks
 from .terminal_wait import wait_for_terminal_signals
 from .trace import TraceWriter, TreeStore
+
+
+# REVIEW-202: install shutdown hooks at process startup, on the main
+# thread. Doing this at import time guarantees `signal.signal()` runs
+# from the thread Python booted on — the constructor-side install used
+# to run from `asyncio.to_thread` workers and silently skipped signal
+# registration, leaving fix #3 a partial no-op in the MCP server.
+# Idempotent on re-import / re-call; no-op when already installed.
+_install_shutdown_hooks()
 
 
 __all__ = [

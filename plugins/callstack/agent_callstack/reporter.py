@@ -28,6 +28,8 @@ from typing import Any, Iterator, Optional, Sequence
 
 import yaml
 
+from . import shutdown as _shutdown
+from . import state as _state
 from .driver import Tree
 from .frames import (
     _ROOT_FRAME_KEY,
@@ -79,6 +81,13 @@ class _LiveReporter:
         self._last_merged_hash: Optional[bytes] = None
         self._finalized = False
         self._debounce = _report_debounce_secs()
+        # Most recent Tree handed to __call__. Captured so the
+        # shutdown-hardening path (atexit / SIGTERM / SIGINT) can write a
+        # post-mortem frame for any reporter that the normal finalize()
+        # never reached — without it the signal handler would have
+        # nothing to serialize.
+        self._latest_tree: Optional[Tree] = None
+        _shutdown.register_reporter(self)
 
     def __call__(self, tree: Tree) -> None:
         ended_at = _utc_now_iso()
@@ -94,6 +103,7 @@ class _LiveReporter:
             # needs them visible promptly.
             self._write_frame(tree, ended_at=ended_at)
             self._latest_ended_at = ended_at
+            self._latest_tree = tree
             # Schedule the merge if one isn't already pending. The first
             # action inside `_debounced_merge` is to null out the timer
             # pointer under the same lock, so the next __call__ can
@@ -141,6 +151,7 @@ class _LiveReporter:
             self._ctx.frames_dir.mkdir(parents=True, exist_ok=True)
             self._write_frame(tree, ended_at=ended_at)
             self._latest_ended_at = ended_at
+            self._latest_tree = tree
             self._do_merge(force=True, ended_at=ended_at)
             # If we're a nested invocation and the root frame still isn't on
             # disk by finalize time (root never ticked again, or root crashed
@@ -151,6 +162,10 @@ class _LiveReporter:
             if self._ctx.is_nested:
                 self._write_partial_if_no_root(tree, ended_at=ended_at)
             self._append_transitions(tree, ended_at)
+        # Drop from the shutdown registry now that we've written the
+        # authoritative final state — no need for the atexit / signal
+        # handler to revisit this reporter.
+        _shutdown.unregister_reporter(self)
         # SEC-009: never unlink the lock file. Re-creating it between
         # acquirers races with the unlink and hands different inodes to
         # concurrent waiters, breaking mutual exclusion. Orphan lock
@@ -159,12 +174,18 @@ class _LiveReporter:
     # ---- per-frame snapshot ----
 
     def _write_frame(self, tree: Tree, *, ended_at: str) -> None:
+        # writer_pid lets the merge layer (frames._reconcile_orphan_states)
+        # detect frames whose owning writer died mid-flight and promote any
+        # non-terminal node states to "abandoned" — otherwise a killed/
+        # crashed driver leaves "awaiting_*" states pinned forever, which
+        # unwind renders as a spinning in-progress dot.
         frame = {
             "frame_key": self._ctx.frame_key,
             "is_nested": self._ctx.is_nested,
             "kind": self._kind,
             "tasks": self._tasks,
             "cwd": self._ctx.cwd,
+            "writer_pid": os.getpid(),
             "started_at": self._started_at,
             "ended_at": ended_at,
             "tree": tree.to_dict(),
@@ -262,6 +283,53 @@ class _LiveReporter:
         # processes without a lock.
         with open(self._ctx.log_path, "a") as f:
             f.write("\n".join(lines) + "\n")
+
+    def _emergency_finalize_on_shutdown(self) -> None:
+        """Best-effort post-mortem write triggered by ``atexit`` or by a
+        SIGTERM/SIGINT handler. Rewrites the latest known tree's
+        non-terminal nodes as :class:`state.Abandoned` and forces a frame
+        write so the on-disk frame surfaces ``status="abandoned"`` rather
+        than leaving nodes pinned at ``awaiting_*``.
+
+        Contract: must never raise — the caller is in a shutdown path
+        where exceptions are swallowed at best and corrupt subsequent
+        siblings' shutdown at worst. Skips silently when:
+
+          * The normal ``finalize`` already ran (``self._finalized``).
+          * No tree was ever observed (``self._latest_tree is None``).
+          * ``self._thread_lock`` can't be acquired briefly — assume the
+            normal finalize is currently executing and will produce the
+            authoritative write.
+        """
+        try:
+            if not self._thread_lock.acquire(timeout=0.5):
+                return
+        except Exception:
+            return
+        try:
+            if self._finalized:
+                return
+            tree = self._latest_tree
+            if tree is None:
+                return
+            _abandon_tree_nodes_in_place(
+                tree,
+                reason=f"abandoned at shutdown (pid={os.getpid()})",
+            )
+            try:
+                self._ctx.invocation_dir.mkdir(parents=True, exist_ok=True)
+                self._ctx.frames_dir.mkdir(parents=True, exist_ok=True)
+                self._write_frame(tree, ended_at=_utc_now_iso())
+            except Exception:
+                # Shutdown is already in progress; surfacing this here
+                # would only confuse the operator. Frame write may fail
+                # if the disk / temp dir is already torn down.
+                pass
+        finally:
+            try:
+                self._thread_lock.release()
+            except RuntimeError:
+                pass
 
     def _ancestor_chain(self) -> list[str]:
         """Short node ids from root down to the node that spawned this
@@ -390,3 +458,156 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp_name)
         raise
+
+
+# ---------- abandonment helpers (fix #2 + #3) ----------
+#
+# Both the MCP-boundary guard (fix #2) and the shutdown/signal handler
+# (fix #3) need to convert non-terminal node state into a synthetic
+# terminal kind so the merged report stops rendering an in-progress
+# spinner. The two paths differ in *what they have access to*:
+#
+#   - Fix #2 runs at the MCP server's tool boundary. It only has the
+#     invocation's log_dir + invoke_id; the tree is gone (it lived in
+#     the worker thread). So it operates on frame YAML files on disk.
+#
+#   - Fix #3 runs at process shutdown. The tree is still in memory on
+#     each registered `_LiveReporter`. Operating on the in-memory tree
+#     keeps the abandonment write consistent with whatever the reporter
+#     would have written, and skips one disk round-trip.
+#
+# Both ultimately produce a frame whose nodes are tagged with the
+# synthetic `Abandoned` terminal kind defined in state.py.
+
+
+def _abandon_tree_nodes_in_place(tree: Tree, *, reason: str) -> int:
+    """Walk every node in `tree`; for any whose state is non-terminal
+    (and not suspended awaiting user input), replace it with
+    :class:`state.Abandoned` and mirror the error onto ``node.error`` so
+    the merged-report graft surfaces it.
+
+    Returns the number of nodes mutated. Skips terminal and
+    ``AwaitingUser`` nodes (the latter is parked legitimately waiting
+    for a user reply — sealing it as abandoned would lose that intent)."""
+    from .driver import Node as _Node
+
+    changed = 0
+    def walk(node: _Node) -> None:
+        nonlocal changed
+        s = node.state
+        if not _state.is_terminal(s) and not _state.is_suspended(s):
+            sid = getattr(s, "session_id", None) or node.session_id
+            kind = getattr(s, "kind", "unknown")
+            err = f"{reason} (state was {kind!r})"
+            node.state = _state.Abandoned(error=err, session_id=sid)
+            node.error = err
+            changed += 1
+        for c in node.children:
+            walk(c)
+    for n in tree.nodes:
+        walk(n)
+    return changed
+
+
+def _abandon_frame_nodes_in_place(nodes: list, *, reason: str) -> int:
+    """Dict-shape counterpart to :func:`_abandon_tree_nodes_in_place`.
+
+    Operates on the raw ``Node.to_dict()`` payload loaded from a frame
+    YAML — used by :func:`_finalize_own_frames` so the MCP boundary can
+    fix frames without needing to round-trip them through
+    `Tree.from_dict`. Returns the number of node dicts mutated.
+
+    Does NOT touch nodes whose ``state.kind`` is terminal or
+    ``awaiting_user`` (consistent with the tree-shape variant)."""
+    changed = 0
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        state = n.get("state")
+        if isinstance(state, dict):
+            kind = state.get("kind")
+            if (isinstance(kind, str)
+                    and kind not in _state.TERMINAL
+                    and kind not in _state.SUSPENDED):
+                err = f"{reason} (state was {kind!r})"
+                # Preserve session_id on the State payload so downstream
+                # consumers reading the dict can still chase it.
+                sid = state.get("session_id") or n.get("session_id")
+                new_state: dict = {"kind": "abandoned", "error": err}
+                if sid:
+                    new_state["session_id"] = sid
+                n["state"] = new_state
+                if not n.get("error"):
+                    n["error"] = err
+                changed += 1
+        children = n.get("children")
+        if isinstance(children, list):
+            changed += _abandon_frame_nodes_in_place(children, reason=reason)
+    return changed
+
+
+def _finalize_own_frames(log_dir: Path, invoke_id: str, *,
+                         reason: str) -> bool:
+    """Fix #2: at the MCP server's tool boundary, force-terminate any
+    non-terminal nodes in frames written by **this process** before the
+    `tool_result` envelope is emitted to the parent agent.
+
+    Acquires the same interprocess merge lock the live reporter uses, so
+    the rewrite is atomic with respect to concurrent reads of the
+    merged report. Only touches frames whose ``writer_pid`` field equals
+    ``os.getpid()`` — frames owned by other processes (e.g. a parent
+    invocation's root frame, observed because we share an invocation
+    directory under nested MCP) are left untouched.
+
+    Returns True iff at least one frame was rewritten. Safe to call
+    when the invocation directory does not yet exist (no-op)."""
+    invocation_dir = Path(log_dir) / invoke_id
+    frames_dir = invocation_dir / "_frames"
+    if not frames_dir.is_dir():
+        return False
+    lock_path = invocation_dir / ".report.lock"
+    own_pid = os.getpid()
+    rewrote_any = False
+    with _interprocess_lock(lock_path):
+        for frame_path in sorted(frames_dir.glob("*.yaml")):
+            try:
+                payload = yaml.safe_load(frame_path.read_text())
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            # Only finalize frames this process owns. A nested MCP
+            # invocation under a long-lived root would otherwise wipe
+            # the parent's still-running awaiting_child node when its
+            # own boundary fires.
+            if payload.get("writer_pid") != own_pid:
+                continue
+            tree = payload.get("tree")
+            if not isinstance(tree, dict):
+                continue
+            nodes = tree.get("nodes")
+            if not isinstance(nodes, list):
+                continue
+            if _abandon_frame_nodes_in_place(nodes, reason=reason) > 0:
+                _atomic_yaml_write(frame_path, payload)
+                rewrote_any = True
+    return rewrote_any
+
+
+# ---------- shutdown hardening (fix #3) ----------
+#
+# The shutdown registry, atexit, and signal-handler install live in
+# `agent_callstack.shutdown` so install can happen at process startup
+# from the main thread (REVIEW-202). Reporters only register/unregister
+# themselves here. The names below are thin re-exports kept stable for
+# tests and external callers that previously reached into this module.
+
+from .shutdown import (  # noqa: E402
+    _ACTIVE_REPORTERS,
+    _ACTIVE_REPORTERS_LOCK,
+    _chain_signal_handler,
+    flush_active_reporters as _flush_active_reporters,
+    install_shutdown_hooks,
+    register_reporter as _register_active_reporter,
+    unregister_reporter as _unregister_active_reporter,
+)

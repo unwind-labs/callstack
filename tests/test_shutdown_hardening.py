@@ -33,6 +33,7 @@ import agent_callstack as ac
 from agent_callstack import _InvocationContext, _ROOT_FRAME_KEY
 from agent_callstack import state as st
 from agent_callstack import reporter as reporter_mod
+from agent_callstack import shutdown as shutdown_mod
 from agent_callstack.driver import Node, Tree
 from agent_callstack.reporter import (
     _LiveReporter,
@@ -624,13 +625,15 @@ class TestSignalHandlerChain:
             lambda sig, handler: installed.setdefault("handler", handler),
         )
 
-        # Also stub the flush so we don't need real reporters.
+        # Also stub the flush so we don't need real reporters. The
+        # canonical implementation lives in `shutdown`; the reporter
+        # re-export is just an alias, so we patch the source.
         monkeypatch.setattr(
-            reporter_mod, "_flush_active_reporters",
+            shutdown_mod, "flush_active_reporters",
             lambda: calls.append("flushed"),
         )
 
-        reporter_mod._chain_signal_handler(signal.SIGTERM)
+        shutdown_mod._chain_signal_handler(signal.SIGTERM)
         handler = installed["handler"]
         handler(signal.SIGTERM, None)
 
@@ -648,39 +651,126 @@ class TestSignalHandlerChain:
             raise ValueError("not allowed")
         monkeypatch.setattr(signal, "signal", fake_signal)
         # Must complete without propagating.
-        reporter_mod._chain_signal_handler(signal.SIGTERM)
+        shutdown_mod._chain_signal_handler(signal.SIGTERM)
 
 
-class TestAtexitInstalledOnce:
-    """First reporter installs the atexit + signal hooks; subsequent
-    reporters reuse the registration. Re-registering on every
-    construction would leak handler entries and run flush N times at
-    shutdown."""
+class TestShutdownInstallIsIdempotent:
+    """REVIEW-202: shutdown hooks are installed exactly once per process
+    by `install_shutdown_hooks()`, called at module-load time on the main
+    thread. Reporters register/unregister themselves but never trigger
+    the install — so an MCP server constructing reporters from worker
+    threads still gets correct signal hooks (the previous design silently
+    skipped the install when the constructor ran off the main thread)."""
 
-    def test_install_hooks_runs_only_on_first_register(self, tmp_path,
-                                                       monkeypatch):
-        installed: list[None] = []
+    def test_install_hooks_is_idempotent(self, monkeypatch):
+        """Calling `install_shutdown_hooks` N times only runs atexit
+        registration once."""
+        atexit_calls: list = []
+        signal_calls: list = []
         monkeypatch.setattr(
-            reporter_mod, "_install_shutdown_hooks",
-            lambda: installed.append(None),
+            shutdown_mod.atexit, "register",
+            lambda fn: atexit_calls.append(fn),
         )
-        # Reset the "already installed" flag so this test starts fresh.
-        monkeypatch.setattr(reporter_mod, "_SHUTDOWN_HOOKS_INSTALLED", False)
+        monkeypatch.setattr(
+            shutdown_mod.signal, "signal",
+            lambda sig, handler: signal_calls.append((sig, handler)),
+        )
+        shutdown_mod._reset_for_tests()
+        try:
+            shutdown_mod.install_shutdown_hooks()
+            shutdown_mod.install_shutdown_hooks()
+            shutdown_mod.install_shutdown_hooks()
+            # Snapshot the count BEFORE the restore step so the restore's
+            # own install doesn't pollute the assertion.
+            installs_under_test = len(atexit_calls)
+        finally:
+            # Restore the live state so subsequent tests don't see a
+            # "never installed" flag.
+            shutdown_mod._reset_for_tests()
+            shutdown_mod.install_shutdown_hooks()
+        assert installs_under_test == 1, (
+            "install_shutdown_hooks must register atexit exactly once, "
+            "regardless of how many times it's called"
+        )
 
+    def test_registering_reporters_does_not_reinstall(self, tmp_path,
+                                                      monkeypatch):
+        """Reporter construction must NOT trigger signal install. The
+        previous architecture installed-on-first-register and silently
+        skipped when that "first register" came from a worker thread."""
+        atexit_calls: list = []
+        signal_calls: list = []
+        monkeypatch.setattr(
+            shutdown_mod.atexit, "register",
+            lambda fn: atexit_calls.append(fn),
+        )
+        monkeypatch.setattr(
+            shutdown_mod.signal, "signal",
+            lambda sig, handler: signal_calls.append((sig, handler)),
+        )
+        # Constructing reporters with hooks ALREADY installed must not
+        # re-register anything.
         r1 = _make_reporter(tmp_path / "a")
         r2 = _make_reporter(tmp_path / "b")
         r3 = _make_reporter(tmp_path / "c")
-
-        assert len(installed) == 1, (
-            "shutdown hooks must be installed exactly once across the "
-            "process lifetime — re-installing on every reporter would "
-            "cause N flushes at shutdown and leak signal handlers"
+        assert atexit_calls == [], (
+            "constructing reporters must not re-register atexit hooks"
         )
-        # Make sure all three reporters did register though.
-        with reporter_mod._ACTIVE_REPORTERS_LOCK:
-            assert r1 in reporter_mod._ACTIVE_REPORTERS
-            assert r2 in reporter_mod._ACTIVE_REPORTERS
-            assert r3 in reporter_mod._ACTIVE_REPORTERS
+        assert signal_calls == [], (
+            "constructing reporters must not re-install signal handlers"
+        )
+        # Reporters DID land in the registry though.
+        with shutdown_mod._ACTIVE_REPORTERS_LOCK:
+            assert r1 in shutdown_mod._ACTIVE_REPORTERS
+            assert r2 in shutdown_mod._ACTIVE_REPORTERS
+            assert r3 in shutdown_mod._ACTIVE_REPORTERS
+
+    def test_install_from_worker_thread_skips_signal_handlers(
+        self, monkeypatch,
+    ):
+        """REVIEW-202 regression: `signal.signal()` only runs on the main
+        thread. The new contract is that `install_shutdown_hooks()` from
+        a worker thread skips signal install (returns False) but still
+        registers atexit (which has no thread restriction). Previously
+        the constructor-side install ran from worker threads and silently
+        dropped signal handlers on the floor."""
+        atexit_calls: list = []
+        signal_calls: list = []
+        monkeypatch.setattr(
+            shutdown_mod.atexit, "register",
+            lambda fn: atexit_calls.append(fn),
+        )
+        monkeypatch.setattr(
+            shutdown_mod.signal, "signal",
+            lambda sig, handler: signal_calls.append((sig, handler)),
+        )
+        shutdown_mod._reset_for_tests()
+        result_holder: dict = {}
+
+        def install_from_worker():
+            result_holder["installed_signals"] = (
+                shutdown_mod.install_shutdown_hooks()
+            )
+        try:
+            t = threading.Thread(target=install_from_worker)
+            t.start()
+            t.join()
+            installs_under_test = len(atexit_calls)
+            signal_under_test = list(signal_calls)
+        finally:
+            shutdown_mod._reset_for_tests()
+            shutdown_mod.install_shutdown_hooks()
+        assert result_holder["installed_signals"] is False, (
+            "install_shutdown_hooks called from a worker thread must "
+            "return False (no signal handlers wired)"
+        )
+        # Worker-thread install still wires atexit — that has no
+        # main-thread restriction in CPython.
+        assert installs_under_test == 1
+        assert signal_under_test == [], (
+            "signal.signal must NOT be invoked from a worker thread — "
+            "the previous code did this silently, breaking SIGTERM/SIGINT"
+        )
 
 
 # ==========================================================
