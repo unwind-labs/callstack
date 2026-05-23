@@ -81,6 +81,52 @@ class TestRootIdentity:
         assert env.root_identity() == ("abc", "/tmp/x")
 
 
+class TestFinalizeWaitSeconds:
+    def test_default(self, monkeypatch):
+        monkeypatch.delenv(env.ENV_FINALIZE_WAIT_SECS, raising=False)
+        assert env.read_finalize_wait_seconds() == pytest.approx(120.0)
+
+    def test_explicit_value(self, monkeypatch):
+        monkeypatch.setenv(env.ENV_FINALIZE_WAIT_SECS, "5.0")
+        assert env.read_finalize_wait_seconds() == pytest.approx(5.0)
+
+    def test_zero_preserves_legacy_seal_immediately(self, monkeypatch):
+        # PRD: setting CALLSTACK_FINALIZE_WAIT_SECONDS=0 must be the
+        # explicit opt-in to the pre-fix "seal immediately" behavior
+        # so tests can pin the legacy report shape if needed.
+        monkeypatch.setenv(env.ENV_FINALIZE_WAIT_SECS, "0")
+        assert env.read_finalize_wait_seconds() == 0
+
+    def test_huge_value_clamped(self, monkeypatch):
+        # Don't let a stray env var hang finalize for an hour.
+        monkeypatch.setenv(env.ENV_FINALIZE_WAIT_SECS, "100000")
+        assert env.read_finalize_wait_seconds() == 600.0
+
+    @pytest.mark.parametrize("bad", ["-1", "abc", ""])
+    def test_invalid_returns_default(self, bad, monkeypatch):
+        monkeypatch.setenv(env.ENV_FINALIZE_WAIT_SECS, bad)
+        assert env.read_finalize_wait_seconds() == pytest.approx(120.0)
+
+
+class TestQuiescenceGraceSeconds:
+    def test_default(self, monkeypatch):
+        monkeypatch.delenv(env.ENV_QUIESCENCE_GRACE_SECS, raising=False)
+        assert env.read_quiescence_grace_seconds() == pytest.approx(2.0)
+
+    def test_explicit_value(self, monkeypatch):
+        monkeypatch.setenv(env.ENV_QUIESCENCE_GRACE_SECS, "0.5")
+        assert env.read_quiescence_grace_seconds() == pytest.approx(0.5)
+
+    def test_huge_value_clamped(self, monkeypatch):
+        monkeypatch.setenv(env.ENV_QUIESCENCE_GRACE_SECS, "10000")
+        assert env.read_quiescence_grace_seconds() == 60.0
+
+    @pytest.mark.parametrize("bad", ["-1", "abc"])
+    def test_invalid_returns_default(self, bad, monkeypatch):
+        monkeypatch.setenv(env.ENV_QUIESCENCE_GRACE_SECS, bad)
+        assert env.read_quiescence_grace_seconds() == pytest.approx(2.0)
+
+
 def test_env_constants_match_string_literals():
     """Lock in the variable names — a rename would break every shell
     integration that exports these. If you intentionally rename one,
@@ -96,3 +142,5 @@ def test_env_constants_match_string_literals():
     assert env.ENV_MAX_CONCURRENT_FORKS == "CALLSTACK_MAX_CONCURRENT_FORKS"
     assert env.ENV_MAX_IN_FLIGHT_TURNS == "CALLSTACK_MAX_IN_FLIGHT_TURNS"
     assert env.ENV_REPORT_DEBOUNCE_SECS == "CALLSTACK_REPORT_DEBOUNCE_SECS"
+    assert env.ENV_FINALIZE_WAIT_SECS == "CALLSTACK_FINALIZE_WAIT_SECONDS"
+    assert env.ENV_QUIESCENCE_GRACE_SECS == "CALLSTACK_QUIESCENCE_GRACE_SECONDS"

@@ -112,3 +112,67 @@ and are grouped by tier. Execute top-down; commit each independently.
 - [ ] **DRY-104** Consolidate six DFS variants behind `_TreeIndex`: `_depth_of`, `_parent_file_for`, `_find_parent`, `_find`, `Tree.find_by_session`, `_chain_to_session`, `_walk_tree`. `plugins/callstack/agent_callstack/driver.py:355,370,418,730,191`, `frames.py:288,227`.
 - [x] **DRY-105** Trivial dedups: UUID regex, `_utc_now`, drop `_wrap` identity, inline `_stringify` — commit `5fe8f35`. Atomic-write dedup skipped (different error contracts).
 - [ ] **DRY-106** Pick one error-logging policy: first-occurrence-only / always / silent are all in use across modules. Standardize on "log first occurrence per source, suppress repeats."
+
+---
+
+# Thermo-nuclear review — 2026-05-22
+
+From the in-flight diff covering shutdown-hardening / orphan-reconciliation / pre-finalize wait /
+`run_in_background`. Reviewer flagged five overlapping "seal non-terminal nodes" mechanisms that
+should collapse to one policy; signal/atexit cross-cutting concerns leaked into `_LiveReporter`;
+`_finalize_own_frames` running in happy-path `finally`; PID-reuse hazard in `_pid_alive`; and
+a depth-budget policy bump that wasn't justified. Work top-down.
+
+## Tier 0 — structural cleanups
+
+- [ ] **REVIEW-201** Collapse the five abandonment paths to one policy + two thin walkers.
+  Today `frames._abandon_non_terminal_nodes`, `reporter._abandon_tree_nodes_in_place`,
+  `reporter._abandon_frame_nodes_in_place`, `wait_for_terminal_signals` (Timeout variant),
+  and `_emergency_finalize_on_shutdown` each open-code the "find non-terminal nodes, rewrite
+  to synthetic terminal kind" logic. Define a single `mark_abandoned(kind, *, reason, sid)`
+  policy in `state.py`; expose two walkers (Tree and frame-dict) that delegate to it.
+  Side-effect bug to fix in the same pass: `frames._abandon_non_terminal_nodes` rewrites
+  `AwaitingUser` nodes (it only consults `_TERMINAL_KINDS`, not `SUSPENDED`), demoting
+  legitimately-yielded calls to `abandoned`.
+
+- [ ] **REVIEW-202** Lift atexit/signal-handler installation out of `_LiveReporter` into a
+  dedicated `shutdown.py` (or fold into `_InvocationContext` startup). `_LiveReporter.__init__`
+  is called from `asyncio.to_thread` in the MCP server — i.e. NOT on the main thread — so
+  `_install_shutdown_hooks` silently skips signal installation; fix #3 is currently a
+  partial no-op in production. Verify with a regression test that signal hooks are installed
+  at process startup, not at reporter construction.
+
+- [ ] **REVIEW-203** Move `_finalize_own_frames` from the happy-path `finally` into an `except`
+  branch in `mcp_server.call` and `mcp_server.await_call`. Extract the three boundary callsites
+  into one `@contextmanager` (`_finalize_at_boundary`) so the pattern is identical and the
+  no-op cost on success drops to zero (today every tool call globs the frames dir, takes the
+  fcntl lock, and parses every frame).
+
+## Tier 1 — correctness
+
+- [ ] **REVIEW-204** Add wall-clock TTL alongside `_pid_alive`. PID reuse on macOS cycles
+  within a few thousand spawns, so a frame whose writer died and whose PID was reclaimed
+  by an unrelated process stays "alive-looking" forever — defeating the reconciliation fix.
+  Resolution: a frame is abandoned-eligible if `_pid_alive(writer_pid)` is False OR
+  `(now - frame.started_at) > 2 * MCP_TOOL_TIMEOUT` (default).
+
+- [ ] **REVIEW-205** `_load_frames` cache contract silently broke: `_reconcile_orphan_states`
+  now mutates the inner frame dicts that are *shared* between the cache and callers. The
+  outer docstring still says callers can mutate freely. Either deep-copy frame dicts on each
+  cache hit (the YAML-parse skip already dominates the cost) or document the sharper
+  "caller may mutate top-level dict + list, not contents" contract at the function header.
+
+## Tier 2 — simplicity / spaghetti
+
+- [ ] **REVIEW-206** `driver._classify_upstream_failure` is a table-driven dispatcher wrapping
+  a one-entry tuple. Inline back to a direct `if "API Error" in text and "Server is temporarily
+  limiting requests" in text` until a second signature appears.
+
+- [ ] **REVIEW-207** Justify or back out the `MAX_DEPTH` default 10 → 64 and ceiling 32 → 128
+  bumps in `env.py`. Combined with default fanout 64 these are a 4× ceiling jump with no
+  cited workflow. If the bump exists for a specific use case, document it in `env.py` with
+  the workflow name and the observed depth; otherwise revert to a smaller increment.
+
+- [ ] **REVIEW-208** Boundary leak — `Caller.run` reaches into `Driver._current_tree`. Promote
+  to public `Driver.last_tree` (or restructure the fallback path so `Caller` doesn't need
+  it). Minor compared to the items above.

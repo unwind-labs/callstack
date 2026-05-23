@@ -52,6 +52,29 @@ call(tasks=["List the top-level files and summarize the README"],
 
 `{PWD}` substitutes to the caller's project folder. The child's report still grafts under the caller's `report.yaml`, so the call tree stays unified.
 
+### Long-running batches — `run_in_background`
+
+Claude Code closes the MCP transport at `MCP_TOOL_TIMEOUT` (~10 min by default). A synchronous `call` whose children together run longer than that returns `MCP error -32000: Connection closed` to the orchestrator, even when the children's forked sessions completed and committed work successfully — the result envelope is lost. Use `run_in_background=True` for any batch whose wallclock you expect to exceed ~5 min:
+
+```
+started = call(tasks=["...", "...", "..."], run_in_background=True)
+# started == {"invoke_id": "...", "report_path": "...", "status": "started"}
+```
+
+The tool returns immediately. Reconcile with `await_call`:
+
+```
+done = await_call(invoke_id=started["invoke_id"], timeout=300)
+# done["status"] == "pending"  -> poll again
+# else                          -> same {invoke_id, report_path, results: [...]} as a sync call
+```
+
+`await_call` uses `asyncio.shield` internally, so timing out the wait does NOT cancel the underlying work — keep polling. A successful or errored reconciliation drops the entry from the registry; a pending one leaves it in place.
+
+Validation errors (bad tasks, bad cwd, fork + cross-project) still return synchronously even when `run_in_background=True` — no doomed task gets parked.
+
+The registry is capped (default 64, widenable via `CALLSTACK_MAX_BACKGROUND`). Hitting the cap returns a loud error rather than silently evicting. Finished-but-never-awaited tasks are reaped on the next background call, so short-lived fire-and-forget calls don't burn slots forever.
+
 ### Response format
 
 `call` returns `{invoke_id, report_path, results: [...]}`. Each entry in `results` is one of 3 response types:
@@ -149,5 +172,5 @@ MFA codes, passwords, confirmations). Do not guess.
 ## Critical rules
 
 - **Do NOT send your context in `fork` mode** — the forked session already has all your context, so just say what task in 1 line. In `fresh` mode, do include any context the child needs in the task string.
-- **Forked sessions can themselves call** (up to max depth of 5)
+- **Forked sessions can themselves call** (up to max depth of 10; widenable via `CALLSTACK_MAX_DEPTH`, clamped to a defensive ceiling of 32)
 - **`fork` + different `cwd` is rejected** — combining `context="fork"` with a `cwd` that resolves to a different project folder returns an error. Use `context="fresh"` for cross-project work.

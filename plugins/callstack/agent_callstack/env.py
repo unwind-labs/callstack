@@ -60,6 +60,14 @@ ENV_MAX_DEPTH = "CALLSTACK_MAX_DEPTH"
 # trivial DoS. Widenable for legitimate batch needs.
 ENV_MAX_FANOUT = "CALLSTACK_MAX_FANOUT"
 
+# Cap on outstanding `run_in_background=True` invocations parked in the
+# MCP server's registry awaiting `await_call`. Each entry is cheap (one
+# asyncio.Task ref) but a leaking orchestrator that fires background
+# calls and never reconciles them would grow unboundedly. The cap is a
+# loud failure rather than a silent LRU eviction so the operator notices
+# the leak.
+ENV_MAX_BACKGROUND = "CALLSTACK_MAX_BACKGROUND"
+
 # Process-pool sizing (channel.py).
 ENV_MAX_CONCURRENT_FORKS = "CALLSTACK_MAX_CONCURRENT_FORKS"
 ENV_MAX_IN_FLIGHT_TURNS = "CALLSTACK_MAX_IN_FLIGHT_TURNS"
@@ -67,13 +75,29 @@ ENV_MAX_IN_FLIGHT_TURNS = "CALLSTACK_MAX_IN_FLIGHT_TURNS"
 # Debounce window for LiveReporter merge ticks (reporter.py).
 ENV_REPORT_DEBOUNCE_SECS = "CALLSTACK_REPORT_DEBOUNCE_SECS"
 
+# Pre-finalize wait budget: how long the runtime is willing to block in
+# `wait_for_terminal_signals` waiting for non-terminal nodes to receive a
+# late `op:return` / `op:yield` envelope on their child JSONL before
+# sealing the report. 0 = seal immediately (legacy behavior).
+ENV_FINALIZE_WAIT_SECS = "CALLSTACK_FINALIZE_WAIT_SECONDS"
+
+# Quiescence grace window applied alongside process-exit detection: once
+# the child's pooled subprocess has been observed dead, wait this many
+# seconds of no JSONL writes before giving up on its envelope.
+ENV_QUIESCENCE_GRACE_SECS = "CALLSTACK_QUIESCENCE_GRACE_SECONDS"
+
 
 # ---------- Defaults ----------
 
 _DEFAULT_MAX_DEPTH = 10
 _DEFAULT_MAX_FANOUT = 64
+_DEFAULT_MAX_BACKGROUND = 64
 _DEFAULT_MAX_CONCURRENT_FORKS = 8
 _DEFAULT_REPORT_DEBOUNCE_SECS = 0.25
+_DEFAULT_FINALIZE_WAIT_SECS = 120.0
+_MAX_FINALIZE_WAIT_SECS = 600.0
+_DEFAULT_QUIESCENCE_GRACE_SECS = 2.0
+_MAX_QUIESCENCE_GRACE_SECS = 60.0
 
 # SEC-103: defensive ceiling on the depth budget. A caller (or stale
 # shell env) setting `CALLSTACK_MAX_DEPTH=1_000_000` would let a runaway
@@ -110,6 +134,19 @@ def max_fanout() -> int:
         return _DEFAULT_MAX_FANOUT
 
 
+def max_background() -> int:
+    """Max number of `run_in_background=True` invocations the MCP server
+    will keep parked in its registry at once."""
+    raw = os.environ.get(ENV_MAX_BACKGROUND)
+    if raw is None:
+        return _DEFAULT_MAX_BACKGROUND
+    try:
+        v = int(raw)
+        return v if v > 0 else _DEFAULT_MAX_BACKGROUND
+    except ValueError:
+        return _DEFAULT_MAX_BACKGROUND
+
+
 def max_concurrent_forks() -> int:
     raw = os.environ.get(ENV_MAX_CONCURRENT_FORKS, str(_DEFAULT_MAX_CONCURRENT_FORKS))
     try:
@@ -140,6 +177,39 @@ def report_debounce_secs() -> float:
         return v if v >= 0 else _DEFAULT_REPORT_DEBOUNCE_SECS
     except ValueError:
         return _DEFAULT_REPORT_DEBOUNCE_SECS
+
+
+def read_finalize_wait_seconds() -> float:
+    """How long `wait_for_terminal_signals` will block on non-terminal nodes
+    before marking them `Timeout`. Clamped to `[0, _MAX_FINALIZE_WAIT_SECS]`.
+    Setting `CALLSTACK_FINALIZE_WAIT_SECONDS=0` preserves the pre-fix
+    "seal immediately" behavior."""
+    raw = os.environ.get(ENV_FINALIZE_WAIT_SECS)
+    if raw is None:
+        return _DEFAULT_FINALIZE_WAIT_SECS
+    try:
+        v = float(raw)
+    except ValueError:
+        return _DEFAULT_FINALIZE_WAIT_SECS
+    if v < 0:
+        return _DEFAULT_FINALIZE_WAIT_SECS
+    return min(v, _MAX_FINALIZE_WAIT_SECS)
+
+
+def read_quiescence_grace_seconds() -> float:
+    """Grace window after process-exit / no-JSONL-writes used by
+    `wait_for_terminal_signals` to declare a node truly stalled. Clamped
+    to `[0, _MAX_QUIESCENCE_GRACE_SECS]`."""
+    raw = os.environ.get(ENV_QUIESCENCE_GRACE_SECS)
+    if raw is None:
+        return _DEFAULT_QUIESCENCE_GRACE_SECS
+    try:
+        v = float(raw)
+    except ValueError:
+        return _DEFAULT_QUIESCENCE_GRACE_SECS
+    if v < 0:
+        return _DEFAULT_QUIESCENCE_GRACE_SECS
+    return min(v, _MAX_QUIESCENCE_GRACE_SECS)
 
 
 def current_depth() -> int:
