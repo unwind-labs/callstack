@@ -53,6 +53,7 @@ from .results import (
     _unwrap_single,
 )
 from .session import PROJECTS_DIR, SessionLocator, SessionRef, encode_project_dir
+from .terminal_wait import wait_for_terminal_signals
 from .trace import TraceWriter, TreeStore
 
 
@@ -76,6 +77,8 @@ from .env import (  # noqa: E402
     ENV_OWN_SESSION,
     ENV_CLAUDE_SESSION,
     ENV_MAX_DEPTH,
+    read_finalize_wait_seconds,
+    read_quiescence_grace_seconds,
 )
 from .env import max_depth as _default_max_depth  # noqa: E402
 
@@ -160,6 +163,16 @@ class Caller:
         try:
             driver.resume(tree, token.session_id, reply)
         finally:
+            # Give late `op:return` / `op:yield` envelopes a chance to
+            # land on the child JSONL before sealing the report; nodes
+            # that miss the window become `Timeout` instead of being
+            # silently sealed as `running`. See PRD
+            # `prd-don-t-seal-report-yaml-virtual-harp.md`.
+            wait_for_terminal_signals(
+                tree,
+                wait_budget_seconds=read_finalize_wait_seconds(),
+                quiescence_grace_seconds=read_quiescence_grace_seconds(),
+            )
             reporter.finalize(tree)
         return _unwrap_single(_results_from_tree(tree)[0])
 
@@ -190,11 +203,29 @@ class Caller:
         try:
             tree = driver.run(parent, tasks, base_depth=depth, context=context)
         finally:
+            # If `driver.run` raised before assigning to `tree`, fall back
+            # to `driver.last_tree` (stamped immediately after the Tree
+            # object exists) so the reporter still gets a finalize pass.
+            # Without this fallback the frame would be left with whatever
+            # state the last `on_progress` tick recorded — typically
+            # `awaiting_turn` — and `frames._reconcile_orphan_states`
+            # would have to wait for the process to die before promoting
+            # it to "abandoned". With the fallback, the frame is sealed
+            # synchronously before the MCP boundary emits its tool_result.
+            if tree is None:
+                tree = driver.last_tree
             if tree is not None:
+                wait_for_terminal_signals(
+                    tree,
+                    wait_budget_seconds=read_finalize_wait_seconds(),
+                    quiescence_grace_seconds=read_quiescence_grace_seconds(),
+                )
                 reporter.finalize(tree)
-        # `tree is None` only when `driver.run` raised — the finally above
-        # already ran, and the exception is propagating; we never reach here
-        # in that case. The assert is for type narrowing.
+        # `tree is None` only reaches here when `driver.run` raised AND
+        # never even stamped a partial tree onto itself — extremely rare
+        # (would require failure inside `__init__`-level setup). The
+        # `finally` above already ran; the exception is propagating in
+        # that case so we never actually return.
         assert tree is not None
         return _results_from_tree(tree)
 

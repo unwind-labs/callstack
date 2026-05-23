@@ -241,7 +241,13 @@ class Driver:
     # swallowed so a broken reporter can't kill execution.
     on_progress: Optional[Callable[["Tree"], None]] = None
 
-    _current_tree: Optional["Tree"] = field(default=None, init=False, repr=False)
+    # Most recently constructed/resumed Tree; written by `run` and
+    # `resume` immediately after the Tree object exists. Exposed as a
+    # public attribute (not underscore-prefixed) so `Caller.run`'s
+    # finally-block fallback can seal a partial report when `run`
+    # raises after the tree exists but before returning — the fallback
+    # is the only consumer outside the driver itself.
+    last_tree: Optional["Tree"] = field(default=None, init=False, repr=False)
     # SEC-011: log the first on_progress failure with full traceback, then
     # set this flag so subsequent ticks swallow silently. Avoids drowning
     # stderr in identical errors on every state transition while still
@@ -280,7 +286,7 @@ class Driver:
         nodes = [self._new_node(task, context_mode=context, call_type=call_type)
                  for task in tasks]
         tree = Tree(root_session=parent, nodes=nodes, base_depth=base_depth)
-        self._current_tree = tree
+        self.last_tree = tree
         self._notify()
 
         if base_depth + 1 > self.max_depth:
@@ -353,7 +359,7 @@ class Driver:
         if leaf is None or not leaf.is_yielded_directly:
             raise RuntimeError(f"No yielded node with session_id={target_session_id}")
 
-        self._current_tree = tree
+        self.last_tree = tree
         self._notify()
 
         # Walk up to find this leaf's depth.
@@ -372,10 +378,10 @@ class Driver:
 
     def _notify(self) -> None:
         """Fire on_progress with the current tree. Never raises."""
-        if self.on_progress is None or self._current_tree is None:
+        if self.on_progress is None or self.last_tree is None:
             return
         try:
-            self.on_progress(self._current_tree)
+            self.on_progress(self.last_tree)
         except Exception:
             if not self._notify_failed:
                 # First failure: surface with traceback so the cause is
