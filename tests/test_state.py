@@ -166,6 +166,21 @@ class TestPredicates:
         assert not st.is_suspended(st.Done())
         assert not st.is_suspended(st.AwaitingChild(session_id="s", child_id="c"))
 
+    def test_eligible_for_abandonment(self):
+        """REVIEW-201: single shared policy used by the dict-shape and
+        Tree-shape abandonment walkers. Terminal kinds → False (nothing
+        to do). SUSPENDED kinds → False (AwaitingUser must NOT be
+        silently sealed; the previous dict walker had this bug).
+        Non-terminal non-suspended → True."""
+        # Terminal — already sealed.
+        for kind in ("done", "failed", "timeout", "abandoned"):
+            assert not st.is_eligible_for_abandonment(kind), kind
+        # Suspended — legitimately parked, must NOT be demoted.
+        assert not st.is_eligible_for_abandonment("awaiting_user")
+        # Non-terminal in-flight kinds — eligible.
+        for kind in ("pending", "awaiting_turn", "awaiting_child"):
+            assert st.is_eligible_for_abandonment(kind), kind
+
 
 # ---------- Bad transitions ----------
 

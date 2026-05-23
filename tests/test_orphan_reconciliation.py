@@ -240,6 +240,37 @@ def test_merged_report_status_settles_to_abandoned(tmp_path):
     )
 
 
+def test_reconcile_preserves_awaiting_user_nodes(tmp_path, monkeypatch):
+    """REVIEW-201 bug fix: the dict-shape walker used to consult only
+    `_TERMINAL_KINDS` and would happily rewrite an `awaiting_user` (a
+    legitimately YIELDED node parked for a user reply) to `abandoned`,
+    silently destroying the yield intent. The unified policy now skips
+    SUSPENDED kinds — confirm an AwaitingUser frame whose writer is dead
+    stays awaiting_user instead of getting demoted."""
+    ac._frames_cache_clear()
+    frames_dir = tmp_path / "_frames"
+    frames_dir.mkdir()
+
+    parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
+    yielded = Node(
+        id="yyyyyyyy", task="ask user",
+        state=st.AwaitingUser(session_id="sess-yielded", question="ok?"),
+        session_id="sess-yielded",
+    )
+    tree = Tree(root_session=parent, nodes=[yielded], base_depth=0)
+
+    _write_frame(frames_dir, frame_key=_ROOT_FRAME_KEY, tree=tree,
+                 writer_pid=99999)  # nonexistent — guaranteed dead
+    monkeypatch.setattr(frames_mod, "_pid_alive", lambda _pid: False)
+
+    loaded = _load_frames(frames_dir)
+    [node] = loaded[_ROOT_FRAME_KEY][0]["tree"]["nodes"]
+    assert node["state"]["kind"] == "awaiting_user", (
+        "AwaitingUser nodes are SUSPENDED (parked for a user reply), not "
+        "non-terminal-and-stuck. The abandonment policy must skip them."
+    )
+
+
 def test_status_label_maps_abandoned_kind():
     """The new synthetic kind must be in `_STATUS_BY_KIND` so callers of
     `status_label` (driver, frames merge) get a real label rather than

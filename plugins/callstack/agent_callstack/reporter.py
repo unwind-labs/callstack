@@ -39,6 +39,7 @@ from .frames import (
     _load_frames,
     _merge_raw_nodes,
     _walk_tree,
+    mark_abandoned_in_dict_nodes,
 )
 from .invocation_ctx import _InvocationContext, _utc_now_iso
 
@@ -462,43 +463,37 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
 
 # ---------- abandonment helpers (fix #2 + #3) ----------
 #
-# Both the MCP-boundary guard (fix #2) and the shutdown/signal handler
-# (fix #3) need to convert non-terminal node state into a synthetic
-# terminal kind so the merged report stops rendering an in-progress
-# spinner. The two paths differ in *what they have access to*:
+# REVIEW-201: three near-clone implementations of "rewrite non-terminal
+# node state to the synthetic Abandoned kind" used to live across the
+# codebase (one each in frames.py and two in this module). They now
+# share a single policy — `state.is_eligible_for_abandonment(kind)` —
+# and a single dict-shape walker — `frames.mark_abandoned_in_dict_nodes`.
 #
-#   - Fix #2 runs at the MCP server's tool boundary. It only has the
-#     invocation's log_dir + invoke_id; the tree is gone (it lived in
-#     the worker thread). So it operates on frame YAML files on disk.
-#
-#   - Fix #3 runs at process shutdown. The tree is still in memory on
-#     each registered `_LiveReporter`. Operating on the in-memory tree
-#     keeps the abandonment write consistent with whatever the reporter
-#     would have written, and skips one disk round-trip.
-#
-# Both ultimately produce a frame whose nodes are tagged with the
-# synthetic `Abandoned` terminal kind defined in state.py.
+# Only one local walker survives here: `_abandon_tree_nodes_in_place`,
+# which operates on the in-memory `Tree` shape used by the shutdown
+# emergency handler. Frame-YAML callers (this module's
+# `_finalize_own_frames`, frames.py's `_reconcile_orphan_states`) call
+# the dict-shape walker directly.
 
 
 def _abandon_tree_nodes_in_place(tree: Tree, *, reason: str) -> int:
-    """Walk every node in `tree`; for any whose state is non-terminal
-    (and not suspended awaiting user input), replace it with
-    :class:`state.Abandoned` and mirror the error onto ``node.error`` so
-    the merged-report graft surfaces it.
+    """Walk every node in `tree`; for any whose state is eligible for
+    abandonment per :func:`state.is_eligible_for_abandonment`, replace
+    it with :class:`state.Abandoned` and mirror the error onto
+    ``node.error`` so the merged-report graft surfaces it.
 
-    Returns the number of nodes mutated. Skips terminal and
-    ``AwaitingUser`` nodes (the latter is parked legitimately waiting
-    for a user reply — sealing it as abandoned would lose that intent)."""
+    Returns the number of nodes mutated. Tree-shape counterpart of
+    :func:`frames.mark_abandoned_in_dict_nodes`; both consult the same
+    eligibility predicate."""
     from .driver import Node as _Node
 
     changed = 0
     def walk(node: _Node) -> None:
         nonlocal changed
         s = node.state
-        if not _state.is_terminal(s) and not _state.is_suspended(s):
+        if _state.is_eligible_for_abandonment(s.kind):
             sid = getattr(s, "session_id", None) or node.session_id
-            kind = getattr(s, "kind", "unknown")
-            err = f"{reason} (state was {kind!r})"
+            err = f"{reason} (state was {s.kind!r})"
             node.state = _state.Abandoned(error=err, session_id=sid)
             node.error = err
             changed += 1
@@ -509,41 +504,10 @@ def _abandon_tree_nodes_in_place(tree: Tree, *, reason: str) -> int:
     return changed
 
 
-def _abandon_frame_nodes_in_place(nodes: list, *, reason: str) -> int:
-    """Dict-shape counterpart to :func:`_abandon_tree_nodes_in_place`.
-
-    Operates on the raw ``Node.to_dict()`` payload loaded from a frame
-    YAML — used by :func:`_finalize_own_frames` so the MCP boundary can
-    fix frames without needing to round-trip them through
-    `Tree.from_dict`. Returns the number of node dicts mutated.
-
-    Does NOT touch nodes whose ``state.kind`` is terminal or
-    ``awaiting_user`` (consistent with the tree-shape variant)."""
-    changed = 0
-    for n in nodes:
-        if not isinstance(n, dict):
-            continue
-        state = n.get("state")
-        if isinstance(state, dict):
-            kind = state.get("kind")
-            if (isinstance(kind, str)
-                    and kind not in _state.TERMINAL
-                    and kind not in _state.SUSPENDED):
-                err = f"{reason} (state was {kind!r})"
-                # Preserve session_id on the State payload so downstream
-                # consumers reading the dict can still chase it.
-                sid = state.get("session_id") or n.get("session_id")
-                new_state: dict = {"kind": "abandoned", "error": err}
-                if sid:
-                    new_state["session_id"] = sid
-                n["state"] = new_state
-                if not n.get("error"):
-                    n["error"] = err
-                changed += 1
-        children = n.get("children")
-        if isinstance(children, list):
-            changed += _abandon_frame_nodes_in_place(children, reason=reason)
-    return changed
+# Backwards-compat alias for tests + external callers that pulled
+# the dict-shape helper from this module. The canonical name now lives
+# in `frames` (REVIEW-201).
+_abandon_frame_nodes_in_place = mark_abandoned_in_dict_nodes
 
 
 def _finalize_own_frames(log_dir: Path, invoke_id: str, *,
@@ -588,7 +552,7 @@ def _finalize_own_frames(log_dir: Path, invoke_id: str, *,
             nodes = tree.get("nodes")
             if not isinstance(nodes, list):
                 continue
-            if _abandon_frame_nodes_in_place(nodes, reason=reason) > 0:
+            if mark_abandoned_in_dict_nodes(nodes, reason=reason) > 0:
                 _atomic_yaml_write(frame_path, payload)
                 rewrote_any = True
     return rewrote_any

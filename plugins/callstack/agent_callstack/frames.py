@@ -28,9 +28,9 @@ from typing import Optional
 import yaml
 
 from . import session
+from . import state as _state
 from .driver import Node, Tree
 from .env import read_orphan_ttl_seconds
-from .state import TERMINAL as _TERMINAL_KINDS
 
 
 _ROOT_FRAME_KEY = "root"
@@ -187,30 +187,45 @@ def _reconcile_orphan_states(frames_by_key: dict[str, list[dict]]) -> None:
             nodes = tree.get("nodes")
             if not isinstance(nodes, list):
                 continue
-            _abandon_non_terminal_nodes(nodes, writer_pid=pid)
+            mark_abandoned_in_dict_nodes(
+                nodes,
+                reason=f"writer pid {pid} is no longer alive",
+            )
 
 
-def _abandon_non_terminal_nodes(nodes: list, *, writer_pid: int) -> None:
-    """Recurse `nodes` (raw `Node.to_dict()` shape); for any node whose
-    `state.kind` is non-terminal, rewrite the kind to ``"abandoned"`` and
-    stamp a human-readable error message on the node so the merged report
-    surfaces *why* it stopped advancing."""
+def mark_abandoned_in_dict_nodes(nodes: list, *, reason: str) -> int:
+    """REVIEW-201: single canonical walker for the frame-YAML (dict)
+    shape. Consults `state.is_eligible_for_abandonment` so the policy
+    stays in sync with the in-memory Tree variant in `reporter.py`.
+
+    Recursively walks `nodes` (raw `Node.to_dict()` payload); for any
+    node whose `state.kind` is eligible, rewrites it to ``"abandoned"``,
+    preserves the original `session_id`, and stamps a human-readable
+    error onto both `state` and the top-level `node.error` so the merged
+    report surfaces *why* it stopped advancing. Returns the count of
+    nodes mutated."""
+    changed = 0
     for n in nodes:
         if not isinstance(n, dict):
             continue
         state = n.get("state")
         if isinstance(state, dict):
             kind = state.get("kind")
-            if isinstance(kind, str) and kind not in _TERMINAL_KINDS:
-                state["kind"] = "abandoned"
+            if (isinstance(kind, str)
+                    and _state.is_eligible_for_abandonment(kind)):
+                err = f"abandoned: {reason} (state was {kind!r})"
+                sid = state.get("session_id") or n.get("session_id")
+                new_state: dict = {"kind": "abandoned", "error": err}
+                if sid:
+                    new_state["session_id"] = sid
+                n["state"] = new_state
                 if not n.get("error"):
-                    n["error"] = (
-                        f"abandoned: writer pid {writer_pid} is no longer "
-                        f"alive (state was {kind!r})"
-                    )
+                    n["error"] = err
+                changed += 1
         children = n.get("children")
         if isinstance(children, list):
-            _abandon_non_terminal_nodes(children, writer_pid=writer_pid)
+            changed += mark_abandoned_in_dict_nodes(children, reason=reason)
+    return changed
 
 
 def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:

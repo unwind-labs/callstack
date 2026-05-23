@@ -80,9 +80,42 @@ class Failed:
     kind: Literal["failed"] = "failed"
 
 
-State = Union[Pending, AwaitingTurn, AwaitingChild, AwaitingUser, Done, Failed]
+@dataclass(frozen=True)
+class Timeout:
+    """Terminal state recorded when finalize() waited for a late terminal
+    envelope on the child JSONL and never received one. Distinct from
+    Failed so reports can distinguish "the child errored" from "we gave
+    up waiting for the child's envelope"."""
+    error: str = "wait-for-terminal-envelope budget elapsed"
+    session_id: Optional[str] = None
+    kind: Literal["timeout"] = "timeout"
 
-TERMINAL = ("done", "failed")
+
+@dataclass(frozen=True)
+class Abandoned:
+    """Synthetic terminal state used when an in-flight node must be
+    sealed by something *other* than its own state machine. Two producers:
+
+    1. Orphan reconciliation (frames._reconcile_orphan_states), when a
+       frame's writer pid is no longer alive (the writer crashed before
+       it could record its own terminal envelope).
+    2. Shutdown hardening (reporter._flush_active_reporters), when the
+       process is being torn down (atexit / SIGTERM / SIGINT) with
+       non-terminal nodes still in flight.
+
+    Distinct from Failed because no LLM-side error occurred — the driver
+    simply never got the chance to record the terminal envelope. Distinct
+    from Timeout because we did not even wait for a JSONL envelope; the
+    decision was made by an external signal."""
+    error: str
+    session_id: Optional[str] = None
+    kind: Literal["abandoned"] = "abandoned"
+
+
+State = Union[Pending, AwaitingTurn, AwaitingChild, AwaitingUser, Done, Failed,
+              Timeout, Abandoned]
+
+TERMINAL = ("done", "failed", "timeout", "abandoned")
 SUSPENDED = ("awaiting_user",)  # node is parked, waiting for an out-of-band event
 
 
@@ -94,10 +127,31 @@ def is_suspended(state: State) -> bool:
     return state.kind in SUSPENDED
 
 
+def is_eligible_for_abandonment(kind: str) -> bool:
+    """REVIEW-201: single policy shared by every "seal non-terminal nodes
+    when something went wrong upstream" code path (frames orphan
+    reconciliation, MCP boundary guard, shutdown/signal handler).
+
+    Returns True iff `kind` is neither already terminal (nothing to do)
+    nor SUSPENDED — ``AwaitingUser`` is legitimately parked waiting for a
+    user reply; sealing it as abandoned would destroy that intent.
+
+    Takes a state-kind string so it works against both the Tree-shape
+    (``state.kind`` via ``getattr``) and the dict-shape (``state["kind"]``)
+    walks. Both walkers consult this predicate so they can't drift."""
+    return kind not in TERMINAL and kind not in SUSPENDED
+
+
 # Canonical mapping from state kind → externally-visible status label.
 # Owned here because state.py is the source of truth for state kinds;
 # both the runtime (driver.Node.status) and the merged report (frames.py)
 # consume the same labels.
+#
+# "abandoned" is a synthetic terminal kind never produced by step(); the
+# merge layer (frames.py) rewrites a frame's non-terminal node states to
+# this when the frame's owning writer process is no longer alive. Distinct
+# from "failed" so consumers can tell "the agent errored" from "the writer
+# died before producing a terminal envelope."
 _STATUS_BY_KIND = {
     "pending": "pending",
     "awaiting_turn": "running",
@@ -105,6 +159,8 @@ _STATUS_BY_KIND = {
     "awaiting_user": "yielded",
     "done": "complete",
     "failed": "error",
+    "timeout": "timeout",
+    "abandoned": "abandoned",
 }
 
 
