@@ -15,6 +15,8 @@ Nothing here performs I/O outside of `_load_frames` (read + stat) and
 """
 from __future__ import annotations
 
+import copy
+import os
 import re
 import threading
 from collections import OrderedDict
@@ -25,6 +27,7 @@ import yaml
 
 from . import session
 from .driver import Node, Tree
+from .state import TERMINAL as _TERMINAL_KINDS
 
 
 _ROOT_FRAME_KEY = "root"
@@ -84,6 +87,78 @@ def _cache_put_dir(path: Path, value: tuple[int, dict]) -> None:
         _FRAMES_DIR_CACHE.popitem(last=False)
 
 
+def _pid_alive(pid: int) -> bool:
+    """True if signal 0 reaches `pid`. False on ESRCH (process gone) or
+    invalid pid; True on EPERM (process exists but we lack permission).
+
+    Only a liveness probe — does not verify process identity. A reused PID
+    is treated as "alive," which is the safe direction (we'd skip
+    reconciliation rather than falsely mark a live invocation as
+    abandoned)."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _reconcile_orphan_states(frames_by_key: dict[str, list[dict]]) -> None:
+    """Walk every frame; if its `writer_pid` field names a process that is
+    no longer alive, promote any non-terminal node state inside that frame
+    to the synthetic terminal kind ``"abandoned"``.
+
+    Mutates the frame dicts in place. Idempotent — once a frame is
+    reconciled, subsequent passes are no-ops (dead pids stay dead;
+    "abandoned" kinds are already terminal).
+
+    Frames with no `writer_pid` field (older runs, externally-produced
+    frames) are skipped: we can't decide liveness, so we leave the frame
+    alone."""
+    for frames in frames_by_key.values():
+        for frame in frames:
+            pid = frame.get("writer_pid")
+            if not isinstance(pid, int):
+                continue
+            if _pid_alive(pid):
+                continue
+            tree = frame.get("tree")
+            if not isinstance(tree, dict):
+                continue
+            nodes = tree.get("nodes")
+            if not isinstance(nodes, list):
+                continue
+            _abandon_non_terminal_nodes(nodes, writer_pid=pid)
+
+
+def _abandon_non_terminal_nodes(nodes: list, *, writer_pid: int) -> None:
+    """Recurse `nodes` (raw `Node.to_dict()` shape); for any node whose
+    `state.kind` is non-terminal, rewrite the kind to ``"abandoned"`` and
+    stamp a human-readable error message on the node so the merged report
+    surfaces *why* it stopped advancing."""
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        state = n.get("state")
+        if isinstance(state, dict):
+            kind = state.get("kind")
+            if isinstance(kind, str) and kind not in _TERMINAL_KINDS:
+                state["kind"] = "abandoned"
+                if not n.get("error"):
+                    n["error"] = (
+                        f"abandoned: writer pid {writer_pid} is no longer "
+                        f"alive (state was {kind!r})"
+                    )
+        children = n.get("children")
+        if isinstance(children, list):
+            _abandon_non_terminal_nodes(children, writer_pid=writer_pid)
+
+
 def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
     """Load every frame file under ``frames_dir``, grouped by ``frame_key``.
 
@@ -94,6 +169,13 @@ def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
 
     Backed by a stat-keyed cache (PERF-B): re-parsing every YAML on every
     reporter tick was the second-largest cost after the merge rebuild.
+
+    Contract — the returned structure is fully owned by the caller and
+    safe to mutate (including the inner frame dicts and their nested
+    ``tree``/``state`` fields). The internal caches (parsed-frame and
+    dir-mtime) deep-copy on retrieval to keep that promise: orphan
+    reconciliation, graft helpers, and tests can all rewrite frame
+    contents without poisoning subsequent loads.
     """
     import sys
     out: dict[str, list[dict]] = {}
@@ -111,8 +193,15 @@ def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
             cached = _FRAMES_DIR_CACHE.get(frames_dir)
             if cached is not None and cached[0] == dir_mtime:
                 _FRAMES_DIR_CACHE.move_to_end(frames_dir)
-                # Copy dict + value lists so callers can mutate freely.
-                return {k: list(v) for k, v in cached[1].items()}
+                # Deep-copy so the caller can mutate frame contents freely
+                # (orphan reconciliation rewrites `state.kind`; the merge
+                # layer grafts children in place) without corrupting the
+                # cached snapshot — restoring the documented "callers can
+                # mutate freely" contract. The copy is cheap relative to
+                # the YAML parse it replaces.
+                snapshot = copy.deepcopy(cached[1])
+                _reconcile_orphan_states(snapshot)
+                return snapshot
     loaded = 0
     for p in frames_dir.glob("*.yaml"):
         if loaded >= _MAX_FRAMES_PER_LOAD:
@@ -135,7 +224,11 @@ def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
             cached = _FRAMES_PARSED_CACHE.get(p)
             if cached is not None and (cached[0], cached[1]) == stat_key:
                 _FRAMES_PARSED_CACHE.move_to_end(p)
-                d = cached[2]
+                # Deep-copy so downstream mutations (orphan reconciliation,
+                # graft helpers) don't bleed back into the parsed-frame
+                # cache. yaml.safe_load already returns fresh dicts on a
+                # parse-miss; we keep the invariant uniform.
+                d = copy.deepcopy(cached[2])
         if d is None:
             try:
                 parsed = yaml.safe_load(p.read_text())
@@ -165,12 +258,17 @@ def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
     for key in out:
         out[key].sort(key=lambda f: str(f.get("started_at") or ""))
     # PERF-104: cache the aggregated result under the dir's mtime so a
-    # quiet tick reuses it. Deep-copy lists so a caller mutating its
-    # result can't corrupt the cached snapshot.
+    # quiet tick reuses it. Deep-copy so the cache stores a frozen
+    # snapshot — the caller (and `_reconcile_orphan_states` below) will
+    # mutate `out` in place; the cached copy stays pristine.
     if dir_mtime is not None:
-        snapshot = {k: list(v) for k, v in out.items()}
         with _FRAMES_DIR_CACHE_LOCK:
-            _cache_put_dir(frames_dir, (dir_mtime, snapshot))
+            _cache_put_dir(frames_dir, (dir_mtime, copy.deepcopy(out)))
+    # Reconciliation runs on `out`, the caller-side copy. The dir-mtime
+    # cache hit path above re-runs reconciliation on each retrieval; the
+    # PID check per node is cheap relative to the YAML parse we already
+    # skipped, and idempotent rewrites are harmless.
+    _reconcile_orphan_states(out)
     return out
 
 
@@ -277,6 +375,10 @@ def _status_of_nodes(nodes: list[dict]) -> str:
         return "yielded"
     if statuses == {"error"}:
         return "error"
+    if statuses == {"timeout"}:
+        return "timeout"
+    if statuses == {"abandoned"}:
+        return "abandoned"
     return "mixed"
 
 
