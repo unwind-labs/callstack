@@ -64,6 +64,20 @@ def _shutdown_run_pool() -> None:
         pool.shutdown(wait=True, cancel_futures=False)
 
 
+def _classify_upstream_failure(text: str) -> Optional[str]:
+    """If `text` is a Claude Code synthetic upstream-rate-limit message,
+    return a typed error string for `st.TurnFailed`. Otherwise None.
+
+    Anchored on `"API Error"` so the signature isn't matched in normal
+    assistant prose. When a second synthetic shows up in traces, this
+    grows back into a table — until then a direct check is clearer than
+    a one-row dispatcher."""
+    if ("API Error" in text
+            and "Server is temporarily limiting requests" in text):
+        return f"upstream_rate_limited: {text.strip()[:500]}"
+    return None
+
+
 # ---------- Tree of execution nodes ----------
 
 @dataclass
@@ -639,8 +653,17 @@ class Driver:
         envelope = parse_envelope(result.text)
         if envelope is None:
             # No parseable envelope — child crashed mid-thought, was cut off,
-            # or emitted an unknown opcode. Surface as a turn failure rather
-            # than silently mapping to Done(result=None).
+            # or emitted an unknown opcode. Before surfacing the generic
+            # failure, see if the text is a recognized synthetic from Claude
+            # Code (e.g. upstream rate-limit) so the parent agent gets an
+            # actionable typed error instead of a vague "no envelope".
+            classified = _classify_upstream_failure(result.text)
+            if classified is not None:
+                return st.TurnFailed(
+                    error=classified,
+                    session_id=result.session_id,
+                    partial=result.text,
+                )
             return st.TurnFailed(
                 error="child emitted no parseable envelope",
                 session_id=result.session_id,
@@ -730,6 +753,8 @@ _STATE_TYPES = {
     "awaiting_user": st.AwaitingUser,
     "done": st.Done,
     "failed": st.Failed,
+    "timeout": st.Timeout,
+    "abandoned": st.Abandoned,
 }
 
 
@@ -762,6 +787,14 @@ def _denormalize(node: Node) -> None:
         node.summary = s.summary
         node.suggested_next = s.suggested_next
     elif isinstance(s, st.Failed):
+        if s.session_id:
+            node.session_id = s.session_id
+        node.error = s.error
+    elif isinstance(s, st.Timeout):
+        if s.session_id:
+            node.session_id = s.session_id
+        node.error = s.error
+    elif isinstance(s, st.Abandoned):
         if s.session_id:
             node.session_id = s.session_id
         node.error = s.error
