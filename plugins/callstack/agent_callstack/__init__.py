@@ -88,7 +88,6 @@ from .env import (  # noqa: E402
     ENV_CLAUDE_SESSION,
     ENV_MAX_DEPTH,
     read_finalize_wait_seconds,
-    read_quiescence_grace_seconds,
 )
 from .env import max_depth as _default_max_depth  # noqa: E402
 
@@ -181,7 +180,6 @@ class Caller:
             wait_for_terminal_signals(
                 tree,
                 wait_budget_seconds=read_finalize_wait_seconds(),
-                quiescence_grace_seconds=read_quiescence_grace_seconds(),
             )
             reporter.finalize(tree)
         return _unwrap_single(_results_from_tree(tree)[0])
@@ -228,7 +226,6 @@ class Caller:
                 wait_for_terminal_signals(
                     tree,
                     wait_budget_seconds=read_finalize_wait_seconds(),
-                    quiescence_grace_seconds=read_quiescence_grace_seconds(),
                 )
                 reporter.finalize(tree)
         # `tree is None` only reaches here when `driver.run` raised AND

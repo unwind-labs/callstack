@@ -173,6 +173,36 @@ class TestRunSingleTask:
         assert node.status == "error"
         assert "timed out" in node.error
 
+    def test_upstream_rate_limit_classified(self, tmp_path, parent_session):
+        """When the child returns Claude Code's synthetic rate-limit text,
+        the driver must surface it as `upstream_rate_limited:` rather than
+        the generic envelope-parse failure — so the parent agent can act
+        on a transient upstream condition."""
+        synthetic = ("API Error: Server is temporarily limiting requests "
+                     "(not your usage limit) · Rate limited")
+        ch = ScriptedChannel().respond(synthetic, "child-rl")
+        driver = _make_driver(tmp_path, ch)
+
+        tree = driver.run(parent_session, ["task"])
+
+        node = tree.nodes[0]
+        assert node.status == "error"
+        assert node.error.startswith("upstream_rate_limited:")
+        assert "Server is temporarily limiting requests" in node.error
+
+    def test_unparseable_non_rate_limit_falls_through(self, tmp_path, parent_session):
+        """Plain garbage that isn't a recognized synthetic must still surface
+        the existing 'no parseable envelope' error — regression guard that
+        the new classifier branch didn't widen."""
+        ch = ScriptedChannel().respond("hello, no envelope here", "child-junk")
+        driver = _make_driver(tmp_path, ch)
+
+        tree = driver.run(parent_session, ["task"])
+
+        node = tree.nodes[0]
+        assert node.status == "error"
+        assert node.error == "child emitted no parseable envelope"
+
 
 # ---------- parallel root tasks ----------
 
@@ -619,3 +649,38 @@ class TestTreeIndexMissingClone:
             f"C's parent_file leaked to grandparent: {idx.parent_file_of[id(c)]} "
             f"(expected root sentinel {root_file})"
         )
+
+
+# ---------- Timeout state (PRD: don't seal report.yaml prematurely) ----------
+
+class TestTimeoutState:
+    """Timeout is the explicit terminal state recorded by
+    `wait_for_terminal_signals` when the wait budget elapses without
+    observing a child-side `op:return` / `op:yield` envelope. Pin its
+    on-disk round-trip and status mapping so a future refactor can't
+    silently collapse it back into `Failed` (which would lose the
+    "we gave up vs. the child errored" distinction)."""
+
+    def test_status_label_is_timeout(self):
+        s = st.Timeout(error="budget elapsed", session_id="sess-x")
+        assert st.status_label(s) == "timeout"
+
+    def test_is_terminal_true(self):
+        # Drivers, reporters, and the wait helper all branch on
+        # `st.is_terminal` to decide whether to keep stepping. A
+        # Timeout that isn't terminal would loop forever.
+        assert st.is_terminal(st.Timeout())
+
+    def test_round_trips_through_node_to_from_dict(self):
+        node = Node(
+            id="abc123ef0000000000000000000000aa",
+            task="t",
+            state=st.Timeout(error="elapsed", session_id="sess-x"),
+            session_id="sess-x",
+        )
+        d = node.to_dict()
+        round = Node.from_dict(d)
+        assert isinstance(round.state, st.Timeout)
+        assert round.state.error == "elapsed"
+        assert round.state.session_id == "sess-x"
+        assert round.status == "timeout"

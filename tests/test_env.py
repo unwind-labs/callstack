@@ -108,25 +108,6 @@ class TestFinalizeWaitSeconds:
         assert env.read_finalize_wait_seconds() == pytest.approx(120.0)
 
 
-class TestQuiescenceGraceSeconds:
-    def test_default(self, monkeypatch):
-        monkeypatch.delenv(env.ENV_QUIESCENCE_GRACE_SECS, raising=False)
-        assert env.read_quiescence_grace_seconds() == pytest.approx(2.0)
-
-    def test_explicit_value(self, monkeypatch):
-        monkeypatch.setenv(env.ENV_QUIESCENCE_GRACE_SECS, "0.5")
-        assert env.read_quiescence_grace_seconds() == pytest.approx(0.5)
-
-    def test_huge_value_clamped(self, monkeypatch):
-        monkeypatch.setenv(env.ENV_QUIESCENCE_GRACE_SECS, "10000")
-        assert env.read_quiescence_grace_seconds() == 60.0
-
-    @pytest.mark.parametrize("bad", ["-1", "abc"])
-    def test_invalid_returns_default(self, bad, monkeypatch):
-        monkeypatch.setenv(env.ENV_QUIESCENCE_GRACE_SECS, bad)
-        assert env.read_quiescence_grace_seconds() == pytest.approx(2.0)
-
-
 class TestOrphanTtlSeconds:
     def test_default(self, monkeypatch):
         monkeypatch.delenv(env.ENV_ORPHAN_TTL_SECS, raising=False)
@@ -167,5 +148,4 @@ def test_env_constants_match_string_literals():
     assert env.ENV_MAX_IN_FLIGHT_TURNS == "CALLSTACK_MAX_IN_FLIGHT_TURNS"
     assert env.ENV_REPORT_DEBOUNCE_SECS == "CALLSTACK_REPORT_DEBOUNCE_SECS"
     assert env.ENV_FINALIZE_WAIT_SECS == "CALLSTACK_FINALIZE_WAIT_SECONDS"
-    assert env.ENV_QUIESCENCE_GRACE_SECS == "CALLSTACK_QUIESCENCE_GRACE_SECONDS"
     assert env.ENV_ORPHAN_TTL_SECS == "CALLSTACK_ORPHAN_TTL_SECONDS"

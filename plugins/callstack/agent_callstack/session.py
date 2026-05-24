@@ -11,8 +11,11 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+from .protocol import Envelope, parse_envelope
 
 
 CLAUDE_DIR = Path.home() / ".claude"
@@ -283,6 +286,48 @@ class SessionLocator:
         ref = SessionRef(session_id=Path(best_path).stem, file=Path(best_path))
         self._mru_cache[key] = (dir_mtime_ns, ref)
         return ref
+
+
+def envelope_from_session_record(record: dict) -> Optional[Envelope]:
+    """Extract a control envelope from one Claude Code session JSONL record.
+
+    Claude Code records assistant turns under ``message.content`` as a list
+    of typed blocks; the ``op:return`` / ``op:yield`` / ``op:call`` envelope
+    lives inside a ``text`` block as a fenced ```json fence. Only assistant
+    rows are considered — a user/system row that happens to quote an
+    envelope must not be mistaken for the agent's own terminal signal.
+
+    Reuses ``protocol.parse_envelope`` so the envelope grammar stays
+    single-sourced; this function owns only the session-record *shape*.
+    """
+    msg = record.get("message")
+    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+        return None
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        text = block.get("text")
+        if not isinstance(text, str):
+            continue
+        env = parse_envelope(text)
+        if env is not None:
+            return env
+    return None
+
+
+def session_record_epoch(record: dict) -> Optional[float]:
+    """Epoch seconds for a session record's ISO-8601 ``timestamp`` field
+    (e.g. ``2026-05-18T15:49:09.206Z``), or None if absent/unparseable."""
+    ts = record.get("timestamp")
+    if not isinstance(ts, str) or not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts).timestamp()
+    except ValueError:
+        return None
 
 
 def _extract_cwd(session_file: Path) -> Optional[str]:
