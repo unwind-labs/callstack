@@ -792,15 +792,10 @@ def _denormalize(node: Node) -> None:
         node.result = s.result
         node.summary = s.summary
         node.suggested_next = s.suggested_next
-    elif isinstance(s, st.Failed):
-        if s.session_id:
-            node.session_id = s.session_id
-        node.error = s.error
-    elif isinstance(s, st.Timeout):
-        if s.session_id:
-            node.session_id = s.session_id
-        node.error = s.error
-    elif isinstance(s, st.Abandoned):
+    elif isinstance(s, (st.Failed, st.Timeout, st.Abandoned)):
+        # All three carry `error` + optional `session_id` and denormalize
+        # identically; they differ only in how they were produced (LLM
+        # error / wait-budget expiry / external seal).
         if s.session_id:
             node.session_id = s.session_id
         node.error = s.error

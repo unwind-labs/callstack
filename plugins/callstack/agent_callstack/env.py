@@ -81,11 +81,6 @@ ENV_REPORT_DEBOUNCE_SECS = "CALLSTACK_REPORT_DEBOUNCE_SECS"
 # sealing the report. 0 = seal immediately (legacy behavior).
 ENV_FINALIZE_WAIT_SECS = "CALLSTACK_FINALIZE_WAIT_SECONDS"
 
-# Quiescence grace window applied alongside process-exit detection: once
-# the child's pooled subprocess has been observed dead, wait this many
-# seconds of no JSONL writes before giving up on its envelope.
-ENV_QUIESCENCE_GRACE_SECS = "CALLSTACK_QUIESCENCE_GRACE_SECONDS"
-
 # Wall-clock TTL on a frame's `writer_pid` liveness check
 # (frames._reconcile_orphan_states). A frame older than this wall-clock
 # age is treated as abandoned regardless of `os.kill(pid, 0)` — defense
@@ -103,8 +98,6 @@ _DEFAULT_MAX_CONCURRENT_FORKS = 8
 _DEFAULT_REPORT_DEBOUNCE_SECS = 0.25
 _DEFAULT_FINALIZE_WAIT_SECS = 120.0
 _MAX_FINALIZE_WAIT_SECS = 600.0
-_DEFAULT_QUIESCENCE_GRACE_SECS = 2.0
-_MAX_QUIESCENCE_GRACE_SECS = 60.0
 # 2 × Claude Code's default MCP tool timeout (~10 min) — past this point
 # we declare a writer dead regardless of what `os.kill(pid, 0)` says.
 _DEFAULT_ORPHAN_TTL_SECS = 1200.0
@@ -225,22 +218,6 @@ def read_orphan_ttl_seconds() -> float:
     if v < 0:
         return _DEFAULT_ORPHAN_TTL_SECS
     return min(v, _MAX_ORPHAN_TTL_SECS)
-
-
-def read_quiescence_grace_seconds() -> float:
-    """Grace window after process-exit / no-JSONL-writes used by
-    `wait_for_terminal_signals` to declare a node truly stalled. Clamped
-    to `[0, _MAX_QUIESCENCE_GRACE_SECS]`."""
-    raw = os.environ.get(ENV_QUIESCENCE_GRACE_SECS)
-    if raw is None:
-        return _DEFAULT_QUIESCENCE_GRACE_SECS
-    try:
-        v = float(raw)
-    except ValueError:
-        return _DEFAULT_QUIESCENCE_GRACE_SECS
-    if v < 0:
-        return _DEFAULT_QUIESCENCE_GRACE_SECS
-    return min(v, _MAX_QUIESCENCE_GRACE_SECS)
 
 
 def current_depth() -> int:
