@@ -265,6 +265,8 @@ Orchestrator validates all 6 expected values across the three returned summaries
 
 Every `op: call tasks=[…]` with multiple entries is a **parallel fan-out** — the runtime spawns one forked subprocess per sibling and runs them concurrently under the `CALLSTACK_MAX_CONCURRENT_FORKS` semaphore. Each sibling independently supports the full `call`/`yield`/`return` protocol, so a parallel branch can itself fan out (depth 2 inside `task-c`), pause for user input, or return — without blocking its siblings. The 3-level deep nesting under `task-c` (orchestrator → c → e → {g, h}) shows that parallel batches compose: a sibling at any depth can become the parent of its own parallel batch.
 
+> **Concurrency is capped per level, not globally.** Each forked child runs its own `agent_callstack` runtime, so `CALLSTACK_MAX_CONCURRENT_FORKS` bounds fan-out independently at every depth rather than across the whole tree. There is no cross-process deadlock — a parent never holds a concurrency slot while its children run — but a tree that is both **wide and deep** can hold many `claude` subprocesses live at once, each with its own memory footprint. Tune `CALLSTACK_MAX_CONCURRENT_FORKS` and `CALLSTACK_MAX_DEPTH` (see [Configuration](#configuration)) if you fan out aggressively.
+
 Each `task-*` node is a Claude Code Skill at `examples/parallel_calls/.claude/skills/task-*/SKILL.md`. `/call` invokes them by name, and any Skill is free to itself `/call` other Skills — Skills become the "functions" in the call stack: small, named, composable units the orchestrator wires together.
 
 ## How it works
