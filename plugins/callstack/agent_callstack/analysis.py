@@ -282,7 +282,12 @@ def _parse_ts(ts: Optional[str]) -> Optional[datetime]:
 
 def _content_preview(obj: dict) -> tuple[str, Optional[str]]:
     """Extract a flat text preview and a tool name (if any) from a message."""
-    msg = obj.get("message") or {}
+    # Guard non-dict `message` (e.g. a JSON string) the same way
+    # session_messages() does: `or {}` only catches falsy values, so a
+    # truthy non-dict would reach msg.get(...) and raise AttributeError.
+    msg = obj.get("message")
+    if not isinstance(msg, dict):
+        return "", None
     if isinstance(msg.get("content"), str):
         return msg["content"][:200], None
     if isinstance(msg.get("content"), list):

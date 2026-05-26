@@ -214,6 +214,18 @@ class TestContentPreview:
     def test_missing_message_returns_empty(self):
         assert _content_preview({}) == ("", None)
 
+    def test_non_dict_message_does_not_crash(self):
+        """A truthy non-dict `message` (e.g. a JSON string) must degrade to
+        empty, not raise: `or {}` only catches falsy values, so without an
+        isinstance guard msg.get(...) would AttributeError on a str."""
+        assert _content_preview({"message": "just a string"}) == ("", None)
+
+    def test_dict_message_without_content_falls_through(self):
+        """A dict message whose content is absent (neither str nor list) must
+        degrade to empty via the final fallthrough — exercised separately from
+        the missing-message case, which now short-circuits at the dict guard."""
+        assert _content_preview({"message": {"role": "user"}}) == ("", None)
+
     def test_text_is_truncated_to_200_chars(self):
         long = "x" * 500
         text, _ = _content_preview({"message": {"content": long}})
