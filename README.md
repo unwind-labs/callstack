@@ -316,7 +316,7 @@ The parent asks the user, then calls `resume(resume_session="abc-123", user_repl
 The child runs, does its work, and emits exactly one JSON envelope wrapped in a fenced ` ```json ` code block as its final output. The `op` field selects one of three operations:
 
 - `{"op": "return", "result": ..., "summary": ..., "next": ...}` — done. The runtime captures the result, saves a trace to `call_traces/`, and hands the compact result back to the parent as JSON. `summary` and `next` are optional.
-- `{"op": "call", "task": "..."}` — the child wants to delegate further. The runtime adds a child node to the execution tree and forks again. Same mechanism, one level deeper (up to depth 5).
+- `{"op": "call", "task": "..."}` — the child wants to delegate further. The runtime adds a child node to the execution tree and forks again. Same mechanism, one level deeper (up to depth 64).
 - `{"op": "yield", "question": "..."}` — needs user input. The tree is persisted to disk so the session can be resumed later.
 
 ### Execution tree
