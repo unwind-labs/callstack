@@ -10,6 +10,7 @@ import subprocess
 import time
 
 import agent_callstack.channel as ch_mod
+import agent_callstack.channel_pool as pool_mod
 import pytest
 from agent_callstack.channel import (
     _NDJSON_MAX_LINE,
@@ -545,8 +546,8 @@ class TestPoolModuleHelpers:
 
     def test_get_pool_lazily_creates_and_registers_atexit(self, monkeypatch):
         registered: list = []
-        monkeypatch.setattr(ch_mod.atexit, "register", registered.append)
-        monkeypatch.setattr(ch_mod, "_pool", None)
+        monkeypatch.setattr(pool_mod.atexit, "register", registered.append)
+        monkeypatch.setattr(pool_mod, "_pool", None)
         pool = _get_pool()
         assert isinstance(pool, ClaudePool)
         assert _get_pool() is pool  # cached, not re-created
@@ -559,12 +560,12 @@ class TestPoolModuleHelpers:
             def shutdown(self):
                 calls.append(1)
 
-        monkeypatch.setattr(ch_mod, "_pool", _FakePool())
+        monkeypatch.setattr(pool_mod, "_pool", _FakePool())
         shutdown_pool()
         assert calls == [1]
 
     def test_shutdown_pool_noop_when_no_pool(self, monkeypatch):
-        monkeypatch.setattr(ch_mod, "_pool", None)
+        monkeypatch.setattr(pool_mod, "_pool", None)
         shutdown_pool()  # must not raise
 
 

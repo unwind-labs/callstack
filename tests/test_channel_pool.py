@@ -17,14 +17,9 @@ import time
 from unittest.mock import MagicMock
 
 import pytest
-from agent_callstack import channel as ch_mod
-from agent_callstack.channel import (
-    ClaudeChannel,
-    ClaudePool,
-    TurnResult,
-    TurnTimeout,
-    _PooledProcess,
-)
+from agent_callstack import channel_pool as pool_mod
+from agent_callstack.channel import ClaudeChannel, TurnResult, TurnTimeout
+from agent_callstack.channel_pool import ClaudePool, _PooledProcess
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -72,13 +67,13 @@ def pool() -> ClaudePool:
 @pytest.fixture
 def fresh_module_pool():
     """Swap out the module-level pool so tests can't leak into each other."""
-    saved = ch_mod._pool
-    ch_mod._pool = ClaudePool(max_size=ch_mod._MAX_CONCURRENT_FORKS)
+    saved = pool_mod._pool
+    pool_mod._pool = ClaudePool(max_size=pool_mod._MAX_CONCURRENT_FORKS)
     try:
-        yield ch_mod._pool
+        yield pool_mod._pool
     finally:
-        ch_mod._pool.shutdown()
-        ch_mod._pool = saved
+        pool_mod._pool.shutdown()
+        pool_mod._pool = saved
 
 
 # --------------------------------------------------------------------------
@@ -278,7 +273,7 @@ class TestChannelPoolIntegration:
         # each turn's register() last_used strictly increasing (T-M2: no real
         # sleeps), so sA is unambiguously the evicted LRU entry.
         small_pool = ClaudePool(max_size=2, clock=_FakeClock())
-        monkeypatch.setattr(ch_mod, "_pool", small_pool)
+        monkeypatch.setattr(pool_mod, "_pool", small_pool)
 
         rec = _SpawnAndTurnRecorder(
             session_ids=[
