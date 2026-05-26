@@ -168,6 +168,90 @@ class TestResume:
         assert r.value == "ok"
 
 
+class TestResumeRealMethod:
+    """Exercises the REAL ``Caller.resume`` (snapshot load → context resolve →
+    report/reporter/seal wiring → unwrap), not the test-double override used in
+    ``TestResume``. This is the public path a host runs when answering a
+    CallYielded, so its happy and fail-closed branches must both be pinned."""
+
+    _SID = "00000000-0000-0000-0000-0000000000d8"
+
+    def _scripted_driver(self, tmp_path, channel: ScriptedChannel) -> Driver:
+        return Driver(
+            channel=channel,
+            resolve_session=SessionLocator(projects_dir=tmp_path / "projects").resolve,
+            trace=TraceWriter(tmp_path / "traces"),
+            store=TreeStore(),
+            cwd=str(tmp_path),
+            timeout=10,
+            max_depth=5,
+        )
+
+    def _setup_yield(self, tmp_path, parent_file) -> YieldToken:
+        """Drive a real yield so the on-disk state (saved snapshot at a
+        resolvable clone path) matches what a host holds when it gets a token."""
+        clone = _make_clone(tmp_path, self._SID)
+        parent = SessionRef(
+            session_id="00000000-0000-0000-0000-0000000000d2", file=parent_file)
+        ch = ScriptedChannel().respond(
+            _envelope("yield", question="MFA?"), self._SID)
+        tree = self._scripted_driver(tmp_path, ch).run(parent, ["auth"])
+        leaf = tree.yielded_leaves()[0]
+        assert Path(leaf.clone_path or "") == clone
+        return YieldToken(session_id=leaf.session_id, clone_path=leaf.clone_path or "")
+
+    def test_real_resume_completes(self, tmp_path, parent_file):
+        """Resuming a yielded call must load the persisted tree, drive the
+        resume turn through the channel, seal a report, and return the child's
+        Result — the end-to-end contract resume() promises a host."""
+        token = self._setup_yield(tmp_path, parent_file)
+        resume_ch = ScriptedChannel().respond(
+            _envelope("return", result="done"), self._SID)
+
+        test = self
+
+        class _Caller(Caller):
+            def _driver_for(self, parent, *, ctx, depth_base=0):
+                return test._scripted_driver(tmp_path, resume_ch)
+
+        caller = _Caller(log_dir=tmp_path / "logs",
+                         invoke_id="20260101T000000-deadbeef")
+        r = caller.resume(token, "847291")
+        assert isinstance(r, Result)
+        assert r.value == "done"
+        # A report.yaml must have been sealed under the resume's invocation dir.
+        assert (tmp_path / "logs" / "20260101T000000-deadbeef").exists()
+
+    def test_real_resume_missing_snapshot_fails(self, tmp_path):
+        """A token whose clone path has no .call_tree sidecar must raise
+        CallFailed (fail loud), never fabricate an empty Result. Real Caller,
+        no channel override — it must bail before spawning anything."""
+        caller = Caller(log_dir=tmp_path / "logs",
+                        invoke_id="20260101T000000-deadbeef")
+        token = YieldToken(session_id="x", clone_path=str(tmp_path / "ghost.jsonl"))
+        with pytest.raises(CallFailed, match="cannot resume"):
+            caller.resume(token, "reply")
+
+
+def test_module_level_resume_delegates(monkeypatch):
+    """The module-level ``resume()`` wrapper must delegate to a Caller's
+    ``resume`` (via the shared/override resolver), so callers get the same
+    behavior whether they use the function or the object."""
+    import agent_callstack as ac
+
+    captured = {}
+
+    class _Stub:
+        def resume(self, token, reply):
+            captured["args"] = (token, reply)
+            return "delegated"
+
+    monkeypatch.setattr(ac, "_resolve_caller", lambda seed, timeout: _Stub())
+    token = YieldToken(session_id="s", clone_path="/tmp/x.jsonl")
+    assert ac.resume(token, "the-reply") == "delegated"
+    assert captured["args"] == (token, "the-reply")
+
+
 class TestEnvPropagation:
     """The Caller stamps env onto every spawned `claude` subprocess via
     the ClaudeChannel constructed in ``_driver_for``. Grandchildren read
