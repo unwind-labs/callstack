@@ -26,6 +26,12 @@ dev = [
     "pytest-cov",
     "hypothesis",
     "pre-commit",
+    # Pin to match .pre-commit-config.yaml rev so the gate is reproducible
+    # across local and CI environments. Local ruff and the pre-commit hook
+    # must stay in lockstep — older or newer versions disagree on
+    # formatting decisions, which silently leaves files dirty in one env
+    # but clean in the other. Bump both this pin and the hook rev together.
+    "ruff==0.9.0",
 ]
 
 [tool.pytest.ini_options]
