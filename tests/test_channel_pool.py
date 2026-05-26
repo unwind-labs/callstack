@@ -19,7 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 from agent_callstack import channel_pool as pool_mod
 from agent_callstack.channel import ClaudeChannel, TurnResult, TurnTimeout
-from agent_callstack.channel_pool import ClaudePool, _PooledProcess
+from agent_callstack.channel_pool import ClaudePool, _get_pool, _PooledProcess, shutdown_pool
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -328,3 +328,40 @@ class TestChannelPoolIntegration:
         assert fresh_module_pool.session_ids() == ["00000000-0000-0000-0000-0000000000c7"]
         # Handshake was performed on the cache-miss spawn.
         assert rec.turn_calls[0][2] is True
+
+
+class TestPoolModuleHelpers:
+    """The module-level pool is lazily created on first use (so tests can swap
+    it) and registers an atexit teardown exactly once. max_size and evict-of-
+    a-missing-id are the small accessor/no-op branches the integration tests
+    don't reach."""
+
+    def test_max_size_exposes_cap(self):
+        assert ClaudePool(max_size=5).max_size == 5
+
+    def test_evict_missing_id_is_noop(self):
+        ClaudePool(max_size=2).evict("never-registered")  # must not raise
+
+    def test_get_pool_lazily_creates_and_registers_atexit(self, monkeypatch):
+        registered: list = []
+        monkeypatch.setattr(pool_mod.atexit, "register", registered.append)
+        monkeypatch.setattr(pool_mod, "_pool", None)
+        pool = _get_pool()
+        assert isinstance(pool, ClaudePool)
+        assert _get_pool() is pool  # cached, not re-created
+        assert registered, "atexit teardown must be registered on creation"
+
+    def test_shutdown_pool_tears_down_existing(self, monkeypatch):
+        calls: list = []
+
+        class _FakePool:
+            def shutdown(self):
+                calls.append(1)
+
+        monkeypatch.setattr(pool_mod, "_pool", _FakePool())
+        shutdown_pool()
+        assert calls == [1]
+
+    def test_shutdown_pool_noop_when_no_pool(self, monkeypatch):
+        monkeypatch.setattr(pool_mod, "_pool", None)
+        shutdown_pool()  # must not raise

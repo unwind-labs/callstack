@@ -10,19 +10,15 @@ import subprocess
 import time
 
 import agent_callstack.channel as ch_mod
-import agent_callstack.channel_pool as pool_mod
 import pytest
 from agent_callstack.channel import (
     _NDJSON_MAX_LINE,
     ClaudeChannel,
-    ClaudePool,
     TurnTimeout,
     _fire_on_session_id,
-    _get_pool,
     _PooledProcess,
     _process_log_path,
     allow_all,
-    shutdown_pool,
 )
 
 
@@ -294,6 +290,45 @@ class TestReadUntilResult:
         stdout = self._stdout("   \n", "\n", json.dumps({"type": "result", "session_id": "s3", "usage": {}}) + "\n")
         assert ch._read_until_result(io.StringIO(), stdout, [], io.StringIO(), {}) == "s3"
 
+    def test_message_without_session_id_does_not_fire_callback(self):
+        """A message lacking a session_id must not trigger on_session_id — only
+        messages that actually carry an id (system init, result) register the
+        fork, so an id-less control_response is passed over."""
+        fired: list = []
+        ch = ClaudeChannel()
+        stdout = self._stdout(
+            # on_session_id set, but this message has no session_id → skip.
+            json.dumps({"type": "control_response", "request_id": "x"}) + "\n",
+            json.dumps({"type": "result", "session_id": "s", "usage": {}}) + "\n",
+        )
+        ch._read_until_result(io.StringIO(), stdout, [], io.StringIO(), {}, on_session_id=fired.append)
+        # Fires once, on the result's session_id — never on the id-less message.
+        assert fired == ["s"]
+
+    def test_non_text_assistant_block_is_skipped(self):
+        """Non-text assistant blocks (e.g. tool_use) must be dropped; only text
+        blocks accumulate into the turn output, so a mixed message keeps just
+        its text."""
+        ch = ClaudeChannel()
+        parts: list = []
+        stdout = self._stdout(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "tool_use", "name": "Bash"},
+                            {"type": "text", "text": "kept"},
+                        ]
+                    },
+                }
+            )
+            + "\n",
+            json.dumps({"type": "result", "session_id": "s", "usage": {}}) + "\n",
+        )
+        ch._read_until_result(io.StringIO(), stdout, parts, io.StringIO(), {})
+        assert parts == ["kept"]  # tool_use block dropped, text block kept
+
 
 class _FakeProc:
     """Stand-in for subprocess.Popen: only the attributes _run_one_turn reads."""
@@ -532,43 +567,6 @@ class TestPooledProcessLifecycle:
         self._entry(_ClosableProc(), log=_RaisingLog()).close()  # no raise
 
 
-class TestPoolModuleHelpers:
-    """The module-level pool is lazily created on first use (so tests can swap
-    it) and registers an atexit teardown exactly once. max_size and evict-of-
-    a-missing-id are the small accessor/no-op branches the integration tests
-    don't reach."""
-
-    def test_max_size_exposes_cap(self):
-        assert ClaudePool(max_size=5).max_size == 5
-
-    def test_evict_missing_id_is_noop(self):
-        ClaudePool(max_size=2).evict("never-registered")  # must not raise
-
-    def test_get_pool_lazily_creates_and_registers_atexit(self, monkeypatch):
-        registered: list = []
-        monkeypatch.setattr(pool_mod.atexit, "register", registered.append)
-        monkeypatch.setattr(pool_mod, "_pool", None)
-        pool = _get_pool()
-        assert isinstance(pool, ClaudePool)
-        assert _get_pool() is pool  # cached, not re-created
-        assert registered, "atexit teardown must be registered on creation"
-
-    def test_shutdown_pool_tears_down_existing(self, monkeypatch):
-        calls: list = []
-
-        class _FakePool:
-            def shutdown(self):
-                calls.append(1)
-
-        monkeypatch.setattr(pool_mod, "_pool", _FakePool())
-        shutdown_pool()
-        assert calls == [1]
-
-    def test_shutdown_pool_noop_when_no_pool(self, monkeypatch):
-        monkeypatch.setattr(pool_mod, "_pool", None)
-        shutdown_pool()  # must not raise
-
-
 class TestRunTurnArgValidation:
     """SEC-013: run_turn rejects a bad mode or a non-UUID session id BEFORE any
     subprocess spawn — these values flow into the `claude` argv, so validating
@@ -726,52 +724,3 @@ class TestWatchdogTimeout:
         with pytest.raises(TurnTimeout):
             ClaudeChannel()._run_one_turn(entry, "go", timeout=0.05, on_session_id=None, do_handshake=False)
         assert "TIMEOUT after" in entry.log.getvalue()
-
-
-class TestReadUntilResultRemainingBranches:
-    """Two reader-loop branches not hit by the happy-path tests: a message that
-    carries no usable session_id must not fire on_session_id, and an assistant
-    block that isn't text must be skipped rather than appended."""
-
-    def _stdout(self, *lines: str):
-        class _Stdout:
-            def __init__(self, q):
-                self._q = list(q)
-
-            def readline(self, *_a):
-                return self._q.pop(0) if self._q else ""
-
-        return _Stdout(lines)
-
-    def test_message_without_session_id_does_not_fire_callback(self):
-        fired: list = []
-        ch = ClaudeChannel()
-        stdout = self._stdout(
-            # on_session_id set, but this message has no session_id → skip.
-            json.dumps({"type": "control_response", "request_id": "x"}) + "\n",
-            json.dumps({"type": "result", "session_id": "s", "usage": {}}) + "\n",
-        )
-        ch._read_until_result(io.StringIO(), stdout, [], io.StringIO(), {}, on_session_id=fired.append)
-        # Fires once, on the result's session_id — never on the id-less message.
-        assert fired == ["s"]
-
-    def test_non_text_assistant_block_is_skipped(self):
-        ch = ClaudeChannel()
-        parts: list = []
-        stdout = self._stdout(
-            json.dumps(
-                {
-                    "type": "assistant",
-                    "message": {
-                        "content": [
-                            {"type": "tool_use", "name": "Bash"},
-                            {"type": "text", "text": "kept"},
-                        ]
-                    },
-                }
-            )
-            + "\n",
-            json.dumps({"type": "result", "session_id": "s", "usage": {}}) + "\n",
-        )
-        ch._read_until_result(io.StringIO(), stdout, parts, io.StringIO(), {})
-        assert parts == ["kept"]  # tool_use block dropped, text block kept
