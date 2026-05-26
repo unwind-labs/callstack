@@ -13,3 +13,9 @@ __pycache__/
 *.pyc
 .DS_Store
 docs/
+
+# Coverage
+.coverage
+**/.coverage
+htmlcov/
+coverage.xml

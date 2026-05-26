@@ -6,9 +6,30 @@ requires-python = ">=3.10"
 
 [project.optional-dependencies]
 dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
     "hypothesis",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["plugins/callstack"]
+
+[tool.coverage.run]
+branch = true
+source = [
+    "plugins/callstack/agent_callstack",
+    "plugins/callstack/resources",
+]
+
+[tool.coverage.report]
+fail_under = 92
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
