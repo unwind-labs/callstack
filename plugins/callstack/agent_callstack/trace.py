@@ -5,6 +5,7 @@ Two concerns, each owned by one class:
 - TreeStore: snapshots the full execution tree to a `.call_tree` sidecar
   next to a yielded leaf's clone path so resume can reconstruct it.
 """
+
 from __future__ import annotations
 
 import contextlib

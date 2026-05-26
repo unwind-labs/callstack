@@ -5,6 +5,7 @@ audit (#1, #2, #3, #4, #5, #7). The fixes replace silent-success
 paths with explicit fail-loud ones — these tests pin that behavior
 so a future regression that re-swallows an error is caught.
 """
+
 from __future__ import annotations
 
 import json
@@ -14,11 +15,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-
-from agent_callstack.channel import ScriptedChannel, TurnResult
+from agent_callstack.channel import ScriptedChannel
 from agent_callstack.driver import Driver
 from agent_callstack.protocol import (
-    Call, Return, Yield, parse_envelope,
+    Call,
+    Return,
+    Yield,
+    parse_envelope,
 )
 from agent_callstack.session import SessionLocator, SessionRef
 from agent_callstack.trace import TraceWriter, TreeStore
@@ -31,6 +34,7 @@ if str(_PLUGIN) not in sys.path:
 
 
 # ---------- shared helpers ----------
+
 
 def _envelope(op: str, **fields) -> str:
     return "```json\n" + json.dumps({"op": op, **fields}) + "\n```"
@@ -57,8 +61,8 @@ def _make_driver(tmp_path, channel: ScriptedChannel, *, max_depth: int = 5) -> D
 
 # ---------- Fix #1 — parse_envelope distinguishes "no envelope" ----------
 
-class TestFix1ParseEnvelope:
 
+class TestFix1ParseEnvelope:
     def test_no_json_at_all_returns_none(self):
         # No JSON object anywhere → None. Must NOT collapse to Return().
         assert parse_envelope("just some prose, no json here") is None
@@ -95,6 +99,7 @@ class TestFix1ParseEnvelope:
 
 # ---------- Fix #2 — channel checks subprocess returncode ----------
 
+
 class TestFix2ReturncodeCheck:
     """The channel-layer returncode check lives inside the production
     `_run_one_turn` (channel.py); ScriptedChannel doesn't simulate a
@@ -113,12 +118,15 @@ class TestFix2ReturncodeCheck:
         class _FakeProc:
             def __init__(self) -> None:
                 self.returncode = 17  # non-zero, non-None
-                self.stdin = type("S", (), {"write": lambda self, _: None,
-                                            "flush": lambda self: None})()
+                self.stdin = type("S", (), {"write": lambda self, _: None, "flush": lambda self: None})()
                 self.stdout = type("O", (), {"readline": lambda self: ""})()
                 self.stderr = type("E", (), {"close": lambda self: None})()
-            def kill(self) -> None: pass
-            def poll(self) -> int: return self.returncode
+
+            def kill(self) -> None:
+                pass
+
+            def poll(self) -> int:
+                return self.returncode
 
         class _FakePooled:
             def __init__(self) -> None:
@@ -137,23 +145,22 @@ class TestFix2ReturncodeCheck:
         def _fake_send_user_message(self, _stdin, _prompt, _log):
             return None
 
-        def _fake_read_until_result(_self, _stdin, _stdout, text_parts,
-                                    _log, _meta, *, on_session_id=None):
-                # No text appended — that's the failure mode we test.
-                if on_session_id is not None:
-                    on_session_id("00000000-0000-0000-0000-000000000099")
-                return "00000000-0000-0000-0000-000000000099"
+        def _fake_read_until_result(_self, _stdin, _stdout, text_parts, _log, _meta, *, on_session_id=None):
+            # No text appended — that's the failure mode we test.
+            if on_session_id is not None:
+                on_session_id("00000000-0000-0000-0000-000000000099")
+            return "00000000-0000-0000-0000-000000000099"
 
-        with patch.object(ch_mod.ClaudeChannel, "_send_user_message",
-                          _fake_send_user_message), \
-             patch.object(ch_mod.ClaudeChannel, "_read_until_result",
-                          _fake_read_until_result):
+        with (
+            patch.object(ch_mod.ClaudeChannel, "_send_user_message", _fake_send_user_message),
+            patch.object(ch_mod.ClaudeChannel, "_read_until_result", _fake_read_until_result),
+        ):
             with pytest.raises(RuntimeError, match="returncode=17"):
-                channel._run_one_turn(_FakePooled(), "p", timeout=5,
-                                      on_session_id=None, do_handshake=False)
+                channel._run_one_turn(_FakePooled(), "p", timeout=5, on_session_id=None, do_handshake=False)
 
 
 # ---------- Fix #3 — Caller._invoke wraps driver.run in try/finally ----------
+
 
 class TestFix3FinalizeOnException:
     """If `driver.run` raises, the reporter must still flush so
@@ -163,8 +170,7 @@ class TestFix3FinalizeOnException:
         monkeypatch.chdir(tmp_path)
         # Force a parent session file to exist so SessionLocator finds something.
         # Simplest path: stub Caller's locator + driver entirely via patching.
-        from agent_callstack import Caller
-        from agent_callstack import _LiveReporter
+        from agent_callstack import Caller, _LiveReporter
 
         finalize_calls = []
         original_finalize = _LiveReporter.finalize
@@ -191,8 +197,8 @@ class TestFix3FinalizeOnException:
         )
         (tmp_path / "parent.jsonl").write_text("x\n")
         from agent_callstack import session as sess_mod
-        monkeypatch.setattr(sess_mod.SessionLocator, "locate",
-                            lambda self, **kw: fake_parent)
+
+        monkeypatch.setattr(sess_mod.SessionLocator, "locate", lambda self, **kw: fake_parent)
 
         caller = Caller()
         with pytest.raises(RuntimeError, match="simulated driver explosion"):
@@ -207,6 +213,7 @@ class TestFix3FinalizeOnException:
 
 
 # ---------- Fix #4 — report_path verification ----------
+
 
 class TestFix4ReportWarning:
     """If the reporter failed to write `report.yaml`, the MCP envelope
@@ -227,10 +234,18 @@ class TestFix4ReportWarning:
             return fn(*a, **kw)
 
         def _fake_call_many(_self, _tasks, *, context):
-            return MultiResult(results=[Result(
-                value="ok", summary=None, next=None,
-                duration=0.0, log=None, log_start=0,
-            )])
+            return MultiResult(
+                results=[
+                    Result(
+                        value="ok",
+                        summary=None,
+                        next=None,
+                        duration=0.0,
+                        log=None,
+                        log_start=0,
+                    )
+                ]
+            )
 
         monkeypatch.setattr(mcp_server.asyncio, "to_thread", _to_thread)
         monkeypatch.setattr(mcp_server.Caller, "call_many", _fake_call_many)
@@ -239,16 +254,15 @@ class TestFix4ReportWarning:
         envelope = json.loads(result_str)
         # The fake call_many never wrote a report — verification kicks in.
         assert "report_warning" in envelope, (
-            f"missing report_warning key when report.yaml is absent; "
-            f"envelope: {envelope}"
+            f"missing report_warning key when report.yaml is absent; envelope: {envelope}"
         )
         assert "does not exist" in envelope["report_warning"]
 
 
 # ---------- Fix #5 — _resolve_invocation_identity validates inherited env ----------
 
-class TestFix5EnvValidation:
 
+class TestFix5EnvValidation:
     def test_stale_env_falls_through_to_fresh_id(self, tmp_path, monkeypatch, capsys):
         import mcp_server  # type: ignore
 
@@ -256,8 +270,7 @@ class TestFix5EnvValidation:
         # nonexistent directory. The identity helper must reject them.
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("CALLSTACK_ROOT_INVOKE_ID", "20300101T000000-deadbeef")
-        monkeypatch.setenv("CALLSTACK_ROOT_LOG_DIR",
-                           str(tmp_path / "no-such-dir"))
+        monkeypatch.setenv("CALLSTACK_ROOT_LOG_DIR", str(tmp_path / "no-such-dir"))
 
         invoke_id, log_dir = mcp_server._resolve_invocation_identity(str(tmp_path))
 
@@ -299,19 +312,18 @@ class TestFix5EnvValidation:
         mcp_server._resolve_invocation_identity(str(tmp_path))
 
         # After rejection, the env must be cleared so Caller agrees.
-        import os
         assert "CALLSTACK_ROOT_INVOKE_ID" not in os.environ
         assert "CALLSTACK_ROOT_LOG_DIR" not in os.environ
 
 
 # ---------- Fix #7 — partial report when nested has no root ----------
 
-class TestFix7NestedPartialReport:
 
+class TestFix7NestedPartialReport:
     def test_nested_finalize_writes_partial_when_root_missing(self, tmp_path):
         from agent_callstack import _LiveReporter
-        from agent_callstack.invocation_ctx import _InvocationContext
         from agent_callstack.driver import Tree
+        from agent_callstack.invocation_ctx import _InvocationContext
 
         invoke_id = "20300101T000000-test0001"
         log_dir = tmp_path / "log"
@@ -328,8 +340,10 @@ class TestFix7NestedPartialReport:
             instance_id="abc123",
         )
         reporter = _LiveReporter(
-            ctx=ctx, kind="nested:call",
-            tasks=["nested task"], started_at="2030-01-01T00:00:00Z",
+            ctx=ctx,
+            kind="nested:call",
+            tasks=["nested task"],
+            started_at="2030-01-01T00:00:00Z",
         )
 
         # Build a minimal, valid Tree with no nodes — `to_dict` requires
@@ -358,9 +372,9 @@ class TestFix7NestedPartialReport:
 
     def test_nested_finalize_skips_partial_if_root_present(self, tmp_path):
         from agent_callstack import _LiveReporter
-        from agent_callstack.invocation_ctx import _InvocationContext
         from agent_callstack.driver import Tree
         from agent_callstack.frames import _ROOT_FRAME_KEY
+        from agent_callstack.invocation_ctx import _InvocationContext
 
         invoke_id = "20300101T000000-test0002"
         log_dir = tmp_path / "log"
@@ -389,6 +403,7 @@ class TestFix7NestedPartialReport:
             },
         }
         import yaml
+
         (frames_dir / f"{_ROOT_FRAME_KEY}.yaml").write_text(yaml.safe_dump(root_frame))
 
         ctx = _InvocationContext(
@@ -400,8 +415,10 @@ class TestFix7NestedPartialReport:
             instance_id="def456",
         )
         reporter = _LiveReporter(
-            ctx=ctx, kind="nested:call",
-            tasks=["nested task"], started_at="2030-01-01T00:00:00Z",
+            ctx=ctx,
+            kind="nested:call",
+            tasks=["nested task"],
+            started_at="2030-01-01T00:00:00Z",
         )
         tree = Tree(
             root_session=SessionRef(

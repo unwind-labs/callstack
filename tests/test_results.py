@@ -1,4 +1,5 @@
 """Tests for results._find_task_start_line and node→result translation."""
+
 from __future__ import annotations
 
 from agent_callstack import state as st
@@ -47,6 +48,7 @@ def test_does_not_match_different_task_id(tmp_path):
 
 
 # ---------- _result_from_node: terminal-state translation ----------
+
 
 def test_timeout_node_surfaces_real_error_not_unexpected_state():
     # WHY this isn't hypothetical: report.seal() runs

@@ -8,13 +8,13 @@ A child agent ends its turn by emitting one fenced ```json block. Three opcodes:
 This module owns the envelope grammar, the system prompt that teaches it,
 and the helpers that build prompts for follow-up turns.
 """
+
 from __future__ import annotations
 
 import json
 import re
 from dataclasses import dataclass
 from typing import Any, Optional, Union
-
 
 SYSTEM_INSTRUCTION = """\
 You are running in a forked session — a child process that inherited the full \
@@ -29,13 +29,16 @@ emitting EXACTLY ONE JSON envelope wrapped in a fenced ```json code block.
 
 # ---------- Envelope value types ----------
 
+
 @dataclass(frozen=True)
 class Call:
     task: str
 
+
 @dataclass(frozen=True)
 class Yield:
     question: str
+
 
 @dataclass(frozen=True)
 class Return:
@@ -138,6 +141,7 @@ def parse_envelope(output: str) -> Optional[Envelope]:
 
 
 # ---------- Prompt construction ----------
+
 
 def starting_prompt(task: str, task_id: Optional[str] = None) -> str:
     tag = f" [{task_id}]" if task_id else ""

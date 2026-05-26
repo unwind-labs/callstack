@@ -13,15 +13,15 @@ this invariant down. These tests close that gap at every layer it can break:
 
 Layers 1, 2 live in test_session.py; Layer 4 in test_driver.py.
 """
+
 from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import pytest
-
 import agent_callstack as ac
+import pytest
 from agent_callstack import Caller
 from agent_callstack.channel import ScriptedChannel
 from agent_callstack.invocation_ctx import _InvocationContext
@@ -30,7 +30,6 @@ from agent_callstack.session import (
     SessionRef,
     encode_project_dir,
 )
-
 
 # ---------- shared fixtures ----------
 
@@ -90,14 +89,11 @@ def capturing_channel(monkeypatch):
     }
 
     class _CapturingChannel:
-        def __init__(self, *, model=None, permission_mode="default",
-                     permission_handler=None, env=None):
+        def __init__(self, *, model=None, permission_mode="default", permission_handler=None, env=None):
             self._env = dict(env or {})
             captured["envs"].append(self._env)
             captured["instances"].append(self)
-            envelope = ('```json\n'
-                        + json.dumps({"op": "return", "result": "ok"})
-                        + '\n```')
+            envelope = "```json\n" + json.dumps({"op": "return", "result": "ok"}) + "\n```"
             self._inner = ScriptedChannel()
             # Pre-load several responses for any sibling fan-out scenarios.
             for _ in range(64):
@@ -113,13 +109,13 @@ def capturing_channel(monkeypatch):
 
 # ---------- Layer 3 — Caller._driver_for env dict ----------
 
+
 class TestDriverForEnv:
     """The spawned-child env dict must not carry the parent's session path.
     Letting it inherit was the root cause of the regression — children would
     see their grandparent's path in CALLSTACK_PARENT_SESSION."""
 
-    def test_spawned_env_omits_stale_parent_session(self, tmp_path,
-                                                     capturing_channel):
+    def test_spawned_env_omits_stale_parent_session(self, tmp_path, capturing_channel):
         parent = SessionRef(
             session_id="00000000-0000-0000-0000-0000000000aa",
             file=tmp_path / "parent.jsonl",
@@ -147,15 +143,14 @@ class TestDriverForEnv:
 
 # ---------- Layer 5 — end-to-end recursive scenario ----------
 
+
 class TestNestedInvariant:
     """Simulates a child claude doing its own /call. The child's env contains
     a stale CALLSTACK_PARENT_SESSION pointing to root (inherited at spawn)
     AND a fresh CLAUDE_SESSION_ID identifying the child process. The locator
     must use the child's identity; otherwise the grandchild forks from root."""
 
-    def test_grandchild_forks_from_child_not_root(self, two_session_world,
-                                                    capturing_channel,
-                                                    monkeypatch):
+    def test_grandchild_forks_from_child_not_root(self, two_session_world, capturing_channel, monkeypatch):
         projects, cwd, root, child = two_session_world
 
         # Child claude's environment after the root spawned it:
@@ -183,14 +178,13 @@ class TestNestedInvariant:
 
 # ---------- Layer 6 — concurrent siblings ----------
 
+
 class TestConcurrentSiblings:
     """N concurrent /call invocations in the same process all resolve the
     same correct parent — siblings share a parent by definition. Guards
     against any future race in env resolution / per-Caller state."""
 
-    def test_concurrent_siblings_share_parent(self, two_session_world,
-                                                capturing_channel,
-                                                monkeypatch):
+    def test_concurrent_siblings_share_parent(self, two_session_world, capturing_channel, monkeypatch):
         projects, cwd, root, child = two_session_world
 
         # Same recursive-child scenario as Layer 5.
@@ -210,12 +204,12 @@ class TestConcurrentSiblings:
 
         parents = set(capturing_channel["parent_session_ids"])
         assert parents == {CHILD_SID}, (
-            f"concurrent siblings forked from inconsistent parents: "
-            f"{parents}; expected only {CHILD_SID}"
+            f"concurrent siblings forked from inconsistent parents: {parents}; expected only {CHILD_SID}"
         )
 
 
 # ---------- Layer 7 — env var name (the production-name gotcha) ----------
+
 
 class TestEnvVarName:
     """Claude Code actually exports `CLAUDE_CODE_SESSION_ID` to each spawned
@@ -227,6 +221,7 @@ class TestEnvVarName:
 
     def test_locator_constant_is_production_env_var_name(self):
         from agent_callstack.session import _ENV_PARENT_UUID
+
         assert _ENV_PARENT_UUID == "CLAUDE_CODE_SESSION_ID", (
             f"_ENV_PARENT_UUID is {_ENV_PARENT_UUID!r} — Claude Code sets "
             f"CLAUDE_CODE_SESSION_ID per claude subprocess. Reading the wrong "
@@ -235,18 +230,19 @@ class TestEnvVarName:
         )
 
     def test_locator_resolves_via_claude_code_session_id(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         from agent_callstack.session import SessionLocator
+
         cwd = tmp_path / "p"
         cwd.mkdir()
         projects = tmp_path / "projects"
         proj = projects / encode_project_dir(str(cwd))
         proj.mkdir(parents=True)
         sid = "00000000-0000-0000-0000-00000000c0de"
-        (proj / f"{sid}.jsonl").write_text(
-            json.dumps({"cwd": str(cwd), "type": "user"}) + "\n"
-        )
+        (proj / f"{sid}.jsonl").write_text(json.dumps({"cwd": str(cwd), "type": "user"}) + "\n")
         monkeypatch.delenv("CALLSTACK_PARENT_SESSION", raising=False)
         monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", sid)
         monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
@@ -256,6 +252,7 @@ class TestEnvVarName:
 
 
 # ---------- Layer 8 — depth 3+ with parallel siblings at each level ----------
+
 
 def _setup_session_world(tmp_path, monkeypatch, sids):
     """Build a projects dir containing one .jsonl per sid. Returns
@@ -275,6 +272,7 @@ def _setup_session_world(tmp_path, monkeypatch, sids):
     class _TestLocator(_RealLocator):
         def __init__(self, projects_dir=projects):
             super().__init__(projects_dir)
+
     monkeypatch.setattr(ac, "SessionLocator", _TestLocator)
     return projects, str(cwd), refs
 
@@ -291,7 +289,9 @@ class TestDeeperDepthParallelSiblings:
     or stale env leakage."""
 
     def test_depth_3_parallel_siblings_dont_cross_contaminate(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         """root → {A, B} → each of A and B dispatches its own grandchildren.
         Worst-case env: stale CALLSTACK_PARENT_SESSION points to root (as
@@ -300,14 +300,17 @@ class TestDeeperDepthParallelSiblings:
 
         Invariant: A's grandchildren MUST fork from A, B's from B."""
         ROOT = "00000000-0000-0000-0000-000000003001"
-        A    = "00000000-0000-0000-0000-000000003002"  # noqa: E221
-        B    = "00000000-0000-0000-0000-000000003003"  # noqa: E221
+        A = "00000000-0000-0000-0000-000000003002"  # noqa: E221
+        B = "00000000-0000-0000-0000-000000003003"  # noqa: E221
         projects, cwd, refs = _setup_session_world(
-            tmp_path, monkeypatch, [ROOT, A, B],
+            tmp_path,
+            monkeypatch,
+            [ROOT, A, B],
         )
 
         # Bump B's mtime so it'd win an mtime heuristic.
         import time as _time
+
         _time.sleep(0.01)
         refs[B].file.write_text(refs[B].file.read_text() + " ")
 
@@ -316,14 +319,11 @@ class TestDeeperDepthParallelSiblings:
         captures = []
 
         class _PerInvokeChannel:
-            def __init__(self, *, model=None, permission_mode="default",
-                         permission_handler=None, env=None):
+            def __init__(self, *, model=None, permission_mode="default", permission_handler=None, env=None):
                 self.parent_session_ids = []
                 self.env = dict(env or {})
                 self._inner = ScriptedChannel()
-                env_done = ('```json\n'
-                            + json.dumps({"op": "return", "result": "ok"})
-                            + '\n```')
+                env_done = "```json\n" + json.dumps({"op": "return", "result": "ok"}) + "\n```"
                 for _ in range(64):
                     self._inner.respond(env_done, GRANDCHILD_SID)
                 captures.append(self)
@@ -348,9 +348,7 @@ class TestDeeperDepthParallelSiblings:
         monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", B)
         Caller()._invoke(["B-gc-1", "B-gc-2"], context="fork")
 
-        assert len(captures) == 2, (
-            f"expected one channel per _invoke, got {len(captures)}"
-        )
+        assert len(captures) == 2, f"expected one channel per _invoke, got {len(captures)}"
         a_channel, b_channel = captures
         assert set(a_channel.parent_session_ids) == {A}, (
             f"A's grandchildren forked from {a_channel.parent_session_ids}; "
@@ -358,12 +356,13 @@ class TestDeeperDepthParallelSiblings:
             f"prefer per-process UUID over filesystem mtime)"
         )
         assert set(b_channel.parent_session_ids) == {B}, (
-            f"B's grandchildren forked from {b_channel.parent_session_ids}; "
-            f"expected all {B}"
+            f"B's grandchildren forked from {b_channel.parent_session_ids}; expected all {B}"
         )
 
     def test_depth_4_each_level_correctly_identified(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         """Walk a depth-4 chain with multiple siblings at each level. At
         every simulated level, the locator inside that level's process
@@ -373,21 +372,22 @@ class TestDeeperDepthParallelSiblings:
 
         levels = {
             "root": "00000000-0000-0000-0000-000000004001",
-            "L1a":  "00000000-0000-0000-0000-000000004002",
-            "L1b":  "00000000-0000-0000-0000-000000004003",
-            "L2a":  "00000000-0000-0000-0000-000000004004",
-            "L2b":  "00000000-0000-0000-0000-000000004005",
-            "L3a":  "00000000-0000-0000-0000-000000004006",
-            "L3b":  "00000000-0000-0000-0000-000000004007",
+            "L1a": "00000000-0000-0000-0000-000000004002",
+            "L1b": "00000000-0000-0000-0000-000000004003",
+            "L2a": "00000000-0000-0000-0000-000000004004",
+            "L2b": "00000000-0000-0000-0000-000000004005",
+            "L3a": "00000000-0000-0000-0000-000000004006",
+            "L3b": "00000000-0000-0000-0000-000000004007",
         }
         projects, cwd, _ = _setup_session_world(
-            tmp_path, monkeypatch, list(levels.values()),
+            tmp_path,
+            monkeypatch,
+            list(levels.values()),
         )
         # Worst case: every level still has CALLSTACK_PARENT_SESSION leaking
         # the root.jsonl (would happen if any upstream MCP server was running
         # pre-fix code that still propagates the var).
-        root_file = (projects / encode_project_dir(cwd)
-                     / f"{levels['root']}.jsonl")
+        root_file = projects / encode_project_dir(cwd) / f"{levels['root']}.jsonl"
         monkeypatch.setenv("CALLSTACK_PARENT_SESSION", str(root_file))
 
         for label, sid in levels.items():
@@ -403,6 +403,7 @@ class TestDeeperDepthParallelSiblings:
 
 # ---------- Layer 9 — CALLSTACK_OWN_SESSION (the durable fix) ----------
 
+
 class TestCallstackOwnSession:
     """`CALLSTACK_OWN_SESSION` is the deterministic, plugin-controlled
     successor to relying on Claude Code's `CLAUDE_CODE_SESSION_ID`. The
@@ -415,7 +416,9 @@ class TestCallstackOwnSession:
     `--fork-session` subprocesses."""
 
     def test_own_session_wins_over_claude_code_session(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         """The exact prior cross-fork scenario: a spawned child's env
         carries `CLAUDE_CODE_SESSION_ID` leaked from its grandparent.
@@ -423,10 +426,13 @@ class TestCallstackOwnSession:
         resolves itself correctly even if Claude Code's per-process
         var is stale or wrong."""
         from agent_callstack.session import SessionLocator
+
         SELF = "00000000-0000-0000-0000-00000000be11"
         LEAKED = "00000000-0000-0000-0000-00000000beef"  # grandparent's
         projects, cwd, refs = _setup_session_world(
-            tmp_path, monkeypatch, [SELF, LEAKED],
+            tmp_path,
+            monkeypatch,
+            [SELF, LEAKED],
         )
         monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", LEAKED)
         monkeypatch.setenv("CALLSTACK_OWN_SESSION", SELF)
@@ -440,7 +446,9 @@ class TestCallstackOwnSession:
         )
 
     def test_nested_invocation_refuses_mtime_fallback(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         """Inside a callstack-managed nested invocation
         (CALLSTACK_ROOT_INVOKE_ID set), the mtime fallback is unsafe
@@ -449,27 +457,34 @@ class TestCallstackOwnSession:
         guess. This converts a silent cross-fork into a visible
         failure at first /call."""
         from agent_callstack.session import SessionLocator
+
         SID = "00000000-0000-0000-0000-00000000fa11"
         projects, cwd, _ = _setup_session_world(
-            tmp_path, monkeypatch, [SID],
+            tmp_path,
+            monkeypatch,
+            [SID],
         )
         monkeypatch.delenv("CALLSTACK_OWN_SESSION", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
         monkeypatch.setenv("CALLSTACK_ROOT_INVOKE_ID", "iv-1")
-        with pytest.raises(RuntimeError,
-                            match="cannot identify own session inside a nested"):
+        with pytest.raises(RuntimeError, match="cannot identify own session inside a nested"):
             SessionLocator(projects_dir=projects).locate(cwd=cwd)
 
     def test_top_level_invocation_still_uses_mtime(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         """Outside any nested invocation, mtime remains a valid
         last-resort heuristic — the user's interactive `claude`
         session is the only .jsonl in its project dir at startup."""
         from agent_callstack.session import SessionLocator
+
         SID = "00000000-0000-0000-0000-00000000a10e"
         projects, cwd, _ = _setup_session_world(
-            tmp_path, monkeypatch, [SID],
+            tmp_path,
+            monkeypatch,
+            [SID],
         )
         monkeypatch.delenv("CALLSTACK_OWN_SESSION", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
@@ -479,6 +494,7 @@ class TestCallstackOwnSession:
 
 
 # ---------- Layer 10 — spawn-time wiring of CALLSTACK_OWN_SESSION ----------
+
 
 class TestSpawnStampsOwnSession:
     """The parent's `ClaudeChannel._spawn()` is the contract endpoint
@@ -492,6 +508,7 @@ class TestSpawnStampsOwnSession:
 
     def test_build_cmd_includes_session_id_for_fork(self):
         from agent_callstack.channel import ClaudeChannel
+
         ch = ClaudeChannel()
         new_uuid = "00000000-0000-0000-0000-00000000cafe"
         cmd = ch._build_cmd(
@@ -504,6 +521,7 @@ class TestSpawnStampsOwnSession:
 
     def test_build_cmd_includes_session_id_for_fresh(self):
         from agent_callstack.channel import ClaudeChannel
+
         ch = ClaudeChannel()
         new_uuid = "00000000-0000-0000-0000-00000000face"
         cmd = ch._build_cmd(
@@ -523,6 +541,7 @@ class TestSpawnStampsOwnSession:
         resumed id (so a nested /call inside that turn can still
         identify itself), but the argv must not assert a new id."""
         from agent_callstack.channel import ClaudeChannel
+
         ch = ClaudeChannel()
         cmd = ch._build_cmd(
             source_session_id="00000000-0000-0000-0000-00000000beef",
@@ -536,7 +555,9 @@ class TestSpawnStampsOwnSession:
         `--session-id` on argv AND `CALLSTACK_OWN_SESSION` in the
         subprocess env. We intercept subprocess.Popen to capture both."""
         import subprocess
+
         from agent_callstack import channel as ch_mod
+
         captured = {}
 
         class _FakePopen:
@@ -548,17 +569,33 @@ class TestSpawnStampsOwnSession:
                 self.stderr = _Stub()
                 self.returncode = 0
 
-            def poll(self): return None
-            def terminate(self): pass
-            def wait(self, timeout=None): return 0
-            def kill(self): pass
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
 
         class _Stub:
-            def write(self, _): return 0
-            def flush(self): pass
-            def close(self): pass
-            def __iter__(self): return iter([])
-            def readline(self, *a, **k): return ""
+            def write(self, _):
+                return 0
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+            def __iter__(self):
+                return iter([])
+
+            def readline(self, *a, **k):
+                return ""
 
         monkeypatch.setattr(subprocess, "Popen", _FakePopen)
 
@@ -575,8 +612,7 @@ class TestSpawnStampsOwnSession:
         idx = captured["cmd"].index("--session-id")
         assert captured["cmd"][idx + 1] == new_uuid
         assert captured["env"].get("CALLSTACK_OWN_SESSION") == new_uuid, (
-            "spawned child's env must carry CALLSTACK_OWN_SESSION so its "
-            "MCP server resolves itself deterministically"
+            "spawned child's env must carry CALLSTACK_OWN_SESSION so its MCP server resolves itself deterministically"
         )
 
     def test_env_actually_crosses_real_subprocess_boundary(self, tmp_path):
@@ -593,19 +629,24 @@ class TestSpawnStampsOwnSession:
         import os as _os
         import subprocess as _sp
         import textwrap
+
         new_uuid = "00000000-0000-0000-0000-00000000ec0c"
         script = tmp_path / "echo_env.py"
-        script.write_text(textwrap.dedent("""
+        script.write_text(
+            textwrap.dedent("""
             import os
             import sys
             sys.stdout.write(os.environ.get('CALLSTACK_OWN_SESSION', ''))
-        """))
+        """)
+        )
         # Mirror what _spawn does internally: layer env atop os.environ.
         env = {**_os.environ, "CALLSTACK_OWN_SESSION": new_uuid}
         # Strip any inherited value first so we know the test reads
         # exactly what we just set.
         out = _sp.check_output(
-            ["python3", str(script)], env=env, text=True,
+            ["python3", str(script)],
+            env=env,
+            text=True,
         )
         assert out == new_uuid, (
             f"CALLSTACK_OWN_SESSION crossed subprocess boundary as "
@@ -615,6 +656,7 @@ class TestSpawnStampsOwnSession:
 
 
 # ---------- Layer 11 — consistency check fires on session-id divergence ----------
+
 
 class TestConsistencyCheck:
     """ClaudeChannel pre-allocates a UUID and tells claude to use it
@@ -631,7 +673,10 @@ class TestConsistencyCheck:
     that returns a stable known session id."""
 
     def _build_channel_with_fake_claude(
-        self, monkeypatch, *, wire_session_id: str,
+        self,
+        monkeypatch,
+        *,
+        wire_session_id: str,
     ):
         """Build a ClaudeChannel whose Popen is faked: stdout emits a
         single `result` NDJSON message reporting `wire_session_id`,
@@ -639,30 +684,49 @@ class TestConsistencyCheck:
         --session-id."""
         import json as _json
         import subprocess as _sp
+
         from agent_callstack import channel as ch_mod
 
-        result_line = _json.dumps({
-            "type": "result", "session_id": wire_session_id,
-            "result": "done", "uuid": "req-1",
-            "usage": {"input_tokens": 0, "output_tokens": 0},
-            "total_cost_usd": 0.0,
-        }) + "\n"
+        result_line = (
+            _json.dumps(
+                {
+                    "type": "result",
+                    "session_id": wire_session_id,
+                    "result": "done",
+                    "uuid": "req-1",
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                    "total_cost_usd": 0.0,
+                }
+            )
+            + "\n"
+        )
 
         class _StdinStub:
-            def write(self, _): return 0
-            def flush(self): pass
-            def close(self): pass
+            def write(self, _):
+                return 0
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
 
         class _StdoutStub:
             def __init__(self_):
                 self_._lines = [result_line, ""]
+
             def readline(self_, _limit=None):
                 return self_._lines.pop(0) if self_._lines else ""
-            def close(self): pass
+
+            def close(self):
+                pass
 
         class _StderrStub:
-            def __iter__(self): return iter([])
-            def close(self): pass
+            def __iter__(self):
+                return iter([])
+
+            def close(self):
+                pass
 
         class _FakePopen:
             def __init__(self, cmd, **kw):
@@ -670,21 +734,31 @@ class TestConsistencyCheck:
                 self.stdout = _StdoutStub()
                 self.stderr = _StderrStub()
                 self.returncode = 0
-            def poll(self): return None
-            def terminate(self): pass
-            def wait(self, timeout=None): return 0
-            def kill(self): pass
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
 
         monkeypatch.setattr(_sp, "Popen", _FakePopen)
         return ch_mod.ClaudeChannel()
 
     def test_run_raises_when_claude_reports_different_session_id(
-        self, monkeypatch,
+        self,
+        monkeypatch,
     ):
         wrong_uuid = "00000000-0000-0000-0000-00000000face"
         preallocated = "00000000-0000-0000-0000-00000000c001"
         ch = self._build_channel_with_fake_claude(
-            monkeypatch, wire_session_id=wrong_uuid,
+            monkeypatch,
+            wire_session_id=wrong_uuid,
         )
         with pytest.raises(RuntimeError) as ei:
             ch.run_turn(
@@ -695,18 +769,19 @@ class TestConsistencyCheck:
             )
         msg = str(ei.value)
         assert preallocated in msg and wrong_uuid in msg, (
-            f"error must mention both pre-allocated ({preallocated}) "
-            f"and reported ({wrong_uuid}) UUIDs; got: {msg!r}"
+            f"error must mention both pre-allocated ({preallocated}) and reported ({wrong_uuid}) UUIDs; got: {msg!r}"
         )
 
     def test_run_succeeds_when_claude_honors_session_id(
-        self, monkeypatch,
+        self,
+        monkeypatch,
     ):
         """Positive control: claude reports the pre-allocated UUID
         back on the wire (the healthy case). No error."""
         preallocated = "00000000-0000-0000-0000-00000000c002"
         ch = self._build_channel_with_fake_claude(
-            monkeypatch, wire_session_id=preallocated,
+            monkeypatch,
+            wire_session_id=preallocated,
         )
         result = ch.run_turn(
             source_session_id="",

@@ -9,15 +9,14 @@ Two layers:
    ._run_one_turn to count spawns and verify the pool's reuse logic
    without needing the real `claude` CLI.
 """
+
 from __future__ import annotations
 
 import threading
 import time
-from typing import Optional
 from unittest.mock import MagicMock
 
 import pytest
-
 from agent_callstack import channel as ch_mod
 from agent_callstack.channel import (
     ClaudeChannel,
@@ -27,10 +26,10 @@ from agent_callstack.channel import (
     _PooledProcess,
 )
 
-
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
 
 class _FakeClock:
     """Deterministic monotonic clock: each read advances by a fixed tick, so
@@ -55,8 +54,12 @@ def _mock_pooled_process() -> _PooledProcess:
     proc.returncode = None
     proc.wait.return_value = 0
     entry = _PooledProcess(
-        proc=proc, stdin=MagicMock(), stdout=MagicMock(),
-        log=MagicMock(), log_path="/tmp/mock.log", cwd="/tmp",
+        proc=proc,
+        stdin=MagicMock(),
+        stdout=MagicMock(),
+        log=MagicMock(),
+        log_path="/tmp/mock.log",
+        cwd="/tmp",
     )
     return entry
 
@@ -82,8 +85,8 @@ def fresh_module_pool():
 # 1. ClaudePool unit tests
 # --------------------------------------------------------------------------
 
-class TestClaudePool:
 
+class TestClaudePool:
     def test_register_then_acquire_returns_same_entry(self, pool):
         p = _mock_pooled_process()
         pool.register("00000000-0000-0000-0000-0000000000c3", p)
@@ -138,9 +141,7 @@ class TestClaudePool:
         assert pool.acquire("s5") is entries[5]
         assert pool.acquire("s4") is entries[4]
         for i in range(4):
-            assert pool.acquire(f"s{i}") is None, (
-                f"expected s{i} to be evicted as LRU but it survived"
-            )
+            assert pool.acquire(f"s{i}") is None, f"expected s{i} to be evicted as LRU but it survived"
             entries[i].proc.terminate.assert_called()
 
     def test_in_use_entries_are_skipped_during_eviction(self):
@@ -183,13 +184,18 @@ class TestClaudePool:
 # 2. ClaudeChannel integration tests (mocked spawn/turn)
 # --------------------------------------------------------------------------
 
+
 def _make_turn_result(session_id: str) -> TurnResult:
     return TurnResult(
-        text="```json\n{\"op\": \"return\", \"result\": \"ok\"}\n```",
+        text='```json\n{"op": "return", "result": "ok"}\n```',
         session_id=session_id,
         duration=0.01,
-        api_request_id="", input_tokens=0, output_tokens=0,
-        cache_read_tokens=0, cache_creation_tokens=0, total_cost_usd=0.0,
+        api_request_id="",
+        input_tokens=0,
+        output_tokens=0,
+        cache_read_tokens=0,
+        cache_creation_tokens=0,
+        total_cost_usd=0.0,
     )
 
 
@@ -206,8 +212,7 @@ class _SpawnAndTurnRecorder:
     def patch(self, monkeypatch, channel: ClaudeChannel) -> None:
         recorder = self
 
-        def fake_spawn(self_, source_sid, mode, cwd, extra_env,
-                       *, preallocated_session_id=None):
+        def fake_spawn(self_, source_sid, mode, cwd, extra_env, *, preallocated_session_id=None):
             with recorder._lock:
                 recorder.spawn_calls.append((source_sid, mode))
                 # Each spawn binds to the next prepared session_id.
@@ -216,8 +221,9 @@ class _SpawnAndTurnRecorder:
             entry.session_id = next_sid  # pre-mark for _run_one_turn
             return entry
 
-        def fake_run_one_turn(self_, entry, prompt, timeout, on_session_id, *,
-                              do_handshake, preallocated_session_id=None):
+        def fake_run_one_turn(
+            self_, entry, prompt, timeout, on_session_id, *, do_handshake, preallocated_session_id=None
+        ):
             sid = entry.session_id or "auto-sid"
             with recorder._lock:
                 recorder.turn_calls.append((sid, prompt, do_handshake))
@@ -233,7 +239,6 @@ class _SpawnAndTurnRecorder:
 
 
 class TestChannelPoolIntegration:
-
     def test_resume_reuses_same_pooled_process(self, monkeypatch, fresh_module_pool):
         rec = _SpawnAndTurnRecorder(session_ids=["00000000-0000-0000-0000-0000000000c2"])
         ch = ClaudeChannel()
@@ -253,7 +258,9 @@ class TestChannelPoolIntegration:
         assert fresh_module_pool.size() == 1
 
     def test_two_different_sessions_each_spawn(self, monkeypatch, fresh_module_pool):
-        rec = _SpawnAndTurnRecorder(session_ids=["00000000-0000-0000-0000-0000000000c3", "00000000-0000-0000-0000-0000000000c4"])
+        rec = _SpawnAndTurnRecorder(
+            session_ids=["00000000-0000-0000-0000-0000000000c3", "00000000-0000-0000-0000-0000000000c4"]
+        )
         ch = ClaudeChannel()
         rec.patch(monkeypatch, ch)
 
@@ -261,7 +268,10 @@ class TestChannelPoolIntegration:
         ch.run_turn("00000000-0000-0000-0000-0000000000c0", "tb", mode="fork")
         assert len(rec.spawn_calls) == 2
         assert fresh_module_pool.size() == 2
-        assert set(fresh_module_pool.session_ids()) == {"00000000-0000-0000-0000-0000000000c3", "00000000-0000-0000-0000-0000000000c4"}
+        assert set(fresh_module_pool.session_ids()) == {
+            "00000000-0000-0000-0000-0000000000c3",
+            "00000000-0000-0000-0000-0000000000c4",
+        }
 
     def test_lru_eviction_at_pool_cap(self, monkeypatch, fresh_module_pool):
         # Force a small cap by replacing the pool entirely. _FakeClock makes
@@ -270,7 +280,13 @@ class TestChannelPoolIntegration:
         small_pool = ClaudePool(max_size=2, clock=_FakeClock())
         monkeypatch.setattr(ch_mod, "_pool", small_pool)
 
-        rec = _SpawnAndTurnRecorder(session_ids=["00000000-0000-0000-0000-0000000000c3", "00000000-0000-0000-0000-0000000000c4", "00000000-0000-0000-0000-0000000000c5"])
+        rec = _SpawnAndTurnRecorder(
+            session_ids=[
+                "00000000-0000-0000-0000-0000000000c3",
+                "00000000-0000-0000-0000-0000000000c4",
+                "00000000-0000-0000-0000-0000000000c5",
+            ]
+        )
         ch = ClaudeChannel()
         rec.patch(monkeypatch, ch)
 
@@ -292,9 +308,9 @@ class TestChannelPoolIntegration:
         assert fresh_module_pool.size() == 1
 
         # Second turn: resume on "00000000-0000-0000-0000-0000000000c6", but _run_one_turn raises TurnTimeout.
-        def boom(self_, entry, prompt, timeout, on_session_id, *,
-                 do_handshake, preallocated_session_id=None):
+        def boom(self_, entry, prompt, timeout, on_session_id, *, do_handshake, preallocated_session_id=None):
             raise TurnTimeout("simulated", partial="")
+
         monkeypatch.setattr(ClaudeChannel, "_run_one_turn", boom)
 
         with pytest.raises(TurnTimeout):

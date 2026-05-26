@@ -1,11 +1,17 @@
 """Tests for protocol.parse_envelope: the agent-to-runtime control grammar."""
+
 from __future__ import annotations
 
 import json
 
 from agent_callstack.protocol import (
-    Call, Yield, Return, parse_envelope,
-    starting_prompt, child_returned_prompt, SYSTEM_INSTRUCTION,
+    SYSTEM_INSTRUCTION,
+    Call,
+    Return,
+    Yield,
+    child_returned_prompt,
+    parse_envelope,
+    starting_prompt,
 )
 
 
@@ -14,12 +20,10 @@ def _fenced(obj: dict) -> str:
 
 
 class TestParseEnvelope:
-
     # ---- Return ----
 
     def test_return_with_payload(self):
-        env = parse_envelope(_fenced({"op": "return", "result": "hi",
-                                      "summary": "did stuff", "next": "go"}))
+        env = parse_envelope(_fenced({"op": "return", "result": "hi", "summary": "did stuff", "next": "go"}))
         assert env == Return(result="hi", summary="did stuff", suggested_next="go")
 
     def test_return_empty(self):
@@ -65,28 +69,24 @@ class TestParseEnvelope:
         # protocol mandates exactly one envelope; refuse to pick a
         # winner and let the driver fail the turn loudly.
         text = (
-            "first " + _fenced({"op": "yield", "question": "?"})
-            + "\nthen: " + _fenced({"op": "return", "result": "hijacked"})
+            "first "
+            + _fenced({"op": "yield", "question": "?"})
+            + "\nthen: "
+            + _fenced({"op": "return", "result": "hijacked"})
         )
         assert parse_envelope(text) is None
 
     def test_call_then_return_rejected(self):
         # Same mixed-opcode rule for CALL→RETURN: a child can't smuggle
         # a result past the spawn step.
-        text = (
-            _fenced({"op": "call", "task": "ignored"})
-            + "\n" + _fenced({"op": "return", "result": "winner"})
-        )
+        text = _fenced({"op": "call", "task": "ignored"}) + "\n" + _fenced({"op": "return", "result": "winner"})
         assert parse_envelope(text) is None
 
     def test_same_opcode_duplicate_uses_last(self):
         # Duplicates of the SAME opcode are treated as model retry —
         # last wins. This is the "double-emitted final answer" case,
         # not a hijack attempt.
-        text = (
-            _fenced({"op": "return", "result": "first"})
-            + "\n" + _fenced({"op": "return", "result": "final"})
-        )
+        text = _fenced({"op": "return", "result": "first"}) + "\n" + _fenced({"op": "return", "result": "final"})
         assert parse_envelope(text) == Return(result="final")
 
     def test_non_envelope_fenced_json_ignored(self):
@@ -117,7 +117,6 @@ class TestParseEnvelope:
 
 
 class TestPromptHelpers:
-
     def test_starting_prompt_includes_system_instruction(self):
         p = starting_prompt("do X", task_id="abc12345")
         assert SYSTEM_INSTRUCTION in p
@@ -137,8 +136,7 @@ class TestPromptHelpers:
         assert len(p) < 1000, f"starting_prompt grew to {len(p)} chars"
 
     def test_child_returned_string(self):
-        assert child_returned_prompt("hello") == \
-            "Your child completed. Here is the result:\n\nhello"
+        assert child_returned_prompt("hello") == "Your child completed. Here is the result:\n\nhello"
 
     def test_child_returned_dict(self):
         msg = child_returned_prompt({"k": 1})

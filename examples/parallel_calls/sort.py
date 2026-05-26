@@ -8,5 +8,6 @@ def quicksort(arr):
     right = [x for x in arr if x > pivot]
     return quicksort(left) + mid + quicksort(right)
 
+
 if __name__ == "__main__":
     print(quicksort([64, 34, 25, 12, 22, 11, 90]))

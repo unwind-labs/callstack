@@ -14,6 +14,7 @@ testable without spinning up FastMCP or parsing envelopes.
 This is the package's async adapter; the synchronous core (Caller, Driver,
 channel) stays asyncio-free.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -33,15 +34,16 @@ class _CallerLike(Protocol):
     module from the package root (where `Caller` lives) and avoids a circular
     import."""
 
-    def call_many(self, tasks: Sequence[str], *,
-                  context: str = "fork") -> MultiResult: ...
+    def call_many(self, tasks: Sequence[str], *, context: str = "fork") -> MultiResult: ...
 
 
 # ---------- start() outcomes ----------
 
+
 @dataclass(frozen=True)
 class Started:
     """The run was scheduled and parked in the registry."""
+
     invoke_id: str
     report_path: str
 
@@ -50,6 +52,7 @@ class Started:
 class CapReached:
     """The registry is full; the run was NOT scheduled. `outstanding` runs are
     parked against a cap of `cap`."""
+
     cap: int
     outstanding: int
 
@@ -59,10 +62,12 @@ StartOutcome = Union[Started, CapReached]
 
 # ---------- reconcile() outcomes ----------
 
+
 @dataclass(frozen=True)
 class Pending:
     """Still running after the await budget elapsed. The entry is kept so the
     caller can poll again."""
+
     invoke_id: str
     report_path: str
 
@@ -70,6 +75,7 @@ class Pending:
 @dataclass(frozen=True)
 class Done:
     """The run finished; `result` is its `MultiResult`. The entry was popped."""
+
     invoke_id: str
     report_path: str
     result: MultiResult
@@ -80,6 +86,7 @@ class Crashed:
     """`call_many` raised (an internal failure, not a per-task `CallFailed`).
     The entry was popped and the run's own frames force-finalized. `error` is a
     pre-formatted ``Type: message`` string."""
+
     invoke_id: str
     report_path: str
     error: str
@@ -88,6 +95,7 @@ class Crashed:
 @dataclass(frozen=True)
 class NotFound:
     """No run with this `invoke_id` is (or ever was) in the registry."""
+
     invoke_id: str
 
 
@@ -126,9 +134,16 @@ class BackgroundRuns:
         self._runs: dict[str, _Run] = {}
         self._max_outstanding = max_outstanding or max_background
 
-    def start(self, *, invoke_id: str, caller: _CallerLike,
-              tasks: Sequence[str], context: str,
-              report_path: str, log_dir: Path) -> StartOutcome:
+    def start(
+        self,
+        *,
+        invoke_id: str,
+        caller: _CallerLike,
+        tasks: Sequence[str],
+        context: str,
+        report_path: str,
+        log_dir: Path,
+    ) -> StartOutcome:
         """Schedule `caller.call_many(tasks, context=...)` on a worker thread
         and park it under `invoke_id`. First reaps abandoned fire-and-forget
         runs (so a host that fires fast background calls and never awaits them
@@ -152,13 +167,14 @@ class BackgroundRuns:
             asyncio.to_thread(caller.call_many, list(tasks), context=context)
         )
         self._runs[invoke_id] = _Run(
-            task=task, report_path=report_path,
-            log_dir=Path(log_dir), invoke_id=invoke_id,
+            task=task,
+            report_path=report_path,
+            log_dir=Path(log_dir),
+            invoke_id=invoke_id,
         )
         return Started(invoke_id=invoke_id, report_path=report_path)
 
-    async def reconcile(self, invoke_id: str, *,
-                        timeout: float) -> ReconcileOutcome:
+    async def reconcile(self, invoke_id: str, *, timeout: float) -> ReconcileOutcome:
         """Await the run up to `timeout` seconds.
 
         - unknown id            -> `NotFound`
@@ -173,7 +189,8 @@ class BackgroundRuns:
             return NotFound(invoke_id)
         try:
             multi: MultiResult = await asyncio.wait_for(
-                asyncio.shield(run.task), timeout=timeout,
+                asyncio.shield(run.task),
+                timeout=timeout,
             )
         except asyncio.TimeoutError:
             # Healthy and still running — keep the entry, do NOT finalize.
@@ -191,8 +208,7 @@ class BackgroundRuns:
                 run,
                 reason="background call_many raised before terminal frame state",
             )
-            return Crashed(invoke_id, run.report_path,
-                           f"{type(e).__name__}: {e}")
+            return Crashed(invoke_id, run.report_path, f"{type(e).__name__}: {e}")
         self._runs.pop(invoke_id, None)
         return Done(invoke_id, run.report_path, multi)
 
@@ -205,8 +221,7 @@ class BackgroundRuns:
         so its result survives here until the next `reconcile` delivers it.
         Only `done() and not polled` entries are truly abandoned. Any pending
         exception on a reaped task is consumed so asyncio doesn't warn at GC."""
-        stale = [iid for iid, r in self._runs.items()
-                 if r.task.done() and not r.polled]
+        stale = [iid for iid, r in self._runs.items() if r.task.done() and not r.polled]
         for iid in stale:
             run = self._runs.pop(iid)
             if run.task.cancelled():
@@ -254,10 +269,15 @@ class BackgroundRuns:
         — logs to stderr on failure (the run already crashed; this is cleanup)."""
         try:
             report = InvocationReport(
-                invoke_id=run.invoke_id, log_dir=run.log_dir, cwd="",
+                invoke_id=run.invoke_id,
+                log_dir=run.log_dir,
+                cwd="",
             )
             report.finalize_own_frames(reason=reason)
         except Exception as e:  # pragma: no cover - defensive
-            print(f"[callstack] WARN finalize_own_frames raised reconciling "
-                  f"background run {run.invoke_id} ({reason}): "
-                  f"{type(e).__name__}: {e}", file=sys.stderr)
+            print(
+                f"[callstack] WARN finalize_own_frames raised reconciling "
+                f"background run {run.invoke_id} ({reason}): "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )

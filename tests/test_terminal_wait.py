@@ -13,6 +13,7 @@ These tests pin the four signals the helper must honor:
    blocks (the exact shape Claude Code writes), NOT via raw substring
    match on the JSONL line.
 """
+
 from __future__ import annotations
 
 import json
@@ -20,22 +21,22 @@ import threading
 import time
 from pathlib import Path
 
-import pytest
-
 import agent_callstack.state as st
+import pytest
 from agent_callstack.driver import Node, Tree
 from agent_callstack.session import SessionRef
 from agent_callstack.terminal_wait import wait_for_terminal_signals
 
-
 # ---------- helpers ----------
+
 
 def _make_node(*, clone_path: Path, session_id: str = "sess-x") -> Node:
     """Construct a Node already in AwaitingTurn — i.e. the shape it has
     when finalize would have otherwise sealed it as `running`."""
     nid = "abc123ef" + "0" * 24
     return Node(
-        id=nid, task="do thing",
+        id=nid,
+        task="do thing",
         state=st.AwaitingTurn(session_id=session_id),
         session_id=session_id,
         clone_path=str(clone_path),
@@ -52,9 +53,9 @@ def _make_tree(node: Node, tmp_path: Path) -> Tree:
     )
 
 
-def _assistant_envelope_line(env_text: str,
-                             *, session_id: str = "sess-x",
-                             timestamp: str = "2026-05-18T15:49:09.206Z") -> str:
+def _assistant_envelope_line(
+    env_text: str, *, session_id: str = "sess-x", timestamp: str = "2026-05-18T15:49:09.206Z"
+) -> str:
     """One JSONL row in the shape Claude Code emits for assistant turns,
     with `env_text` (a fenced ```json envelope) embedded in the text
     content block — the same escaping the repro JSONL exhibits."""
@@ -87,6 +88,7 @@ def _fenced(op: str, **payload) -> str:
 
 # ---------- tests ----------
 
+
 class TestRecoverReturnEnvelope:
     def test_late_return_transitions_to_done(self, tmp_path):
         clone = tmp_path / "child.jsonl"
@@ -94,8 +96,7 @@ class TestRecoverReturnEnvelope:
         node = _make_node(clone_path=clone)
         tree = _make_tree(node, tmp_path)
 
-        envelope_text = _fenced("return", result="late-but-recovered",
-                                summary="went well", next="next-step")
+        envelope_text = _fenced("return", result="late-but-recovered", summary="went well", next="next-step")
 
         # The session JSONL opens with a header stamped at fork-creation
         # (the node's true start) and ends with the late return envelope.
@@ -109,8 +110,8 @@ class TestRecoverReturnEnvelope:
         def append_late():
             time.sleep(0.15)
             with clone.open("a") as fh:
-                fh.write(_assistant_envelope_line(
-                    envelope_text, timestamp=envelope_ts) + "\n")
+                fh.write(_assistant_envelope_line(envelope_text, timestamp=envelope_ts) + "\n")
+
         threading.Thread(target=append_late, daemon=True).start()
 
         wait_for_terminal_signals(tree, wait_budget_seconds=5.0)
@@ -149,8 +150,8 @@ class TestRecoverReturnEnvelope:
         def append_late():
             time.sleep(0.15)
             with clone.open("a") as fh:
-                fh.write(_assistant_envelope_line(
-                    envelope_text, timestamp=envelope_ts) + "\n")
+                fh.write(_assistant_envelope_line(envelope_text, timestamp=envelope_ts) + "\n")
+
         threading.Thread(target=append_late, daemon=True).start()
 
         wait_for_terminal_signals(tree, wait_budget_seconds=5.0)
@@ -173,6 +174,7 @@ class TestRecoverYieldEnvelope:
             time.sleep(0.1)
             with clone.open("a") as fh:
                 fh.write(_assistant_envelope_line(envelope_text) + "\n")
+
         threading.Thread(target=append_late, daemon=True).start()
 
         wait_for_terminal_signals(tree, wait_budget_seconds=5.0)
@@ -201,7 +203,8 @@ class TestTimeoutOnBudgetExhaustion:
         # A node that never resolved its session JSONL — the waiter has
         # nothing to tail, so the only valid outcome is budget expiry.
         node = Node(
-            id="x" * 32, task="t",
+            id="x" * 32,
+            task="t",
             state=st.AwaitingTurn(session_id="sess-y"),
             session_id="sess-y",
             clone_path=None,
@@ -285,23 +288,28 @@ class TestEnvelopeShapeIsTheReproShape:
         # Build the exact shape the repro JSONL line 136 had: an assistant
         # message whose `content[0].text` is a long string containing a
         # fenced ```json envelope, all properly JSON-escaped on the wire.
-        wire_line = json.dumps({
-            "type": "assistant",
-            "sessionId": "sess-x",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": (
-                        "Write permissions appear blocked. Returning to "
-                        "parent.\n\n"
-                        "```json\n"
-                        '{"op": "return", "result": "phase 3 done", '
-                        '"summary": "all good"}\n'
-                        "```"
-                    )},
-                ],
-            },
-        })
+        wire_line = json.dumps(
+            {
+                "type": "assistant",
+                "sessionId": "sess-x",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Write permissions appear blocked. Returning to "
+                                "parent.\n\n"
+                                "```json\n"
+                                '{"op": "return", "result": "phase 3 done", '
+                                '"summary": "all good"}\n'
+                                "```"
+                            ),
+                        },
+                    ],
+                },
+            }
+        )
         # Confirm the wire form is genuinely escaped (the on-disk
         # representation of `"op":"return"` is `\"op\": \"return\"`).
         assert '\\"op\\": \\"return\\"' in wire_line
@@ -310,6 +318,7 @@ class TestEnvelopeShapeIsTheReproShape:
             time.sleep(0.1)
             with clone.open("a") as fh:
                 fh.write(wire_line + "\n")
+
         threading.Thread(target=append_late, daemon=True).start()
 
         wait_for_terminal_signals(tree, wait_budget_seconds=3.0)
@@ -328,15 +337,15 @@ class TestIgnoresIrrelevantJsonlRecords:
         node = _make_node(clone_path=clone)
         tree = _make_tree(node, tmp_path)
 
-        noise = json.dumps({
-            "type": "user",
-            "message": {
-                "role": "user",
-                "content": [{"type": "text",
-                             "text": "```json\n{\"op\": \"return\", "
-                                     "\"result\": \"NOPE\"}\n```"}],
-            },
-        })
+        noise = json.dumps(
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": '```json\n{"op": "return", "result": "NOPE"}\n```'}],
+                },
+            }
+        )
 
         def append_noise_then_real():
             time.sleep(0.1)
@@ -344,8 +353,8 @@ class TestIgnoresIrrelevantJsonlRecords:
                 fh.write(noise + "\n")
             time.sleep(0.1)
             with clone.open("a") as fh:
-                fh.write(_assistant_envelope_line(
-                    _fenced("return", result="real")) + "\n")
+                fh.write(_assistant_envelope_line(_fenced("return", result="real")) + "\n")
+
         threading.Thread(target=append_noise_then_real, daemon=True).start()
 
         wait_for_terminal_signals(tree, wait_budget_seconds=3.0)
@@ -373,9 +382,11 @@ class TestNestedNodesAreWaitedOnToo:
         def append_late():
             time.sleep(0.1)
             with child_clone.open("a") as fh:
-                fh.write(_assistant_envelope_line(
-                    _fenced("return", result="child-recovered"),
-                    session_id="child-sess") + "\n")
+                fh.write(
+                    _assistant_envelope_line(_fenced("return", result="child-recovered"), session_id="child-sess")
+                    + "\n"
+                )
+
         threading.Thread(target=append_late, daemon=True).start()
 
         wait_for_terminal_signals(tree, wait_budget_seconds=3.0)
@@ -387,12 +398,17 @@ class TestNestedNodesAreWaitedOnToo:
         assert root.state.result == "root-ok"
 
 
-@pytest.mark.parametrize("applied_envelope, expected_state", [
-    ("return", st.Done),
-    ("yield", st.AwaitingUser),
-])
+@pytest.mark.parametrize(
+    "applied_envelope, expected_state",
+    [
+        ("return", st.Done),
+        ("yield", st.AwaitingUser),
+    ],
+)
 def test_envelope_routed_through_state_machine(
-    tmp_path, applied_envelope, expected_state,
+    tmp_path,
+    applied_envelope,
+    expected_state,
 ):
     """Recovery goes through the canonical `state.step` transition, so a
     recovered `op:return` lands on `Done` and `op:yield` on `AwaitingUser`
@@ -408,14 +424,14 @@ def test_envelope_routed_through_state_machine(
 
     envelope_text = _fenced(
         applied_envelope,
-        **({"result": "x"} if applied_envelope == "return"
-           else {"question": "?"}),
+        **({"result": "x"} if applied_envelope == "return" else {"question": "?"}),
     )
 
     def append_late():
         time.sleep(0.1)
         with clone.open("a") as fh:
             fh.write(_assistant_envelope_line(envelope_text) + "\n")
+
     threading.Thread(target=append_late, daemon=True).start()
 
     wait_for_terminal_signals(tree, wait_budget_seconds=3.0)
@@ -428,8 +444,7 @@ def test_awaiting_child_falls_through_to_timeout(tmp_path):
     own turn hasn't resumed), so even with a `return` envelope on its
     JSONL it must seal as `Timeout`, never `Done`."""
     clone = tmp_path / "child.jsonl"
-    clone.write_text(
-        _assistant_envelope_line(_fenced("return", result="x")) + "\n")
+    clone.write_text(_assistant_envelope_line(_fenced("return", result="x")) + "\n")
     node = _make_node(clone_path=clone)
     node.state = st.AwaitingChild(session_id="sess-x", child_id="c1")
     tree = _make_tree(node, tmp_path)

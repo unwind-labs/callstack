@@ -1,4 +1,5 @@
 """Tests for TraceWriter (append JSONL) and TreeStore (sidecar snapshots)."""
+
 from __future__ import annotations
 
 import json
@@ -6,16 +7,22 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-
 from agent_callstack.trace import TraceWriter, TreeStore, _json_default
 
 
 def _base_kwargs(**overrides):
     """Minimal required kwargs for TraceWriter.write; tests override what they need."""
     base = dict(
-        depth=1, task="t", session_id="s", result="", duration=0.0,
-        api_request_id="req_test", input_tokens=100, output_tokens=50,
-        cache_read_tokens=0, cache_creation_tokens=0,
+        depth=1,
+        task="t",
+        session_id="s",
+        result="",
+        duration=0.0,
+        api_request_id="req_test",
+        input_tokens=100,
+        output_tokens=50,
+        cache_read_tokens=0,
+        cache_creation_tokens=0,
         started_at_utc="2026-04-16T00:00:00+00:00",
         ended_at_utc="2026-04-16T00:00:01+00:00",
     )
@@ -24,17 +31,23 @@ def _base_kwargs(**overrides):
 
 
 class TestTraceWriter:
-
     def test_appends_jsonl(self, tmp_path):
         writer = TraceWriter(tmp_path / "traces")
-        writer.write(**_base_kwargs(depth=1, task="t1", session_id="s1",
-                                    result="hello", duration=1.23,
-                                    api_request_id="req_abc",
-                                    input_tokens=200, output_tokens=75,
-                                    cache_read_tokens=150,
-                                    cache_creation_tokens=50))
-        writer.write(**_base_kwargs(depth=2, task="t2", session_id="s2",
-                                    result="x", duration=0.5, error="boom"))
+        writer.write(
+            **_base_kwargs(
+                depth=1,
+                task="t1",
+                session_id="s1",
+                result="hello",
+                duration=1.23,
+                api_request_id="req_abc",
+                input_tokens=200,
+                output_tokens=75,
+                cache_read_tokens=150,
+                cache_creation_tokens=50,
+            )
+        )
+        writer.write(**_base_kwargs(depth=2, task="t2", session_id="s2", result="x", duration=0.5, error="boom"))
 
         path = tmp_path / "traces" / "call_trace.jsonl"
         lines = path.read_text().strip().split("\n")
@@ -47,8 +60,10 @@ class TestTraceWriter:
         assert entry1["error"] is None
         assert entry1["api_request_id"] == "req_abc"
         assert entry1["usage"] == {
-            "input_tokens": 200, "output_tokens": 75,
-            "cache_read_tokens": 150, "cache_creation_tokens": 50,
+            "input_tokens": 200,
+            "output_tokens": 75,
+            "cache_read_tokens": 150,
+            "cache_creation_tokens": 50,
         }
         assert entry1["timestamp"] == "2026-04-16T00:00:00+00:00"
         assert entry1["ended_at"] == "2026-04-16T00:00:01+00:00"
@@ -87,12 +102,9 @@ class TestTraceWriter:
         def hammer(tid: int) -> None:
             start.wait()
             for k in range(per_thread):
-                writer.write(**_base_kwargs(
-                    depth=tid, task=f"t{tid}-{k}", session_id=f"s{tid}",
-                    result=big))
+                writer.write(**_base_kwargs(depth=tid, task=f"t{tid}-{k}", session_id=f"s{tid}", result=big))
 
-        threads = [threading.Thread(target=hammer, args=(i,))
-                   for i in range(n_threads)]
+        threads = [threading.Thread(target=hammer, args=(i,)) for i in range(n_threads)]
         for t in threads:
             t.start()
         start.set()  # release all threads at once to maximize contention
@@ -107,7 +119,6 @@ class TestTraceWriter:
 
 
 class TestTreeStore:
-
     def test_save_and_load_round_trip(self, tmp_path):
         clone = tmp_path / "clone.jsonl"
         clone.write_text("")
@@ -130,6 +141,7 @@ class TestTreeStore:
         """SEC-007: two threads racing to load the same sidecar must yield
         exactly one winner; the loser sees None, no exception escapes."""
         import threading
+
         clone = tmp_path / "clone.jsonl"
         clone.write_text("")
         store = TreeStore()

@@ -4,10 +4,10 @@ runtime's env-var names and parsing policy.
 These tests pin the typed readers' default/fallback policy and the
 defensive ceilings so a future change can't silently widen them.
 """
+
 from __future__ import annotations
 
 import pytest
-
 from agent_callstack import env
 
 

@@ -13,17 +13,14 @@ silently under-covers. Three properties, one per pure module:
   3. env propagation — a cap a parent chooses in the supported range reaches a
      child unchanged (CORR-101: no silent revert to the default budget).
 """
+
 from __future__ import annotations
 
 import json
 import os
 
-from hypothesis import given, settings
-from hypothesis import strategies as st
-
-from agent_callstack import Caller
-from agent_callstack import env
-from agent_callstack.env import ENV_MAX_DEPTH, _DEFAULT_MAX_DEPTH, _MAX_DEPTH_CEILING
+from agent_callstack import Caller, env
+from agent_callstack.env import _DEFAULT_MAX_DEPTH, _MAX_DEPTH_CEILING, ENV_MAX_DEPTH
 from agent_callstack.protocol import Call, Return, Yield, parse_envelope
 from agent_callstack.state import (
     Abandoned,
@@ -46,7 +43,7 @@ from agent_callstack.state import (
     status_label,
     step,
 )
-
+from hypothesis import given, settings, strategies as st
 
 # ---------- shared strategies ----------
 
@@ -56,15 +53,13 @@ from agent_callstack.state import (
 # Dict keys are text because JSON object keys are always strings.
 _json = st.recursive(
     st.none() | st.booleans() | st.integers() | st.text(),
-    lambda children: (
-        st.lists(children, max_size=3)
-        | st.dictionaries(st.text(max_size=5), children, max_size=3)
-    ),
+    lambda children: (st.lists(children, max_size=3) | st.dictionaries(st.text(max_size=5), children, max_size=3)),
     max_leaves=5,
 )
 
 
 # ---------- 1. protocol round-trip + crash-freedom ----------
+
 
 def _encode(envelope) -> str:
     """The canonical fenced-JSON wire form for an envelope. protocol.py owns
@@ -99,12 +94,31 @@ _envelopes = st.one_of(
 # (fence open/close, op/keys, whole mini-envelopes) instead of mostly-random
 # noise that never reaches the json.loads path.
 _fence_noise = st.lists(
-    st.sampled_from([
-        "```json", "```", "\n", "{", "}", "[", "]", ":", ",", '"',
-        '"op"', '"call"', '"yield"', '"return"', '"task"', '"question"',
-        "garbage", '{"op":"call","task":"x"}', '{"op": "return"}',
-        '{"op":"yield"}{"op":"return"}', "{not json}",
-    ]),
+    st.sampled_from(
+        [
+            "```json",
+            "```",
+            "\n",
+            "{",
+            "}",
+            "[",
+            "]",
+            ":",
+            ",",
+            '"',
+            '"op"',
+            '"call"',
+            '"yield"',
+            '"return"',
+            '"task"',
+            '"question"',
+            "garbage",
+            '{"op":"call","task":"x"}',
+            '{"op": "return"}',
+            '{"op":"yield"}{"op":"return"}',
+            "{not json}",
+        ]
+    ),
     max_size=10,
 ).map("".join)
 
@@ -134,8 +148,14 @@ class TestProtocolRoundTrip:
 # ---------- 2. state machine invariants ----------
 
 _STATE_TYPES = (
-    Pending, AwaitingTurn, AwaitingChild, AwaitingUser,
-    Done, Failed, Timeout, Abandoned,
+    Pending,
+    AwaitingTurn,
+    AwaitingChild,
+    AwaitingUser,
+    Done,
+    Failed,
+    Timeout,
+    Abandoned,
 )
 _EFFECT_TYPES = (RunTurn, SpawnChild)
 _TERMINALS = [Done(), Failed(error="boom"), Timeout(), Abandoned(error="gone")]
@@ -177,10 +197,8 @@ class TestStateMachineInvariants:
             if kind == "pending":
                 event = Start()
             elif kind == "awaiting_turn":
-                sid = established_sid or data.draw(
-                    st.uuids().map(str))
-                choice = data.draw(
-                    st.sampled_from(["return", "yield", "call", "fail"]))
+                sid = established_sid or data.draw(st.uuids().map(str))
+                choice = data.draw(st.sampled_from(["return", "yield", "call", "fail"]))
                 if choice == "return":
                     event = TurnCompleted(Return(result=data.draw(_json)), sid)
                 elif choice == "yield":
@@ -193,11 +211,9 @@ class TestStateMachineInvariants:
                     event = TurnFailed(error=data.draw(st.text()), session_id=None)
             elif kind == "awaiting_child":
                 if data.draw(st.booleans()):
-                    event = ChildDone(child_id=state.child_id,
-                                      result=data.draw(_json))
+                    event = ChildDone(child_id=state.child_id, result=data.draw(_json))
                 else:
-                    event = ChildFailed(child_id=state.child_id,
-                                        error=data.draw(st.text()))
+                    event = ChildFailed(child_id=state.child_id, error=data.draw(st.text()))
             else:  # awaiting_user
                 event = UserReplied(reply=data.draw(st.text()))
 
@@ -214,8 +230,8 @@ class TestStateMachineInvariants:
                     established_sid = new_sid
                 else:
                     assert new_sid == established_sid, (
-                        "session id drifted mid-walk; the driver keys child "
-                        "resumption off a stable id")
+                        "session id drifted mid-walk; the driver keys child resumption off a stable id"
+                    )
             state = new_state
 
     @given(st.sampled_from(_TERMINALS), st.sampled_from(_ALL_EVENTS))
@@ -229,11 +245,12 @@ class TestStateMachineInvariants:
         except AssertionError:
             return
         raise AssertionError(
-            f"{terminal.kind} accepted {type(event).__name__} but terminal "
-            f"states must reject all events")
+            f"{terminal.kind} accepted {type(event).__name__} but terminal states must reject all events"
+        )
 
 
 # ---------- 3. env / cap propagation ----------
+
 
 def _child_reads_max_depth(stamped: str) -> int:
     """Simulate the child process: read the stamped value back through the
@@ -254,8 +271,7 @@ class TestCapPropagation:
     unchanged. The example test pins max_depth=3 and the default; this pins
     the whole supported range."""
 
-    @given(st.one_of(st.none(), st.integers(min_value=1,
-                                            max_value=_MAX_DEPTH_CEILING)))
+    @given(st.one_of(st.none(), st.integers(min_value=1, max_value=_MAX_DEPTH_CEILING)))
     @settings(max_examples=100, deadline=None)
     def test_supported_cap_reaches_child_without_drift(self, n):
         """For any cap in the supported range (1.._MAX_DEPTH_CEILING) — and
@@ -270,5 +286,5 @@ class TestCapPropagation:
 
         assert stamped == str(expected), "parent stamped a cap it didn't choose"
         assert _child_reads_max_depth(stamped) == expected, (
-            "child enforces a different cap than the parent chose — CORR-101 "
-            "drift")
+            "child enforces a different cap than the parent chose — CORR-101 drift"
+        )

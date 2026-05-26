@@ -17,6 +17,7 @@ exception escaping the asyncio loop, or a normal `sys.exit`. Each live
 `_LiveReporter` writes a post-mortem frame from its in-memory tree so
 the merged report still settles.
 """
+
 from __future__ import annotations
 
 import os
@@ -26,15 +27,18 @@ import sys
 import threading
 from pathlib import Path
 
+import agent_callstack as ac
 import pytest
 import yaml
-
-import agent_callstack as ac
-from agent_callstack import InvocationReport, ROOT_FRAME_KEY
-from agent_callstack import state as st
-from agent_callstack import reporter as reporter_mod
-from agent_callstack import shutdown as shutdown_mod
+from agent_callstack import (
+    ROOT_FRAME_KEY,
+    InvocationReport,
+    reporter as reporter_mod,
+    shutdown as shutdown_mod,
+    state as st,
+)
 from agent_callstack.driver import Node, Tree
+
 # White-box imports: the abandonment primitives and the shutdown-hook
 # internals below have no honest expression through the public
 # `InvocationReport` boundary — they operate on in-memory `Tree`/node-dict
@@ -42,31 +46,31 @@ from agent_callstack.driver import Node, Tree
 # behavior (frame finalize, merged report) is exercised via `InvocationReport`;
 # these names are imported directly on purpose to test the machinery beneath it.
 from agent_callstack.reporter import (
-    _LiveReporter,
     _abandon_frame_nodes_in_place,
     _abandon_tree_nodes_in_place,
     _flush_active_reporters,
+    _LiveReporter,
     _register_active_reporter,
     _unregister_active_reporter,
 )
 from agent_callstack.session import SessionRef
 
-
 # ---------- shared helpers ----------
 
-def _running_node(nid: str, task: str = "t", *,
-                  session_id: str | None = None) -> Node:
+
+def _running_node(nid: str, task: str = "t", *, session_id: str | None = None) -> Node:
     sid = session_id or f"sess-{nid}"
     return Node(
-        id=nid, task=task,
+        id=nid,
+        task=task,
         state=st.AwaitingTurn(session_id=sid),
         session_id=sid,
     )
 
 
-def _report(tmp_path: Path, *, invoke_id: str = "inv-shutdown-test",
-            frame_key: str = ROOT_FRAME_KEY,
-            is_nested: bool = False) -> InvocationReport:
+def _report(
+    tmp_path: Path, *, invoke_id: str = "inv-shutdown-test", frame_key: str = ROOT_FRAME_KEY, is_nested: bool = False
+) -> InvocationReport:
     return InvocationReport(
         invoke_id=invoke_id,
         log_dir=tmp_path / "log",
@@ -83,17 +87,19 @@ def _make_reporter(tmp_path: Path, **report_kwargs) -> _LiveReporter:
     return report.reporter(kind="call", tasks=["t"], started_at="s")
 
 
-def _write_frame_with(report: InvocationReport, *, frame_key: str, tree: Tree,
-                      writer_pid: int) -> Path:
+def _write_frame_with(report: InvocationReport, *, frame_key: str, tree: Tree, writer_pid: int) -> Path:
     """Write a frame YAML file in the shape the reporter would produce
     and return its path so tests can probe / re-read it. Goes through the
     public boundary's `write_frame` so the on-disk shape stays canonical."""
     frame = {
         "frame_key": frame_key,
         "is_nested": frame_key != ROOT_FRAME_KEY,
-        "kind": "call", "tasks": ["t"], "cwd": report.cwd,
+        "kind": "call",
+        "tasks": ["t"],
+        "cwd": report.cwd,
         "writer_pid": writer_pid,
-        "started_at": "s", "ended_at": "e",
+        "started_at": "s",
+        "ended_at": "e",
         "tree": tree.to_dict(),
     }
     return report.write_frame(frame, key=frame_key)
@@ -123,6 +129,7 @@ def _clear_reporter_registry():
 # ==========================================================
 # Fix #2: atomic finalize at MCP boundary
 # ==========================================================
+
 
 class TestAbandonTreeInPlace:
     """`_abandon_tree_nodes_in_place` is the in-memory primitive both
@@ -166,9 +173,11 @@ class TestAbandonTreeInPlace:
         pass — that would erase real results."""
         parent = SessionRef(session_id="p", file=Path("/tmp/p.jsonl"))
         done = Node(
-            id="dddddddd", task="t",
+            id="dddddddd",
+            task="t",
             state=st.Done(session_id="s", result="kept"),
-            session_id="s", result="kept",
+            session_id="s",
+            result="kept",
         )
         tree = Tree(root_session=parent, nodes=[done], base_depth=0)
 
@@ -184,7 +193,8 @@ class TestAbandonTreeInPlace:
         and the parent would never get a chance to resume()."""
         parent = SessionRef(session_id="p", file=Path("/tmp/p.jsonl"))
         yielded = Node(
-            id="yyyyyyyy", task="t",
+            id="yyyyyyyy",
+            task="t",
             state=st.AwaitingUser(session_id="s", question="who?"),
             session_id="s",
         )
@@ -203,27 +213,33 @@ class TestAbandonFrameInPlace:
     trip on the MCP boundary path."""
 
     def test_promotes_running_dict_to_abandoned_kind(self):
-        nodes = [{
-            "id": "x", "task": "t",
-            "state": {"kind": "awaiting_turn", "session_id": "s"},
-            "children": [],
-        }]
+        nodes = [
+            {
+                "id": "x",
+                "task": "t",
+                "state": {"kind": "awaiting_turn", "session_id": "s"},
+                "children": [],
+            }
+        ]
         n = _abandon_frame_nodes_in_place(nodes, reason="boundary")
         assert n == 1
         assert nodes[0]["state"]["kind"] == "abandoned"
         assert "boundary" in nodes[0]["state"]["error"]
         assert nodes[0]["state"]["session_id"] == "s", (
-            "session_id must be preserved so chain-to-session lookups "
-            "still resolve after abandonment"
+            "session_id must be preserved so chain-to-session lookups still resolve after abandonment"
         )
         assert "boundary" in nodes[0]["error"]
 
     def test_does_not_clobber_existing_error(self):
-        nodes = [{
-            "id": "x", "task": "t", "error": "pre-existing",
-            "state": {"kind": "awaiting_child"},
-            "children": [],
-        }]
+        nodes = [
+            {
+                "id": "x",
+                "task": "t",
+                "error": "pre-existing",
+                "state": {"kind": "awaiting_child"},
+                "children": [],
+            }
+        ]
         _abandon_frame_nodes_in_place(nodes, reason="r")
         assert nodes[0]["error"] == "pre-existing", (
             "if the node already carried an error message, the abandonment "
@@ -232,26 +248,34 @@ class TestAbandonFrameInPlace:
         )
 
     def test_skips_awaiting_user_kind(self):
-        nodes = [{
-            "id": "x", "task": "t",
-            "state": {"kind": "awaiting_user", "session_id": "s",
-                      "question": "?"},
-            "children": [],
-        }]
+        nodes = [
+            {
+                "id": "x",
+                "task": "t",
+                "state": {"kind": "awaiting_user", "session_id": "s", "question": "?"},
+                "children": [],
+            }
+        ]
         n = _abandon_frame_nodes_in_place(nodes, reason="r")
         assert n == 0
         assert nodes[0]["state"]["kind"] == "awaiting_user"
 
     def test_recurses_into_children(self):
-        nodes = [{
-            "id": "p", "task": "p",
-            "state": {"kind": "awaiting_child"},
-            "children": [{
-                "id": "c", "task": "c",
-                "state": {"kind": "awaiting_turn"},
-                "children": [],
-            }],
-        }]
+        nodes = [
+            {
+                "id": "p",
+                "task": "p",
+                "state": {"kind": "awaiting_child"},
+                "children": [
+                    {
+                        "id": "c",
+                        "task": "c",
+                        "state": {"kind": "awaiting_turn"},
+                        "children": [],
+                    }
+                ],
+            }
+        ]
         n = _abandon_frame_nodes_in_place(nodes, reason="r")
         assert n == 2
 
@@ -275,7 +299,9 @@ class TestFinalizeOwnFrames:
         node = _running_node("aaaa1111")
         tree = Tree(root_session=parent, nodes=[node], base_depth=0)
         frame_path = _write_frame_with(
-            report, frame_key=ROOT_FRAME_KEY, tree=tree,
+            report,
+            frame_key=ROOT_FRAME_KEY,
+            tree=tree,
             writer_pid=os.getpid(),
         )
 
@@ -300,7 +326,9 @@ class TestFinalizeOwnFrames:
         # PID 1 (init) — it's always alive and never us.
         other_pid = 1 if os.getpid() != 1 else 2
         frame_path = _write_frame_with(
-            report, frame_key=ROOT_FRAME_KEY, tree=tree,
+            report,
+            frame_key=ROOT_FRAME_KEY,
+            tree=tree,
             writer_pid=other_pid,
         )
 
@@ -323,7 +351,9 @@ class TestFinalizeOwnFrames:
         node = _running_node("cccc3333")
         tree = Tree(root_session=parent, nodes=[node], base_depth=0)
         _write_frame_with(
-            report, frame_key=ROOT_FRAME_KEY, tree=tree,
+            report,
+            frame_key=ROOT_FRAME_KEY,
+            tree=tree,
             writer_pid=os.getpid(),
         )
 
@@ -332,21 +362,24 @@ class TestFinalizeOwnFrames:
 
         assert first is True
         assert second is False, (
-            "second pass must be a no-op — the frame's nodes are all "
-            "terminal now and there's nothing left to promote"
+            "second pass must be a no-op — the frame's nodes are all terminal now and there's nothing left to promote"
         )
 
     def test_returns_false_when_only_terminal_nodes(self, tmp_path):
         report = _report(tmp_path)
         parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
         done = Node(
-            id="ffff4444", task="t",
+            id="ffff4444",
+            task="t",
             state=st.Done(session_id="s", result="ok"),
-            session_id="s", result="ok",
+            session_id="s",
+            result="ok",
         )
         tree = Tree(root_session=parent, nodes=[done], base_depth=0)
         _write_frame_with(
-            report, frame_key=ROOT_FRAME_KEY, tree=tree,
+            report,
+            frame_key=ROOT_FRAME_KEY,
+            tree=tree,
             writer_pid=os.getpid(),
         )
 
@@ -363,7 +396,9 @@ class TestInvokeFallsBackToCurrentTree:
     might raise."""
 
     def test_falls_back_when_driver_run_raises_after_tree_stamp(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         # White-box: this test patches `_LiveReporter.finalize` as a class
         # attribute to assert the Caller's try/finally still drives a finalize
@@ -384,6 +419,7 @@ class TestInvokeFallsBackToCurrentTree:
         def capture(self, tree):
             captured_trees.append(tree)
             return real_finalize(self, tree)
+
         monkeypatch.setattr(_LiveReporter, "finalize", capture)
 
         # Patch Driver.run to stamp a partial tree then raise — the
@@ -392,7 +428,8 @@ class TestInvokeFallsBackToCurrentTree:
         parent_file.write_text("")
         parent = SessionRef(session_id="p", file=parent_file)
         monkeypatch.setattr(
-            SessionLocator, "locate",
+            SessionLocator,
+            "locate",
             lambda self, **kwargs: parent,
         )
         # Also patch SessionLocator() construction call site in _invoke;
@@ -401,9 +438,12 @@ class TestInvokeFallsBackToCurrentTree:
         def explosive_run(self, parent, tasks, base_depth=0, context="fork"):
             node = self._new_node(tasks[0])
             self.last_tree = Tree(
-                root_session=parent, nodes=[node], base_depth=base_depth,
+                root_session=parent,
+                nodes=[node],
+                base_depth=base_depth,
             )
             raise RuntimeError("simulated driver crash")
+
         monkeypatch.setattr(Driver, "run", explosive_run)
 
         caller = ac.Caller(
@@ -429,6 +469,7 @@ class TestInvokeFallsBackToCurrentTree:
 # Fix #3: shutdown / signal hardening
 # ==========================================================
 
+
 class TestActiveReporterRegistry:
     def test_construction_registers_reporter(self, tmp_path):
         with reporter_mod._ACTIVE_REPORTERS_LOCK:
@@ -443,9 +484,11 @@ class TestActiveReporterRegistry:
         r = _make_reporter(tmp_path)
         parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
         done = Node(
-            id="ddddeeee", task="t",
+            id="ddddeeee",
+            task="t",
             state=st.Done(session_id="s", result="ok"),
-            session_id="s", result="ok",
+            session_id="s",
+            result="ok",
         )
         tree = Tree(root_session=parent, nodes=[done], base_depth=0)
         r.finalize(tree)
@@ -500,9 +543,11 @@ class TestEmergencyFinalizeOnShutdown:
         r = _make_reporter(tmp_path)
         parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
         done = Node(
-            id="bbbb8888", task="t",
+            id="bbbb8888",
+            task="t",
             state=st.Done(session_id="s", result="real"),
-            session_id="s", result="real",
+            session_id="s",
+            result="real",
         )
         tree = Tree(root_session=parent, nodes=[done], base_depth=0)
         r.finalize(tree)  # this sets _finalized + unregisters
@@ -539,6 +584,7 @@ class TestEmergencyFinalizeOnShutdown:
 
         def boom(*a, **kw):
             raise OSError("disk gone")
+
         # Force the frame write to fail; the routine must swallow it.
         monkeypatch.setattr(r, "_write_frame", boom)
 
@@ -571,7 +617,9 @@ class TestFlushActiveReporters:
             assert n["state"]["kind"] == "abandoned"
 
     def test_one_reporter_failing_does_not_block_siblings(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         good = _make_reporter(tmp_path / "good")
         bad = _make_reporter(tmp_path / "bad")
@@ -584,8 +632,11 @@ class TestFlushActiveReporters:
         # Make `bad`'s emergency-finalize blow up. `good` must still run.
         def explode(*a, **kw):
             raise RuntimeError("intentional")
+
         monkeypatch.setattr(
-            bad, "_emergency_finalize_on_shutdown", explode,
+            bad,
+            "_emergency_finalize_on_shutdown",
+            explode,
         )
 
         _flush_active_reporters()  # must not raise
@@ -605,7 +656,9 @@ class TestSignalHandlerChain:
     KeyboardInterrupt or a parent's SIGTERM handling."""
 
     def test_chain_signal_handler_runs_flush_then_calls_prev(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         # Don't actually deliver a signal in the test — install the
         # handler explicitly and invoke its target callable.
@@ -617,7 +670,8 @@ class TestSignalHandlerChain:
         monkeypatch.setattr(signal, "getsignal", lambda sig: prev)
         installed: dict = {}
         monkeypatch.setattr(
-            signal, "signal",
+            signal,
+            "signal",
             lambda sig, handler: installed.setdefault("handler", handler),
         )
 
@@ -625,7 +679,8 @@ class TestSignalHandlerChain:
         # canonical implementation lives in `shutdown`; the reporter
         # re-export is just an alias, so we patch the source.
         monkeypatch.setattr(
-            shutdown_mod, "flush_active_reporters",
+            shutdown_mod,
+            "flush_active_reporters",
             lambda: calls.append("flushed"),
         )
 
@@ -640,11 +695,13 @@ class TestSignalHandlerChain:
         )
 
     def test_chain_signal_handler_tolerates_unsupported_signal(
-        self, monkeypatch,
+        self,
+        monkeypatch,
     ):
         # Some sandboxes don't allow signal installation. Must not raise.
         def fake_signal(sig, handler):
             raise ValueError("not allowed")
+
         monkeypatch.setattr(signal, "signal", fake_signal)
         # Must complete without propagating.
         shutdown_mod._chain_signal_handler(signal.SIGTERM)
@@ -722,11 +779,13 @@ class TestShutdownInstallIsIdempotent:
         atexit_calls: list = []
         signal_calls: list = []
         monkeypatch.setattr(
-            shutdown_mod.atexit, "register",
+            shutdown_mod.atexit,
+            "register",
             lambda fn: atexit_calls.append(fn),
         )
         monkeypatch.setattr(
-            shutdown_mod.signal, "signal",
+            shutdown_mod.signal,
+            "signal",
             lambda sig, handler: signal_calls.append((sig, handler)),
         )
         shutdown_mod._reset_for_tests()
@@ -743,23 +802,23 @@ class TestShutdownInstallIsIdempotent:
             shutdown_mod._reset_for_tests()
             shutdown_mod.install_shutdown_hooks()
         assert installs_under_test == 1, (
-            "install_shutdown_hooks must register atexit exactly once, "
-            "regardless of how many times it's called"
+            "install_shutdown_hooks must register atexit exactly once, regardless of how many times it's called"
         )
 
-    def test_registering_reporters_does_not_reinstall(self, tmp_path,
-                                                      monkeypatch):
+    def test_registering_reporters_does_not_reinstall(self, tmp_path, monkeypatch):
         """Reporter construction must NOT trigger signal install. The
         previous architecture installed-on-first-register and silently
         skipped when that "first register" came from a worker thread."""
         atexit_calls: list = []
         signal_calls: list = []
         monkeypatch.setattr(
-            shutdown_mod.atexit, "register",
+            shutdown_mod.atexit,
+            "register",
             lambda fn: atexit_calls.append(fn),
         )
         monkeypatch.setattr(
-            shutdown_mod.signal, "signal",
+            shutdown_mod.signal,
+            "signal",
             lambda sig, handler: signal_calls.append((sig, handler)),
         )
         # Constructing reporters with hooks ALREADY installed must not
@@ -767,12 +826,8 @@ class TestShutdownInstallIsIdempotent:
         r1 = _make_reporter(tmp_path / "a")
         r2 = _make_reporter(tmp_path / "b")
         r3 = _make_reporter(tmp_path / "c")
-        assert atexit_calls == [], (
-            "constructing reporters must not re-register atexit hooks"
-        )
-        assert signal_calls == [], (
-            "constructing reporters must not re-install signal handlers"
-        )
+        assert atexit_calls == [], "constructing reporters must not re-register atexit hooks"
+        assert signal_calls == [], "constructing reporters must not re-install signal handlers"
         # Reporters DID land in the registry though.
         with shutdown_mod._ACTIVE_REPORTERS_LOCK:
             assert r1 in shutdown_mod._ACTIVE_REPORTERS
@@ -780,7 +835,8 @@ class TestShutdownInstallIsIdempotent:
             assert r3 in shutdown_mod._ACTIVE_REPORTERS
 
     def test_install_from_worker_thread_skips_signal_handlers(
-        self, monkeypatch,
+        self,
+        monkeypatch,
     ):
         """REVIEW-202 regression: `signal.signal()` only runs on the main
         thread. The new contract is that `install_shutdown_hooks()` from
@@ -791,20 +847,21 @@ class TestShutdownInstallIsIdempotent:
         atexit_calls: list = []
         signal_calls: list = []
         monkeypatch.setattr(
-            shutdown_mod.atexit, "register",
+            shutdown_mod.atexit,
+            "register",
             lambda fn: atexit_calls.append(fn),
         )
         monkeypatch.setattr(
-            shutdown_mod.signal, "signal",
+            shutdown_mod.signal,
+            "signal",
             lambda sig, handler: signal_calls.append((sig, handler)),
         )
         shutdown_mod._reset_for_tests()
         result_holder: dict = {}
 
         def install_from_worker():
-            result_holder["installed_signals"] = (
-                shutdown_mod.install_shutdown_hooks()
-            )
+            result_holder["installed_signals"] = shutdown_mod.install_shutdown_hooks()
+
         try:
             t = threading.Thread(target=install_from_worker)
             t.start()
@@ -815,8 +872,7 @@ class TestShutdownInstallIsIdempotent:
             shutdown_mod._reset_for_tests()
             shutdown_mod.install_shutdown_hooks()
         assert result_holder["installed_signals"] is False, (
-            "install_shutdown_hooks called from a worker thread must "
-            "return False (no signal handlers wired)"
+            "install_shutdown_hooks called from a worker thread must return False (no signal handlers wired)"
         )
         # Worker-thread install still wires atexit — that has no
         # main-thread restriction in CPython.
@@ -832,6 +888,7 @@ class TestShutdownInstallIsIdempotent:
 # report.yaml that settles to status="abandoned" rather than
 # spinning forever.
 # ==========================================================
+
 
 class TestEndToEndSigtermProducesAbandonedReport:
     """Spawn a real Python subprocess that constructs a reporter with a
@@ -886,7 +943,8 @@ while True:
 """)
         proc = subprocess.Popen(
             [sys.executable, str(runner)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
         )
         try:
@@ -895,8 +953,7 @@ while True:
             assert proc.stdout is not None
             ready = proc.stdout.readline()
             assert ready.strip() == "READY", (
-                f"child failed to start: stdout={ready!r}, "
-                f"stderr={proc.stderr.read() if proc.stderr else ''!r}"
+                f"child failed to start: stdout={ready!r}, stderr={proc.stderr.read() if proc.stderr else ''!r}"
             )
 
             os.kill(proc.pid, signal.SIGTERM)
@@ -911,10 +968,7 @@ while True:
                 proc.kill()
                 proc.wait()
 
-        frame_path = (
-            tmp_path / "log" / "sigterm-test" / "_frames"
-            / f"{ROOT_FRAME_KEY}.yaml"
-        )
+        frame_path = tmp_path / "log" / "sigterm-test" / "_frames" / f"{ROOT_FRAME_KEY}.yaml"
         assert frame_path.exists(), (
             f"signal handler must have flushed a frame to disk before "
             f"the child exited; nothing at {frame_path}. "

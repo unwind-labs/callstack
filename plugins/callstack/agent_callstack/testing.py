@@ -9,6 +9,7 @@ For backward compatibility, `ScriptedChannel` (plus the
 `ScriptedResponse` / `ScriptedEntry` type aliases) is also re-exported
 from `agent_callstack.channel`.
 """
+
 from __future__ import annotations
 
 import threading
@@ -16,7 +17,6 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Union
 
 from .channel import TurnResult, _fire_on_session_id
-
 
 ScriptedResponse = Callable[[str, str, str], TurnResult]
 ScriptedEntry = Union[tuple[str, str], ScriptedResponse]
@@ -60,8 +60,7 @@ class ScriptedChannel:
         with self._lock:
             if not self.responses:
                 raise AssertionError(
-                    f"ScriptedChannel exhausted; "
-                    f"unscripted call: source={source_session_id}, mode={mode}"
+                    f"ScriptedChannel exhausted; unscripted call: source={source_session_id}, mode={mode}"
                 )
             self.log.append((source_session_id, prompt, mode))
             nxt = self.responses.pop(0)
@@ -74,7 +73,13 @@ class ScriptedChannel:
         if on_session_id is not None and session_id:
             _fire_on_session_id(on_session_id, session_id)
         return TurnResult(
-            text=text, session_id=session_id, duration=0.0,
-            api_request_id="", input_tokens=0, output_tokens=0,
-            cache_read_tokens=0, cache_creation_tokens=0, total_cost_usd=0.0,
+            text=text,
+            session_id=session_id,
+            duration=0.0,
+            api_request_id="",
+            input_tokens=0,
+            output_tokens=0,
+            cache_read_tokens=0,
+            cache_creation_tokens=0,
+            total_cost_usd=0.0,
         )

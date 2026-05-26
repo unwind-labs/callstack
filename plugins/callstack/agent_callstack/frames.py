@@ -14,6 +14,7 @@ Nothing here performs I/O outside of `_load_frames` (read + stat). The
 reporter owns all writes; the mtime-based "which session is the caller"
 lookup lives in `session.most_recent_session`.
 """
+
 from __future__ import annotations
 
 import copy
@@ -31,7 +32,6 @@ import yaml
 from . import state as _state
 from .driver import Node, Tree
 from .env import read_orphan_ttl_seconds
-
 
 _ROOT_FRAME_KEY = "root"
 
@@ -136,8 +136,7 @@ def _frame_age_seconds(frame: dict, *, now: Optional[float] = None) -> Optional[
     return wall_now - dt.timestamp()
 
 
-def _frame_writer_is_dead(frame: dict, *, ttl_seconds: float,
-                           now: Optional[float] = None) -> bool:
+def _frame_writer_is_dead(frame: dict, *, ttl_seconds: float, now: Optional[float] = None) -> bool:
     """True iff the frame's `writer_pid` is no longer alive OR its
     wall-clock age exceeds ``ttl_seconds``.
 
@@ -176,8 +175,7 @@ def _reconcile_orphan_states(frames_by_key: dict[str, list[dict]]) -> None:
     now = time.time()
     for frames in frames_by_key.values():
         for frame in frames:
-            if not _frame_writer_is_dead(frame, ttl_seconds=ttl_seconds,
-                                          now=now):
+            if not _frame_writer_is_dead(frame, ttl_seconds=ttl_seconds, now=now):
                 continue
             pid = frame.get("writer_pid")
             assert isinstance(pid, int)  # _frame_writer_is_dead enforces this
@@ -211,8 +209,7 @@ def mark_abandoned_in_dict_nodes(nodes: list, *, reason: str) -> int:
         state = n.get("state")
         if isinstance(state, dict):
             kind = state.get("kind")
-            if (isinstance(kind, str)
-                    and _state.is_eligible_for_abandonment(kind)):
+            if isinstance(kind, str) and _state.is_eligible_for_abandonment(kind):
                 err = f"abandoned: {reason} (state was {kind!r})"
                 sid = state.get("session_id") or n.get("session_id")
                 new_state: dict = {"kind": "abandoned", "error": err}
@@ -247,6 +244,7 @@ def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
     contents without poisoning subsequent loads.
     """
     import sys
+
     out: dict[str, list[dict]] = {}
     if not frames_dir.is_dir():
         return out
@@ -274,18 +272,21 @@ def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
     loaded = 0
     for p in frames_dir.glob("*.yaml"):
         if loaded >= _MAX_FRAMES_PER_LOAD:
-            print(f"[callstack] frames_dir {frames_dir} contains more than "
-                  f"{_MAX_FRAMES_PER_LOAD} files; further frames ignored",
-                  file=sys.stderr)
+            print(
+                f"[callstack] frames_dir {frames_dir} contains more than "
+                f"{_MAX_FRAMES_PER_LOAD} files; further frames ignored",
+                file=sys.stderr,
+            )
             break
         try:
             st = p.stat()
         except OSError:
             continue
         if st.st_size > _MAX_FRAME_FILE_BYTES:
-            print(f"[callstack] skipping oversized frame file {p} "
-                  f"({st.st_size} bytes > {_MAX_FRAME_FILE_BYTES})",
-                  file=sys.stderr)
+            print(
+                f"[callstack] skipping oversized frame file {p} ({st.st_size} bytes > {_MAX_FRAME_FILE_BYTES})",
+                file=sys.stderr,
+            )
             continue
         stat_key = (st.st_mtime_ns, st.st_size)
         d: Optional[dict] = None
@@ -306,8 +307,10 @@ def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
                 # preserve forward progress; the producer's next atomic
                 # write will land a fresh (mtime, size) tuple and we'll
                 # retry. SEC-011: log so corruption is observable.
-                print(f"[callstack] ignoring malformed frame file {p}: "
-                      f"{type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
+                print(
+                    f"[callstack] ignoring malformed frame file {p}: {type(e).__name__}: {str(e)[:200]}",
+                    file=sys.stderr,
+                )
                 continue
             if not isinstance(parsed, dict):
                 continue
@@ -341,8 +344,7 @@ def _load_frames(frames_dir: Path) -> dict[str, list[dict]]:
     return out
 
 
-def _grafted_children(node_dict: dict,
-                      nested_by_key: dict[str, list[dict]]) -> list[dict]:
+def _grafted_children(node_dict: dict, nested_by_key: dict[str, list[dict]]) -> list[dict]:
     """Children of `node_dict` plus the root nodes of every nested frame
     whose key matches this node's id (preferred) or session_id.
 
@@ -351,16 +353,13 @@ def _grafted_children(node_dict: dict,
     nid = str(node_dict.get("id", ""))
     sid = node_dict.get("session_id")
     children = list(node_dict.get("children") or [])
-    matched = nested_by_key.get(nid) or (
-        nested_by_key.get(sid) if sid else None
-    ) or []
+    matched = nested_by_key.get(nid) or (nested_by_key.get(sid) if sid else None) or []
     for mf in matched:
         children.extend((mf.get("tree") or {}).get("nodes") or [])
     return children
 
 
-def _build_merged_report(*, invoke_id: str, frames: dict[str, list[dict]],
-                         root_frame: dict, ended_at: str) -> dict:
+def _build_merged_report(*, invoke_id: str, frames: dict[str, list[dict]], root_frame: dict, ended_at: str) -> dict:
     """Produce the report.yaml document by grafting each non-root frame's
     tree under the node (anywhere in the root's tree) whose id matches the
     frame key — the caller node id (set via CALLSTACK_FRAME_KEY) preferred,
@@ -372,9 +371,12 @@ def _build_merged_report(*, invoke_id: str, frames: dict[str, list[dict]],
     nested_by_key = {k: v for k, v in frames.items() if k != _ROOT_FRAME_KEY}
     tasks = root_frame.get("tasks") or []
     merged_nodes = [
-        _graft_node(n, tasks[i] if i < len(tasks) else n.get("task", ""),
-                    depth=root_tree.get("base_depth", 0) + 1,
-                    nested_by_key=nested_by_key)
+        _graft_node(
+            n,
+            tasks[i] if i < len(tasks) else n.get("task", ""),
+            depth=root_tree.get("base_depth", 0) + 1,
+            nested_by_key=nested_by_key,
+        )
         for i, n in enumerate(root_nodes)
     ]
     overall = _status_of_nodes(merged_nodes)
@@ -387,7 +389,8 @@ def _build_merged_report(*, invoke_id: str, frames: dict[str, list[dict]],
         "started_at": root_frame.get("started_at"),
         "ended_at": ended_at,
         "duration_seconds": round(
-            sum(float(n.get("duration_seconds", 0.0)) for n in merged_nodes), 2,
+            sum(float(n.get("duration_seconds", 0.0)) for n in merged_nodes),
+            2,
         ),
         "status": overall,
         "nested_frames": sorted(nested_by_key.keys()),
@@ -395,8 +398,7 @@ def _build_merged_report(*, invoke_id: str, frames: dict[str, list[dict]],
     }
 
 
-def _graft_node(node_dict: dict, input_text: str, *, depth: int,
-                nested_by_key: dict[str, list[dict]]) -> dict:
+def _graft_node(node_dict: dict, input_text: str, *, depth: int, nested_by_key: dict[str, list[dict]]) -> dict:
     """Render one Node.to_dict() into report shape, attaching nested-frame
     children whose frame key matches this node's id (preferred, set by the
     parent Driver via CALLSTACK_FRAME_KEY) or session_id (fallback). When
@@ -404,8 +406,7 @@ def _graft_node(node_dict: dict, input_text: str, *, depth: int,
     same caller), all of their nodes graft in — sorted by frame
     ``started_at`` so order is stable."""
     children = [
-        _graft_node(c, c.get("task", ""), depth=depth + 1,
-                    nested_by_key=nested_by_key)
+        _graft_node(c, c.get("task", ""), depth=depth + 1, nested_by_key=nested_by_key)
         for c in _grafted_children(node_dict, nested_by_key)
     ]
     out: dict = {
@@ -460,9 +461,7 @@ def _walk_tree(tree: Tree, ancestor_chain: Optional[list[str]] = None):
     base_depth = tree.base_depth + 1
     # Stack of (node, depth, chain_to_this_node). Push roots in reverse so
     # the first root pops first — matches the original recursive order.
-    stack: list[tuple[Node, int, list[str]]] = [
-        (root, base_depth, base_chain) for root in reversed(tree.nodes)
-    ]
+    stack: list[tuple[Node, int, list[str]]] = [(root, base_depth, base_chain) for root in reversed(tree.nodes)]
     while stack:
         node, depth, chain = stack.pop()
         yield node, depth, chain
@@ -485,8 +484,7 @@ def _format_log_line(ts: str, node: Node, depth: int, *, chain: list[str]) -> st
         detail = f'  error="{_one_line(node.error, 60)}"'
     elif node.status == "yielded":
         detail = "  (awaiting user)"
-    return (f"[{ts}] d={depth} {indent}[{id_chain}] "
-            f"{node.status:<9} task=\"{task}\"{detail}")
+    return f'[{ts}] d={depth} {indent}[{id_chain}] {node.status:<9} task="{task}"{detail}'
 
 
 def _merge_raw_nodes(frames: dict[str, list[dict]]) -> list[dict]:
@@ -505,15 +503,14 @@ def _merge_raw_nodes(frames: dict[str, list[dict]]) -> list[dict]:
 def _graft_raw(node: dict, nested: dict[str, list[dict]]) -> dict:
     """Recursively graft nested-frame nodes under matching caller nodes,
     preserving the raw `Node.to_dict()` shape (full ids, all fields)."""
-    return {**node, "children": [
-        _graft_raw(c, nested) for c in _grafted_children(node, nested)
-    ]}
+    return {**node, "children": [_graft_raw(c, nested) for c in _grafted_children(node, nested)]}
 
 
 def _chain_to_session(nodes: list, target: str) -> Optional[list[str]]:
     """DFS the root frame's nodes for one matching `target` (either a full
     node id or a session id). Return the short-id chain ending at that
     node (inclusive), or None if not found."""
+
     def walk(node_list: list, path: list[str]) -> Optional[list[str]]:
         for n in node_list:
             if not isinstance(n, dict):
@@ -528,6 +525,7 @@ def _chain_to_session(nodes: list, target: str) -> Optional[list[str]]:
             if hit is not None:
                 return hit
         return None
+
     return walk(nodes, [])
 
 
@@ -545,5 +543,6 @@ def _one_line(s: str, limit: int) -> str:
         if o < 0x20 or o == 0x7F:
             return "?"
         return c
+
     s = "".join(sanitize(c) for c in s).replace('"', "'")
     return s if len(s) <= limit else s[: limit - 1] + "…"

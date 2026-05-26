@@ -1,6 +1,7 @@
 """Tests for the cwd-resolution and fork-incompat guard helpers in the MCP
 server. These are pure functions, so we test them in isolation without
 spinning up the FastMCP runtime."""
+
 from __future__ import annotations
 
 import json
@@ -113,7 +114,8 @@ class TestSameProject:
     def test_different_dirs(self, tmp_path):
         a = tmp_path / "a"
         b = tmp_path / "b"
-        a.mkdir(); b.mkdir()
+        a.mkdir()
+        b.mkdir()
         assert not mcp_server._same_project(str(a), str(b))
 
 
@@ -134,7 +136,9 @@ class TestCallToolGuards:
     async def test_bad_cwd_returns_error(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         raw = await mcp_server.call(
-            tasks=["x"], context="fresh", cwd="{PWD}/nope",
+            tasks=["x"],
+            context="fresh",
+            cwd="{PWD}/nope",
         )
         env = json.loads(raw)
         assert env["results"][0]["status"] == "error"
@@ -146,7 +150,9 @@ class TestCallToolGuards:
         other.mkdir()
         monkeypatch.chdir(tmp_path)
         raw = await mcp_server.call(
-            tasks=["x"], context="fork", cwd="{PWD}/other",
+            tasks=["x"],
+            context="fork",
+            cwd="{PWD}/other",
         )
         env = json.loads(raw)
         assert env["results"][0]["status"] == "error"
@@ -168,6 +174,7 @@ class TestResumeToolGuards:
     def _patch_caller(self, monkeypatch, captured: dict):
         """Replace _build_caller with a stub that records the cwd it was
         handed and whose .resume returns a Result without spawning claude."""
+
         class _ResumeStub:
             def resume(self, _token, _reply):
                 return _ok_result("resumed")
@@ -182,6 +189,7 @@ class TestResumeToolGuards:
         """Replace SessionLocator with a fake that records the cwd passed to
         resolve() and returns a fixed clone path (bypassing the real disk
         scan)."""
+
         class _FakeLocator:
             def resolve(self, _session_id, cwd=None):
                 captured["locate_cwd"] = cwd
@@ -191,7 +199,9 @@ class TestResumeToolGuards:
 
     @pytest.mark.asyncio
     async def test_pwd_substitution_expands_for_explicit_cwd(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         """An explicit {PWD}/sibling cwd must be expanded and canonicalized
         before it reaches the caller AND the session locator — the same
@@ -203,7 +213,9 @@ class TestResumeToolGuards:
         self._patch_caller(monkeypatch, captured)
         self._patch_locator(monkeypatch, captured, sibling / "clone.jsonl")
         raw = await mcp_server.resume(
-            resume_session=self._UUID, user_reply="hi", cwd="{PWD}/sibling",
+            resume_session=self._UUID,
+            user_reply="hi",
+            cwd="{PWD}/sibling",
         )
         env = json.loads(raw)
         # resume() merges the single Result envelope flat into its response.
@@ -214,7 +226,9 @@ class TestResumeToolGuards:
 
     @pytest.mark.asyncio
     async def test_nonexistent_cwd_returns_structured_error(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         """A bad cwd must yield a structured error envelope (not a crash)
         and must short-circuit BEFORE building a caller — parity with
@@ -222,11 +236,14 @@ class TestResumeToolGuards:
         monkeypatch.chdir(tmp_path)
         built: list = []
         monkeypatch.setattr(
-            mcp_server, "_build_caller",
+            mcp_server,
+            "_build_caller",
             lambda *a, **kw: built.append(1),
         )
         raw = await mcp_server.resume(
-            resume_session=self._UUID, user_reply="hi", cwd="{PWD}/nope",
+            resume_session=self._UUID,
+            user_reply="hi",
+            cwd="{PWD}/nope",
         )
         env = json.loads(raw)
         assert env["status"] == "error"
@@ -239,7 +256,9 @@ class TestResumeToolGuards:
         call() does — the gate cannot be bypassed via the resume path."""
         monkeypatch.chdir(tmp_path)
         raw = await mcp_server.resume(
-            resume_session=self._UUID, user_reply="hi", cwd="/etc",
+            resume_session=self._UUID,
+            user_reply="hi",
+            cwd="/etc",
         )
         env = json.loads(raw)
         assert env["status"] == "error"
@@ -247,7 +266,9 @@ class TestResumeToolGuards:
 
     @pytest.mark.asyncio
     async def test_empty_cwd_preserves_cross_project_discovery(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         """WHY: SessionLocator.resolve only does its cross-project full scan
         when cwd is None. A resumed `fresh` cross-project session lives
@@ -260,8 +281,7 @@ class TestResumeToolGuards:
         self._patch_locator(monkeypatch, captured, tmp_path / "clone.jsonl")
         await mcp_server.resume(resume_session=self._UUID, user_reply="hi")
         assert captured["locate_cwd"] is None, (
-            "empty cwd must reach SessionLocator.resolve as None to keep "
-            "cross-project session discovery working"
+            "empty cwd must reach SessionLocator.resolve as None to keep cross-project session discovery working"
         )
 
 
@@ -325,28 +345,31 @@ class TestDefaultMaxDepthCeiling:
 
     def test_ceiling_clamps_huge_values(self, monkeypatch):
         from agent_callstack import _default_max_depth
+
         monkeypatch.setenv("CALLSTACK_MAX_DEPTH", "1000000")
         assert _default_max_depth() == 32
 
     def test_legitimate_value_passes_through(self, monkeypatch):
         from agent_callstack import _default_max_depth
+
         monkeypatch.setenv("CALLSTACK_MAX_DEPTH", "20")
         assert _default_max_depth() == 20
 
     def test_unset_returns_default(self, monkeypatch):
         from agent_callstack import _default_max_depth
+
         monkeypatch.delenv("CALLSTACK_MAX_DEPTH", raising=False)
         assert _default_max_depth() == 10
 
     def test_invalid_returns_default(self, monkeypatch):
         from agent_callstack import _default_max_depth
+
         monkeypatch.setenv("CALLSTACK_MAX_DEPTH", "abc")
         assert _default_max_depth() == 10
 
 
 def _ok_result(value: str = "ok") -> Result:
-    return Result(value=value, summary=None, next=None,
-                  duration=0.01, log=None, log_start=0)
+    return Result(value=value, summary=None, next=None, duration=0.01, log=None, log_start=0)
 
 
 class _StubCaller:
@@ -386,17 +409,21 @@ class TestFinalizeAtBoundary:
 
     @pytest.mark.asyncio
     async def test_happy_path_does_not_invoke_finalize_own_frames(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         """Sync `call` returning normally must not call the boundary guard."""
         monkeypatch.chdir(tmp_path)
         calls = []
         monkeypatch.setattr(
-            mcp_server, "_finalize_at_boundary",
+            mcp_server,
+            "_finalize_at_boundary",
             lambda *a, **kw: calls.append((a, kw)),
         )
         monkeypatch.setattr(
-            mcp_server, "_build_caller",
+            mcp_server,
+            "_build_caller",
             lambda *a, **kw: _StubCaller(results=[_ok_result()]),
         )
         env = json.loads(await mcp_server.call(tasks=["x"]))
@@ -409,14 +436,17 @@ class TestFinalizeAtBoundary:
 
     @pytest.mark.asyncio
     async def test_exception_path_invokes_finalize_own_frames(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         """If call_many raises, the boundary guard must fire so the parent
         sees status='abandoned' rather than a stuck spinner."""
         monkeypatch.chdir(tmp_path)
         calls = []
         monkeypatch.setattr(
-            mcp_server, "_finalize_at_boundary",
+            mcp_server,
+            "_finalize_at_boundary",
             lambda *a, **kw: calls.append((a, kw)),
         )
 
@@ -424,27 +454,28 @@ class TestFinalizeAtBoundary:
             def call_many(self, *_a, **_kw):
                 raise RuntimeError("boom")
 
-        monkeypatch.setattr(mcp_server, "_build_caller",
-                            lambda *a, **kw: _ExplodingCaller())
+        monkeypatch.setattr(mcp_server, "_build_caller", lambda *a, **kw: _ExplodingCaller())
         with pytest.raises(RuntimeError, match="boom"):
             await mcp_server.call(tasks=["x"])
-        assert len(calls) == 1, (
-            "exception path must invoke the boundary guard exactly once"
-        )
+        assert len(calls) == 1, "exception path must invoke the boundary guard exactly once"
 
     @pytest.mark.asyncio
     async def test_await_call_happy_path_does_not_invoke_finalize(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         """await_call returning a normal envelope must not call the guard."""
         monkeypatch.chdir(tmp_path)
         calls = []
         monkeypatch.setattr(
-            mcp_server, "_finalize_at_boundary",
+            mcp_server,
+            "_finalize_at_boundary",
             lambda *a, **kw: calls.append((a, kw)),
         )
         monkeypatch.setattr(
-            mcp_server, "_build_caller",
+            mcp_server,
+            "_build_caller",
             lambda *a, **kw: _StubCaller(results=[_ok_result()]),
         )
         started = json.loads(
@@ -465,12 +496,15 @@ class TestRunInBackground:
 
     @pytest.mark.asyncio
     async def test_returns_started_envelope_immediately(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         monkeypatch.chdir(tmp_path)
         gate = threading.Event()
         monkeypatch.setattr(
-            mcp_server, "_build_caller",
+            mcp_server,
+            "_build_caller",
             lambda *a, **kw: _StubCaller(results=[_ok_result()], gate=gate),
         )
         raw = await mcp_server.call(tasks=["x"], run_in_background=True)
@@ -488,11 +522,14 @@ class TestRunInBackground:
 
     @pytest.mark.asyncio
     async def test_await_call_returns_full_envelope_when_done(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr(
-            mcp_server, "_build_caller",
+            mcp_server,
+            "_build_caller",
             lambda *a, **kw: _StubCaller(results=[_ok_result("done")]),
         )
         started = json.loads(
@@ -510,12 +547,15 @@ class TestRunInBackground:
 
     @pytest.mark.asyncio
     async def test_await_call_timeout_returns_pending(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         monkeypatch.chdir(tmp_path)
         gate = threading.Event()
         monkeypatch.setattr(
-            mcp_server, "_build_caller",
+            mcp_server,
+            "_build_caller",
             lambda *a, **kw: _StubCaller(results=[_ok_result()], gate=gate),
         )
         started = json.loads(
@@ -536,7 +576,9 @@ class TestRunInBackground:
 
     @pytest.mark.asyncio
     async def test_await_call_unknown_id_returns_error(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         monkeypatch.chdir(tmp_path)
         env = json.loads(
@@ -548,14 +590,17 @@ class TestRunInBackground:
 
     @pytest.mark.asyncio
     async def test_validation_errors_still_surface_synchronously(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         """Bad input in background mode must NOT silently park a doomed
         task — the orchestrator needs to react immediately, the same way
         it would for a synchronous call."""
         monkeypatch.chdir(tmp_path)
         raw = await mcp_server.call(
-            tasks=[], run_in_background=True,
+            tasks=[],
+            run_in_background=True,
         )
         env = json.loads(raw)
         assert env["results"][0]["status"] == "error"
@@ -564,7 +609,9 @@ class TestRunInBackground:
 
     @pytest.mark.asyncio
     async def test_background_exception_surfaced_via_await(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         """If `call_many` raises (i.e. an unexpected internal error, not a
         per-task CallFailed), `await_call` must surface it instead of
@@ -577,7 +624,9 @@ class TestRunInBackground:
                 raise RuntimeError("simulated internal failure")
 
         monkeypatch.setattr(
-            mcp_server, "_build_caller", lambda *a, **kw: BoomCaller(),
+            mcp_server,
+            "_build_caller",
+            lambda *a, **kw: BoomCaller(),
         )
         started = json.loads(
             await mcp_server.call(tasks=["x"], run_in_background=True),
@@ -602,7 +651,8 @@ class TestBackgroundRegistryCap:
         monkeypatch.setenv("CALLSTACK_MAX_BACKGROUND", "2")
         gate = threading.Event()
         monkeypatch.setattr(
-            mcp_server, "_build_caller",
+            mcp_server,
+            "_build_caller",
             lambda *a, **kw: _StubCaller(results=[_ok_result()], gate=gate),
         )
         # Park two in the registry.
@@ -628,7 +678,9 @@ class TestBackgroundRegistryCap:
 
     @pytest.mark.asyncio
     async def test_finished_unawaited_tasks_are_reaped(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         """A short-lived background call the orchestrator never `await`ed
         should not occupy a registry slot once it finishes — otherwise an
@@ -638,7 +690,8 @@ class TestBackgroundRegistryCap:
         monkeypatch.setenv("CALLSTACK_MAX_BACKGROUND", "1")
         # First stub returns instantly (no gate).
         monkeypatch.setattr(
-            mcp_server, "_build_caller",
+            mcp_server,
+            "_build_caller",
             lambda *a, **kw: _StubCaller(results=[_ok_result()]),
         )
         e1 = json.loads(

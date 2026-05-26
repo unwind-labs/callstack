@@ -4,6 +4,7 @@
 Usage:
     session_inspect.py <path/to/session.jsonl>
 """
+
 from __future__ import annotations
 
 import argparse

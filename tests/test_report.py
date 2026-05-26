@@ -1,17 +1,13 @@
 """Tests for the per-invocation YAML report writer."""
+
 from __future__ import annotations
 
 import json
 
 import yaml
-
-from agent_callstack import InvocationReport, ROOT_FRAME_KEY
-from tests._helpers import write_invocation_report as _write_invocation_report
+from agent_callstack import ROOT_FRAME_KEY, InvocationReport, state as st
 from agent_callstack.channel import ScriptedChannel
 from agent_callstack.driver import Driver, Node, Tree
-from agent_callstack.session import SessionLocator, SessionRef
-from agent_callstack.trace import TraceWriter, TreeStore
-from agent_callstack import state as st
 
 # ---- White-box internals (PERF-* optimization tests only) ----
 # The optimization tests in the PERF-A section below assert internal
@@ -22,31 +18,50 @@ from agent_callstack import state as st
 # the facade. Behavioral tests in this file use `InvocationReport`.
 from agent_callstack.invocation_ctx import _InvocationContext
 from agent_callstack.reporter import _LiveReporter
+from agent_callstack.session import SessionLocator, SessionRef
+from agent_callstack.trace import TraceWriter, TreeStore
+
+from tests._helpers import write_invocation_report as _write_invocation_report
 
 
-def _done_node(nid: str, task: str, result: str, *, children=None,
-               summary: str | None = None, duration: float = 0.0,
-               session_id: str | None = None) -> Node:
+def _done_node(
+    nid: str,
+    task: str,
+    result: str,
+    *,
+    children=None,
+    summary: str | None = None,
+    duration: float = 0.0,
+    session_id: str | None = None,
+) -> Node:
     sid = session_id or f"sess-{nid}"
     return Node(
-        id=nid, task=task,
+        id=nid,
+        task=task,
         state=st.Done(session_id=sid, result=result, summary=summary),
-        session_id=sid, result=result, summary=summary,
-        duration=duration, children=list(children or []),
+        session_id=sid,
+        result=result,
+        summary=summary,
+        duration=duration,
+        children=list(children or []),
     )
 
 
 # ---------- one-shot writer ----------
 
+
 def test_report_serializes_single_root(tmp_path):
     parent = SessionRef(session_id="parent", file=tmp_path / "parent.jsonl")
-    root = _done_node("abcdef12", "top task", "final answer",
-                      summary="did the thing", duration=4.2)
+    root = _done_node("abcdef12", "top task", "final answer", summary="did the thing", duration=4.2)
     tree = Tree(root_session=parent, nodes=[root], base_depth=0)
 
     path = _write_invocation_report(
-        log_dir=tmp_path / "log", invoke_id="inv1", kind="call",
-        tasks=["top task"], tree=tree, cwd="/some/cwd",
+        log_dir=tmp_path / "log",
+        invoke_id="inv1",
+        kind="call",
+        tasks=["top task"],
+        tree=tree,
+        cwd="/some/cwd",
         started_at="2026-04-19T14:00:00+00:00",
         ended_at="2026-04-19T14:00:05+00:00",
     )
@@ -74,9 +89,14 @@ def test_report_nests_children(tmp_path):
     tree = Tree(root_session=parent, nodes=[root], base_depth=0)
 
     path = _write_invocation_report(
-        log_dir=tmp_path / "log", invoke_id="inv2", kind="call",
-        tasks=["root task"], tree=tree, cwd="/cwd",
-        started_at="s", ended_at="e",
+        log_dir=tmp_path / "log",
+        invoke_id="inv2",
+        kind="call",
+        tasks=["root task"],
+        tree=tree,
+        cwd="/cwd",
+        started_at="s",
+        ended_at="e",
     )
 
     doc = yaml.safe_load(path.read_text())
@@ -90,15 +110,22 @@ def test_report_overall_status_reflects_leaves(tmp_path):
     parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
     ok = _done_node("ok000000", "a", "a-done")
     failed = Node(
-        id="ff000000", task="b",
-        state=st.Failed(error="nope"), error="nope",
+        id="ff000000",
+        task="b",
+        state=st.Failed(error="nope"),
+        error="nope",
     )
     tree = Tree(root_session=parent, nodes=[ok, failed], base_depth=0)
 
     path = _write_invocation_report(
-        log_dir=tmp_path / "log", invoke_id="inv3", kind="call",
-        tasks=["a", "b"], tree=tree, cwd="/cwd",
-        started_at="s", ended_at="e",
+        log_dir=tmp_path / "log",
+        invoke_id="inv3",
+        kind="call",
+        tasks=["a", "b"],
+        tree=tree,
+        cwd="/cwd",
+        started_at="s",
+        ended_at="e",
     )
     doc = yaml.safe_load(path.read_text())
     assert doc["status"] == "mixed"
@@ -115,15 +142,21 @@ def test_report_writes_yaml_at_expected_path(tmp_path):
     log_dir = tmp_path / "deep" / "nested" / "log"
     assert not log_dir.exists()
     path = _write_invocation_report(
-        log_dir=log_dir, invoke_id="inv4", kind="call",
-        tasks=["x"], tree=tree, cwd="/cwd",
-        started_at="s", ended_at="e",
+        log_dir=log_dir,
+        invoke_id="inv4",
+        kind="call",
+        tasks=["x"],
+        tree=tree,
+        cwd="/cwd",
+        started_at="s",
+        ended_at="e",
     )
     assert path.exists()
     assert path == log_dir / "inv4" / "report.yaml"
 
 
 # ---------- live reporter ----------
+
 
 def test_driver_progress_callback_fires_per_transition(tmp_path, monkeypatch):
     # This test asserts the legacy per-notify report.yaml write contract.
@@ -145,14 +178,18 @@ def test_driver_progress_callback_fires_per_transition(tmp_path, monkeypatch):
     snapshots: list[str] = []
 
     report = InvocationReport(
-        invoke_id="inv-live", log_dir=log_dir, cwd=str(tmp_path),
+        invoke_id="inv-live",
+        log_dir=log_dir,
+        cwd=str(tmp_path),
     )
     driver = Driver(
         channel=channel,
         resolve_session=SessionLocator(projects_dir=tmp_path / "projects").resolve,
         trace=TraceWriter(report.invocation_dir),
         store=TreeStore(),
-        cwd=str(tmp_path), timeout=10, max_depth=5,
+        cwd=str(tmp_path),
+        timeout=10,
+        max_depth=5,
     )
     reporter = report.reporter(kind="call", tasks=["do it"], started_at="s")
 
@@ -185,6 +222,7 @@ def test_driver_progress_callback_fires_per_transition(tmp_path, monkeypatch):
 
 # ---------- nested frame merging ----------
 
+
 def test_merged_report_grafts_nested_frame_under_calling_node(tmp_path):
     """Simulate two cooperating reporters: root writes tree with node whose
     session is `sess-C`; a nested reporter with frame_key=`sess-C` writes
@@ -200,11 +238,11 @@ def test_merged_report_grafts_nested_frame_under_calling_node(tmp_path):
     root_tree = Tree(root_session=parent, nodes=[b, c, d], base_depth=0)
 
     root_report = InvocationReport(
-        invoke_id="inv-merge", log_dir=log_dir, cwd="/cwd",
+        invoke_id="inv-merge",
+        log_dir=log_dir,
+        cwd="/cwd",
     )
-    root_reporter = root_report.reporter(kind="call",
-                                         tasks=["/task-b", "/task-c", "/task-d"],
-                                         started_at="s")
+    root_reporter = root_report.reporter(kind="call", tasks=["/task-b", "/task-c", "/task-d"], started_at="s")
 
     # Nested invocation (from inside C's subprocess): E, F
     e = _done_node("e0000000", "/task-e", "E done", session_id="sess-E")
@@ -213,13 +251,13 @@ def test_merged_report_grafts_nested_frame_under_calling_node(tmp_path):
     nested_tree = Tree(root_session=nested_parent, nodes=[e, f], base_depth=1)
 
     nested_report = InvocationReport(
-        invoke_id="inv-merge", log_dir=log_dir, cwd="/cwd",
+        invoke_id="inv-merge",
+        log_dir=log_dir,
+        cwd="/cwd",
         frame_key="sess-C",  # the calling session
         is_nested=True,
     )
-    nested_reporter = nested_report.reporter(kind="nested_call",
-                                             tasks=["/task-e", "/task-f"],
-                                             started_at="s")
+    nested_reporter = nested_report.reporter(kind="nested_call", tasks=["/task-e", "/task-f"], started_at="s")
 
     # Realistic ordering: root writes at least one snapshot (so root.yaml
     # exists with C), nested fires during C's turn, root finalizes.
@@ -259,6 +297,7 @@ def test_encode_project_dir_matches_claude_code(tmp_path):
     into `~/.claude/projects/<slug>/`. Getting the encoding wrong means
     the mtime fallback can't find the active session file."""
     from agent_callstack.session import encode_project_dir
+
     assert encode_project_dir("/a/b/c") == "-a-b-c"
     assert encode_project_dir("/a/parallel_calls") == "-a-parallel-calls"
     assert encode_project_dir("/a_b/c_d") == "-a-b-c-d"
@@ -273,32 +312,37 @@ def test_three_level_chain_prefix(tmp_path):
     c = _done_node("C0000000", "/task-c", "C done", session_id="sess-C")
     root_tree = Tree(root_session=parent, nodes=[c], base_depth=0)
     root_report = InvocationReport(
-        invoke_id="inv-3lvl", log_dir=log_dir, cwd="/cwd",
+        invoke_id="inv-3lvl",
+        log_dir=log_dir,
+        cwd="/cwd",
     )
-    root_reporter = root_report.reporter(kind="call",
-                                         tasks=["/task-c"], started_at="s")
+    root_reporter = root_report.reporter(kind="call", tasks=["/task-c"], started_at="s")
 
     # Level-2 frame: E (caller = C)
     e = _done_node("E0000000", "/task-e", "E done", session_id="sess-E")
     e_parent = SessionRef(session_id="sess-C", file=tmp_path / "c.jsonl")
     e_tree = Tree(root_session=e_parent, nodes=[e], base_depth=1)
     e_report = InvocationReport(
-        invoke_id="inv-3lvl", log_dir=log_dir, cwd="/cwd",
-        frame_key=c.id, is_nested=True,
+        invoke_id="inv-3lvl",
+        log_dir=log_dir,
+        cwd="/cwd",
+        frame_key=c.id,
+        is_nested=True,
     )
-    e_reporter = e_report.reporter(kind="nested_call",
-                                   tasks=["/task-e"], started_at="s")
+    e_reporter = e_report.reporter(kind="nested_call", tasks=["/task-e"], started_at="s")
 
     # Level-3 frame: G (caller = E)
     g = _done_node("G0000000", "/task-g", "G done", session_id="sess-G")
     g_parent = SessionRef(session_id="sess-E", file=tmp_path / "e.jsonl")
     g_tree = Tree(root_session=g_parent, nodes=[g], base_depth=2)
     g_report = InvocationReport(
-        invoke_id="inv-3lvl", log_dir=log_dir, cwd="/cwd",
-        frame_key=e.id, is_nested=True,
+        invoke_id="inv-3lvl",
+        log_dir=log_dir,
+        cwd="/cwd",
+        frame_key=e.id,
+        is_nested=True,
     )
-    g_reporter = g_report.reporter(kind="nested_call",
-                                   tasks=["/task-g"], started_at="s")
+    g_reporter = g_report.reporter(kind="nested_call", tasks=["/task-g"], started_at="s")
 
     # Order matters for chain lookups: root and E must exist on disk
     # before G looks up E's ancestry.
@@ -309,9 +353,7 @@ def test_three_level_chain_prefix(tmp_path):
     root_reporter.finalize(root_tree)
 
     log_text = root_report.log_path.read_text()
-    assert "[C0000000→E0000000→G0000000]" in log_text, (
-        f"missing 3-level chain in log:\n{log_text}"
-    )
+    assert "[C0000000→E0000000→G0000000]" in log_text, f"missing 3-level chain in log:\n{log_text}"
     # Also check the grafted report: G nested under E nested under C.
     doc = yaml.safe_load(root_report.report_path.read_text())
     c_task = doc["tasks"][0]
@@ -333,11 +375,11 @@ def test_merge_by_node_id_wins_over_sessions(tmp_path):
     root_tree = Tree(root_session=parent, nodes=[b, c, d], base_depth=0)
 
     root_report = InvocationReport(
-        invoke_id="inv-by-nodeid", log_dir=log_dir, cwd="/cwd",
+        invoke_id="inv-by-nodeid",
+        log_dir=log_dir,
+        cwd="/cwd",
     )
-    root_reporter = root_report.reporter(kind="call",
-                                         tasks=["/task-b", "/task-c", "/task-d"],
-                                         started_at="s")
+    root_reporter = root_report.reporter(kind="call", tasks=["/task-b", "/task-c", "/task-d"], started_at="s")
 
     e = _done_node("eNODE000", "/task-e", "E done", session_id="sess-E")
     f = _done_node("fNODE000", "/task-f", "F done", session_id="sess-F")
@@ -346,13 +388,13 @@ def test_merge_by_node_id_wins_over_sessions(tmp_path):
 
     # Nested frame keyed by C's full node id (what CALLSTACK_FRAME_KEY holds).
     nested_report = InvocationReport(
-        invoke_id="inv-by-nodeid", log_dir=log_dir, cwd="/cwd",
+        invoke_id="inv-by-nodeid",
+        log_dir=log_dir,
+        cwd="/cwd",
         frame_key=c.id,
         is_nested=True,
     )
-    nested_reporter = nested_report.reporter(kind="nested_call",
-                                             tasks=["/task-e", "/task-f"],
-                                             started_at="s")
+    nested_reporter = nested_report.reporter(kind="nested_call", tasks=["/task-e", "/task-f"], started_at="s")
 
     root_reporter(root_tree)
     nested_reporter.finalize(nested_tree)
@@ -372,19 +414,26 @@ def test_nested_detection_uses_mtime_fallback(tmp_path, monkeypatch):
     Caller must still identify the calling session via the most recently
     modified .jsonl in the project dir, so frame_key is non-'root'."""
     from agent_callstack import (
-        Caller, ENV_ROOT_INVOKE_ID, ENV_ROOT_LOG_DIR, ENV_CLAUDE_SESSION,
+        ENV_CLAUDE_SESSION,
+        ENV_ROOT_INVOKE_ID,
+        ENV_ROOT_LOG_DIR,
+        Caller,
     )
+
     # Fake projects dir for this cwd; seed with a plausibly-active session.
     fake_claude = tmp_path / "fake-home" / ".claude"
     projects = fake_claude / "projects"
     cwd = tmp_path / "workdir"
     cwd.mkdir()
     from agent_callstack.session import encode_project_dir
+
     proj = projects / encode_project_dir(str(cwd))
     proj.mkdir(parents=True)
     # Two sessions; the newer one should win the mtime race.
     (proj / "older.jsonl").write_text(json.dumps({"cwd": str(cwd)}) + "\n")
-    import os as _os, time as _time
+    import os as _os
+    import time as _time
+
     _time.sleep(0.01)
     newest = proj / "newer.jsonl"
     newest.write_text(json.dumps({"cwd": str(cwd)}) + "\n")
@@ -426,10 +475,11 @@ def test_sibling_nested_invocations_dont_overwrite_each_others_frame(tmp_path):
     root_tree = Tree(root_session=parent, nodes=[c], base_depth=0)
 
     root_report = InvocationReport(
-        invoke_id="inv-siblings", log_dir=log_dir, cwd="/cwd",
+        invoke_id="inv-siblings",
+        log_dir=log_dir,
+        cwd="/cwd",
     )
-    root_reporter = root_report.reporter(kind="call",
-                                         tasks=["/task-c"], started_at="s0")
+    root_reporter = root_report.reporter(kind="call", tasks=["/task-c"], started_at="s0")
 
     # Two sibling nested invocations from inside C, each with its own
     # children. Same frame_key (C's id), distinct instance_ids → distinct
@@ -438,21 +488,27 @@ def test_sibling_nested_invocations_dont_overwrite_each_others_frame(tmp_path):
     e_parent = SessionRef(session_id="sess-C", file=tmp_path / "c.jsonl")
     e_tree = Tree(root_session=e_parent, nodes=[e], base_depth=1)
     e_report = InvocationReport(
-        invoke_id="inv-siblings", log_dir=log_dir, cwd="/cwd",
-        frame_key=c.id, is_nested=True, instance_id="aaa111",
+        invoke_id="inv-siblings",
+        log_dir=log_dir,
+        cwd="/cwd",
+        frame_key=c.id,
+        is_nested=True,
+        instance_id="aaa111",
     )
-    e_reporter = e_report.reporter(kind="nested_call",
-                                   tasks=["/task-e"], started_at="s1")
+    e_reporter = e_report.reporter(kind="nested_call", tasks=["/task-e"], started_at="s1")
 
     f = _done_node("f0000000", "/task-f", "F done", session_id="sess-F")
     f_parent = SessionRef(session_id="sess-C", file=tmp_path / "c.jsonl")
     f_tree = Tree(root_session=f_parent, nodes=[f], base_depth=1)
     f_report = InvocationReport(
-        invoke_id="inv-siblings", log_dir=log_dir, cwd="/cwd",
-        frame_key=c.id, is_nested=True, instance_id="bbb222",
+        invoke_id="inv-siblings",
+        log_dir=log_dir,
+        cwd="/cwd",
+        frame_key=c.id,
+        is_nested=True,
+        instance_id="bbb222",
     )
-    f_reporter = f_report.reporter(kind="nested_call",
-                                   tasks=["/task-f"], started_at="s2")
+    f_reporter = f_report.reporter(kind="nested_call", tasks=["/task-f"], started_at="s2")
 
     root_reporter(root_tree)
     e_reporter.finalize(e_tree)
@@ -481,11 +537,13 @@ def test_nested_reporter_is_noop_if_root_frame_absent(tmp_path):
     tree = Tree(root_session=parent, nodes=[e], base_depth=1)
 
     report = InvocationReport(
-        invoke_id="inv-solo-nested", log_dir=log_dir, cwd="/cwd",
-        frame_key="sess-C", is_nested=True,
+        invoke_id="inv-solo-nested",
+        log_dir=log_dir,
+        cwd="/cwd",
+        frame_key="sess-C",
+        is_nested=True,
     )
-    reporter = report.reporter(kind="nested_call", tasks=["/task-e"],
-                               started_at="s")
+    reporter = report.reporter(kind="nested_call", tasks=["/task-e"], started_at="s")
     reporter.finalize(tree)
 
     # Frame written, but no merged report yet.
@@ -494,6 +552,7 @@ def test_nested_reporter_is_noop_if_root_frame_absent(tmp_path):
 
 
 # ---------- PERF-A: debounce + content-hash skip + frames cache ----------
+
 
 def test_debounce_coalesces_burst_of_notifies(tmp_path, monkeypatch):
     """50 notifies inside a single debounce window must produce ONE atomic
@@ -519,11 +578,13 @@ def test_debounce_coalesces_burst_of_notifies(tmp_path, monkeypatch):
     parent = SessionRef(session_id="root", file=tmp_path / "r.jsonl")
 
     ctx = _InvocationContext(
-        invoke_id="inv-burst", log_dir=log_dir, cwd="/cwd",
-        frame_key=ROOT_FRAME_KEY, is_nested=False,
+        invoke_id="inv-burst",
+        log_dir=log_dir,
+        cwd="/cwd",
+        frame_key=ROOT_FRAME_KEY,
+        is_nested=False,
     )
-    reporter = _LiveReporter(ctx=ctx, kind="call", tasks=["t"],
-                             started_at="s")
+    reporter = _LiveReporter(ctx=ctx, kind="call", tasks=["t"], started_at="s")
 
     # Mutate the tree slightly each tick so the hash differs and we'd
     # otherwise write 50 times.
@@ -550,7 +611,9 @@ def test_finalize_writes_report_even_after_quiet_window(tmp_path, monkeypatch):
     log_dir = tmp_path / "log"
     parent = SessionRef(session_id="root", file=tmp_path / "r.jsonl")
     report = InvocationReport(
-        invoke_id="inv-final", log_dir=log_dir, cwd="/cwd",
+        invoke_id="inv-final",
+        log_dir=log_dir,
+        cwd="/cwd",
     )
     reporter = report.reporter(kind="call", tasks=["t"], started_at="s")
     node = _done_node("a0000000", "t", "r")
@@ -558,6 +621,7 @@ def test_finalize_writes_report_even_after_quiet_window(tmp_path, monkeypatch):
     reporter(tree)
 
     import time as _time
+
     _time.sleep(0.20)  # let the debounce timer fire
     first_mtime_ns = report.report_path.stat().st_mtime_ns
 
@@ -593,11 +657,13 @@ def test_content_hash_skip_avoids_duplicate_writes(tmp_path, monkeypatch):
     log_dir = tmp_path / "log"
     parent = SessionRef(session_id="root", file=tmp_path / "r.jsonl")
     ctx = _InvocationContext(
-        invoke_id="inv-hash", log_dir=log_dir, cwd="/cwd",
-        frame_key=ROOT_FRAME_KEY, is_nested=False,
+        invoke_id="inv-hash",
+        log_dir=log_dir,
+        cwd="/cwd",
+        frame_key=ROOT_FRAME_KEY,
+        is_nested=False,
     )
-    reporter = _LiveReporter(ctx=ctx, kind="call", tasks=["t"],
-                             started_at="s")
+    reporter = _LiveReporter(ctx=ctx, kind="call", tasks=["t"], started_at="s")
     node = _done_node("a0000000", "t", "r")
     tree = Tree(root_session=parent, nodes=[node], base_depth=0)
 
@@ -605,8 +671,7 @@ def test_content_hash_skip_avoids_duplicate_writes(tmp_path, monkeypatch):
     # across all notifies — otherwise the doc differs each tick and the
     # hash skip never triggers. _LiveReporter binds `_utc_now_iso` from
     # the reporter module; patch there.
-    monkeypatch.setattr(rep_mod, "_utc_now_iso",
-                        lambda: "2026-05-13T00:00:00+00:00")
+    monkeypatch.setattr(rep_mod, "_utc_now_iso", lambda: "2026-05-13T00:00:00+00:00")
 
     reporter(tree)
     assert write_count["n"] == 1
@@ -642,20 +707,24 @@ def test_content_hash_skip_ignores_ended_at_drift(tmp_path, monkeypatch):
     log_dir = tmp_path / "log"
     parent = SessionRef(session_id="root", file=tmp_path / "r.jsonl")
     ctx = _InvocationContext(
-        invoke_id="inv-drift", log_dir=log_dir, cwd="/cwd",
-        frame_key=ROOT_FRAME_KEY, is_nested=False,
+        invoke_id="inv-drift",
+        log_dir=log_dir,
+        cwd="/cwd",
+        frame_key=ROOT_FRAME_KEY,
+        is_nested=False,
     )
-    reporter = _LiveReporter(ctx=ctx, kind="call", tasks=["t"],
-                             started_at="s")
+    reporter = _LiveReporter(ctx=ctx, kind="call", tasks=["t"], started_at="s")
     node = _done_node("b0000000", "t", "r")
     tree = Tree(root_session=parent, nodes=[node], base_depth=0)
 
     # Advance the mocked clock on every tick to simulate production.
-    times = iter([
-        "2026-05-13T00:00:00+00:00",
-        "2026-05-13T00:00:00.250000+00:00",
-        "2026-05-13T00:00:00.500000+00:00",
-    ])
+    times = iter(
+        [
+            "2026-05-13T00:00:00+00:00",
+            "2026-05-13T00:00:00.250000+00:00",
+            "2026-05-13T00:00:00.500000+00:00",
+        ]
+    )
     monkeypatch.setattr(rep_mod, "_utc_now_iso", lambda: next(times))
 
     reporter(tree)
@@ -672,7 +741,8 @@ def test_content_hash_skip_ignores_ended_at_drift(tmp_path, monkeypatch):
 
 
 def test_frames_cache_skips_yaml_safe_load_when_stat_unchanged(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
     """_load_frames must not re-parse frame YAMLs whose (mtime_ns, size)
     matches the cached entry."""
@@ -692,12 +762,20 @@ def test_frames_cache_skips_yaml_safe_load_when_stat_unchanged(
     frames_dir = tmp_path / "frames"
     frames_dir.mkdir()
     frame = {
-        "frame_key": ROOT_FRAME_KEY, "is_nested": False, "kind": "call",
-        "tasks": ["t"], "cwd": "/cwd",
-        "started_at": "s", "ended_at": "e",
-        "tree": {"schema_version": "2", "root_session_id": "r",
-                  "root_session_file": "/r.jsonl", "base_depth": 0,
-                  "nodes": []},
+        "frame_key": ROOT_FRAME_KEY,
+        "is_nested": False,
+        "kind": "call",
+        "tasks": ["t"],
+        "cwd": "/cwd",
+        "started_at": "s",
+        "ended_at": "e",
+        "tree": {
+            "schema_version": "2",
+            "root_session_id": "r",
+            "root_session_file": "/r.jsonl",
+            "base_depth": 0,
+            "nodes": [],
+        },
     }
     ac._atomic_yaml_write(frames_dir / "root.yaml", frame)
 
@@ -719,6 +797,7 @@ def test_frames_cache_skips_yaml_safe_load_when_stat_unchanged(
     # per-file cache check. Simulate that by bumping both.
     import os as _os
     import time as _time
+
     new_mtime = _time.time() + 10  # bump mtime forward
     _os.utime(frames_dir / "root.yaml", (new_mtime, new_mtime))
     _os.utime(frames_dir, (new_mtime, new_mtime))
@@ -738,12 +817,20 @@ def test_load_frames_dir_mtime_fast_path_skips_glob(tmp_path, monkeypatch):
     frames_dir = tmp_path / "frames"
     frames_dir.mkdir()
     frame = {
-        "frame_key": ROOT_FRAME_KEY, "is_nested": False, "kind": "call",
-        "tasks": ["t"], "cwd": "/cwd",
-        "started_at": "s", "ended_at": "e",
-        "tree": {"schema_version": "2", "root_session_id": "r",
-                 "root_session_file": "/r.jsonl", "base_depth": 0,
-                 "nodes": []},
+        "frame_key": ROOT_FRAME_KEY,
+        "is_nested": False,
+        "kind": "call",
+        "tasks": ["t"],
+        "cwd": "/cwd",
+        "started_at": "s",
+        "ended_at": "e",
+        "tree": {
+            "schema_version": "2",
+            "root_session_id": "r",
+            "root_session_file": "/r.jsonl",
+            "base_depth": 0,
+            "nodes": [],
+        },
     }
     ac._atomic_yaml_write(frames_dir / "root.yaml", frame)
 
@@ -764,8 +851,7 @@ def test_load_frames_dir_mtime_fast_path_skips_glob(tmp_path, monkeypatch):
 
     out2 = ac._load_frames(frames_dir)
     assert glob_calls["n"] == 0, (
-        f"expected dir-mtime fast-path to skip glob, but glob was called "
-        f"{glob_calls['n']} times"
+        f"expected dir-mtime fast-path to skip glob, but glob was called {glob_calls['n']} times"
     )
     assert out2.keys() == out1.keys()
 
@@ -774,16 +860,29 @@ def test_load_frames_dir_cache_returns_independent_copy(tmp_path):
     """The dir-mtime cache must hand back a copy callers can mutate
     without poisoning the cached snapshot for the next call."""
     import agent_callstack as ac
+
     ac._frames_cache_clear()
     frames_dir = tmp_path / "frames"
     frames_dir.mkdir()
-    ac._atomic_yaml_write(frames_dir / "root.yaml", {
-        "frame_key": ROOT_FRAME_KEY, "is_nested": False, "kind": "call",
-        "tasks": ["t"], "cwd": "/cwd", "started_at": "s", "ended_at": "e",
-        "tree": {"schema_version": "2", "root_session_id": "r",
-                 "root_session_file": "/r.jsonl", "base_depth": 0,
-                 "nodes": []},
-    })
+    ac._atomic_yaml_write(
+        frames_dir / "root.yaml",
+        {
+            "frame_key": ROOT_FRAME_KEY,
+            "is_nested": False,
+            "kind": "call",
+            "tasks": ["t"],
+            "cwd": "/cwd",
+            "started_at": "s",
+            "ended_at": "e",
+            "tree": {
+                "schema_version": "2",
+                "root_session_id": "r",
+                "root_session_file": "/r.jsonl",
+                "base_depth": 0,
+                "nodes": [],
+            },
+        },
+    )
 
     out1 = ac._load_frames(frames_dir)
     out1[ROOT_FRAME_KEY].clear()  # corrupt the returned dict
@@ -798,8 +897,9 @@ def test_parsed_frame_cache_lru_eviction(tmp_path):
     """PERF-103: `_FRAMES_PARSED_CACHE` is bounded — past the cap,
     least-recently-used entries are evicted instead of growing
     monotonically across long-lived MCP server lifetimes."""
-    from agent_callstack import frames as frames_mod
     import agent_callstack as ac
+    from agent_callstack import frames as frames_mod
+
     ac._frames_cache_clear()
 
     # Temporarily shrink the cap so the test stays small.

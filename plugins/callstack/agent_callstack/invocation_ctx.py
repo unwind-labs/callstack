@@ -11,6 +11,7 @@ owns the full invocation directory. For a nested MCP call — detected via
 and writes its own tree to `_frames/{caller_session}.yaml`, where the
 root's `_LiveReporter` picks it up and grafts it under the caller's node.
 """
+
 from __future__ import annotations
 
 import datetime as dt

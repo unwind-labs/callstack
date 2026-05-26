@@ -6,6 +6,7 @@ raises. Also owns the private translators that map a finished Tree's
 nodes into those types (used by Caller and re-exported for the MCP
 server / tests).
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -14,8 +15,8 @@ from typing import Any, Optional
 
 from .driver import Node, Tree
 
-
 # ---------- Helpers ----------
+
 
 def _find_task_start_line(log_path: Path, task_id: str) -> Optional[int]:
     """1-based line in `log_path` where this node's task begins.
@@ -44,9 +45,11 @@ def _find_task_start_line(log_path: Path, task_id: str) -> Optional[int]:
 
 # ---------- Public value types ----------
 
+
 @dataclass(frozen=True)
 class YieldToken:
     """Opaque handle for resuming a yielded session. Pass to `resume()`."""
+
     session_id: str
     clone_path: str
 
@@ -76,11 +79,13 @@ class Result:
 @dataclass(frozen=True)
 class MultiResult:
     """Returned by `call_many` (mixed completes/errors/yields)."""
+
     results: list  # list[Result | CallFailed | CallYielded]
 
 
 class CallYielded(Exception):
     """Raised when an agent emits YIELD. Carries the resume token + question."""
+
     def __init__(self, question: str, token: YieldToken):
         super().__init__(question)
         self.question = question
@@ -97,6 +102,7 @@ class CallYielded(Exception):
 
 class CallFailed(Exception):
     """Raised when an agent or its descendants fail. Carries any partial output."""
+
     def __init__(self, error: str, partial: Any = None):
         super().__init__(error)
         self.error = error
@@ -112,6 +118,7 @@ class CallFailed(Exception):
 
 # ---------- Tree → public result translation ----------
 
+
 def _result_from_node(node: Node):
     """Convert a finished node into Result / CallYielded / CallFailed."""
     s = node.state
@@ -121,11 +128,11 @@ def _result_from_node(node: Node):
         # approximate parent_lines count: the parent's file length doesn't
         # line up exactly with where the new turn lands in the child's file
         # (CLI bookkeeping + replay re-encoding both shift the offset).
-        precise = (
-            _find_task_start_line(log_path, node.id[:8]) if log_path else None
-        )
+        precise = _find_task_start_line(log_path, node.id[:8]) if log_path else None
         return Result(
-            value=node.result, summary=node.summary, next=node.suggested_next,
+            value=node.result,
+            summary=node.summary,
+            next=node.suggested_next,
             duration=round(node.duration, 2),
             log=log_path,
             log_start=precise if precise is not None else node.parent_lines + 1,
@@ -148,8 +155,7 @@ def _result_from_node(node: Node):
         # Wraps the leaf the user must answer.
         return CallYielded(
             question=node.state.question,  # type: ignore[union-attr]
-            token=YieldToken(session_id=node.session_id or "",
-                             clone_path=node.clone_path or ""),
+            token=YieldToken(session_id=node.session_id or "", clone_path=node.clone_path or ""),
         )
     # Genuinely unreachable: TERMINAL == done/failed/timeout/abandoned (all
     # handled above) plus awaiting_user; drive() never returns an in-flight node.

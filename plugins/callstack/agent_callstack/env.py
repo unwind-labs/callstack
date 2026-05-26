@@ -13,11 +13,11 @@ constants, some as bare string literals inside ``os.environ.get()``.
 DRY-101 consolidates them so a future rename / addition is one edit
 not five.
 """
+
 from __future__ import annotations
 
 import os
 from typing import Optional
-
 
 # ---------- Variable names ----------
 
@@ -111,6 +111,7 @@ _MAX_DEPTH_CEILING = 32
 
 
 # ---------- Typed readers ----------
+
 
 def max_depth() -> int:
     """Effective max recursion depth, clamped to `_MAX_DEPTH_CEILING`."""

@@ -12,6 +12,7 @@ A cross-process `fcntl.lockf` serializes the merge so parent and nested
 writers can't corrupt each other; an in-process lock serializes parallel
 roots in the same `call_many`.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -28,9 +29,15 @@ from typing import Any, Iterator, Optional, Sequence
 
 import yaml
 
-from . import shutdown as _shutdown
-from . import state as _state
+from . import shutdown as _shutdown, state as _state
 from .driver import Tree
+
+# Re-exports for backwards-compatible test access; the parsing policy
+# lives in `agent_callstack.env`.
+from .env import (
+    _DEFAULT_REPORT_DEBOUNCE_SECS,  # noqa: E402, F401
+    report_debounce_secs as _report_debounce_secs,
+)
 from .frames import (
     _ROOT_FRAME_KEY,
     _build_merged_report,
@@ -42,11 +49,6 @@ from .frames import (
     mark_abandoned_in_dict_nodes,
 )
 from .invocation_ctx import _InvocationContext, _utc_now_iso
-
-
-# Re-exports for backwards-compatible test access; the parsing policy
-# lives in `agent_callstack.env`.
-from .env import _DEFAULT_REPORT_DEBOUNCE_SECS, report_debounce_secs as _report_debounce_secs  # noqa: E402, F401
 
 
 class _LiveReporter:
@@ -65,8 +67,7 @@ class _LiveReporter:
     nested writers can't corrupt each other's updates; an in-process lock
     serializes parallel roots in the same `call_many`."""
 
-    def __init__(self, *, ctx: _InvocationContext, kind: str,
-                 tasks: Sequence[str], started_at: str):
+    def __init__(self, *, ctx: _InvocationContext, kind: str, tasks: Sequence[str], started_at: str):
         self._ctx = ctx
         self._kind = kind
         self._tasks = list(tasks)
@@ -111,7 +112,8 @@ class _LiveReporter:
             # schedule a fresh one.
             if self._merge_timer is None and self._debounce > 0:
                 self._merge_timer = threading.Timer(
-                    self._debounce, self._debounced_merge,
+                    self._debounce,
+                    self._debounced_merge,
                 )
                 self._merge_timer.daemon = True
                 self._merge_timer.start()
@@ -212,15 +214,20 @@ class _LiveReporter:
                 # the root's next progress tick will rewrite the report.
                 return
             doc = _build_merged_report(
-                invoke_id=self._ctx.invoke_id, frames=frames,
-                root_frame=root_frames[0], ended_at=ended_at,
+                invoke_id=self._ctx.invoke_id,
+                frames=frames,
+                root_frame=root_frames[0],
+                ended_at=ended_at,
             )
             new_hash = _content_hash_ignoring_ended_at(doc)
             if not force and new_hash == self._last_merged_hash:
                 return
             payload = yaml.safe_dump(
-                doc, sort_keys=False, default_flow_style=False,
-                width=120, allow_unicode=True,
+                doc,
+                sort_keys=False,
+                default_flow_style=False,
+                width=120,
+                allow_unicode=True,
             ).encode("utf-8")
             _atomic_write_bytes(self._ctx.report_path, payload)
             self._last_merged_hash = new_hash
@@ -259,8 +266,11 @@ class _LiveReporter:
                 "tree": tree.to_dict(),
             }
             payload = yaml.safe_dump(
-                doc, sort_keys=False, default_flow_style=False,
-                width=120, allow_unicode=True,
+                doc,
+                sort_keys=False,
+                default_flow_style=False,
+                width=120,
+                allow_unicode=True,
             ).encode("utf-8")
             partial_path = self._ctx.invocation_dir / "report.partial.yaml"
             _atomic_write_bytes(partial_path, payload)
@@ -417,8 +427,11 @@ def _atomic_yaml_write(path: Path, doc: Any) -> None:
     partial file. fsync ensures a crash between write and replace doesn't
     leave an empty doc as the new report."""
     payload = yaml.safe_dump(
-        doc, sort_keys=False, default_flow_style=False,
-        width=120, allow_unicode=True,
+        doc,
+        sort_keys=False,
+        default_flow_style=False,
+        width=120,
+        allow_unicode=True,
     )
     _atomic_write_bytes(path, payload.encode("utf-8"))
 
@@ -432,9 +445,7 @@ def _content_hash_ignoring_ended_at(doc: dict) -> bytes:
     Hashing the canonicalized dict (sort_keys + default=str) is faster
     than dumping YAML and avoids quoting-style perturbations. PERF-101."""
     stable = {k: v for k, v in doc.items() if k != "ended_at"}
-    return hashlib.sha256(
-        json.dumps(stable, sort_keys=True, default=str).encode("utf-8")
-    ).digest()
+    return hashlib.sha256(json.dumps(stable, sort_keys=True, default=str).encode("utf-8")).digest()
 
 
 def _atomic_write_bytes(path: Path, payload: bytes) -> None:
@@ -447,7 +458,9 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
     no longer collide on a single shared `.tmp`."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
-        prefix=path.name + ".", suffix=".tmp", dir=str(path.parent),
+        prefix=path.name + ".",
+        suffix=".tmp",
+        dir=str(path.parent),
     )
     try:
         with os.fdopen(fd, "wb") as f:
@@ -488,6 +501,7 @@ def _abandon_tree_nodes_in_place(tree: Tree, *, reason: str) -> int:
     from .driver import Node as _Node
 
     changed = 0
+
     def walk(node: _Node) -> None:
         nonlocal changed
         s = node.state
@@ -499,6 +513,7 @@ def _abandon_tree_nodes_in_place(tree: Tree, *, reason: str) -> int:
             changed += 1
         for c in node.children:
             walk(c)
+
     for n in tree.nodes:
         walk(n)
     return changed
@@ -510,8 +525,7 @@ def _abandon_tree_nodes_in_place(tree: Tree, *, reason: str) -> int:
 _abandon_frame_nodes_in_place = mark_abandoned_in_dict_nodes
 
 
-def _finalize_own_frames(log_dir: Path, invoke_id: str, *,
-                         reason: str) -> bool:
+def _finalize_own_frames(log_dir: Path, invoke_id: str, *, reason: str) -> bool:
     """Fix #2: at the MCP server's tool boundary, force-terminate any
     non-terminal nodes in frames written by **this process** before the
     `tool_result` envelope is emitted to the parent agent.
@@ -566,12 +580,12 @@ def _finalize_own_frames(log_dir: Path, invoke_id: str, *,
 # themselves here. The names below are thin re-exports kept stable for
 # tests and external callers that previously reached into this module.
 
-from .shutdown import (  # noqa: E402
-    _ACTIVE_REPORTERS,
-    _ACTIVE_REPORTERS_LOCK,
-    _chain_signal_handler,
-    flush_active_reporters as _flush_active_reporters,
-    install_shutdown_hooks,
-    register_reporter as _register_active_reporter,
-    unregister_reporter as _unregister_active_reporter,
+from .shutdown import (  # noqa: E402  -- intentional late re-exports for backwards-compatible test access
+    _ACTIVE_REPORTERS,  # noqa: F401
+    _ACTIVE_REPORTERS_LOCK,  # noqa: F401
+    _chain_signal_handler,  # noqa: F401
+    flush_active_reporters as _flush_active_reporters,  # noqa: F401
+    install_shutdown_hooks,  # noqa: F401
+    register_reporter as _register_active_reporter,  # noqa: F401
+    unregister_reporter as _unregister_active_reporter,  # noqa: F401
 )

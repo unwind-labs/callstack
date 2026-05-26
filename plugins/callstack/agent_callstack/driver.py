@@ -10,6 +10,7 @@ finished `Tree`. Multiple tasks fan out via a thread pool. Children execute
 synchronously within their parent's drive call. When a node yields, the
 whole subtree pauses; `Driver.resume(reply)` continues it.
 """
+
 from __future__ import annotations
 
 import atexit
@@ -22,11 +23,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional, cast
 
-
 from . import state as st
 from .channel import (
-    Channel, TurnTimeout,
     _MAX_IN_FLIGHT_TURNS as _CHANNEL_MAX_IN_FLIGHT,
+    Channel,
+    TurnTimeout,
 )
 from .invocation_ctx import _utc_now_iso as _utc_now
 from .protocol import parse_envelope
@@ -72,17 +73,18 @@ def _classify_upstream_failure(text: str) -> Optional[str]:
     assistant prose. When a second synthetic shows up in traces, this
     grows back into a table — until then a direct check is clearer than
     a one-row dispatcher."""
-    if ("API Error" in text
-            and "Server is temporarily limiting requests" in text):
+    if "API Error" in text and "Server is temporarily limiting requests" in text:
         return f"upstream_rate_limited: {text.strip()[:500]}"
     return None
 
 
 # ---------- Tree of execution nodes ----------
 
+
 @dataclass
 class Node:
     """One agent invocation. Mutable wrapper around the pure State."""
+
     id: str
     task: str
     state: st.State
@@ -132,29 +134,38 @@ class Node:
 
     def to_dict(self) -> dict:
         return {
-            "id": self.id, "task": self.task,
+            "id": self.id,
+            "task": self.task,
             "state": _state_to_dict(self.state),
-            "parent_lines": self.parent_lines, "duration": self.duration,
+            "parent_lines": self.parent_lines,
+            "duration": self.duration,
             "max_context_tokens_seen": self.max_context_tokens_seen,
             "call_type": self.call_type,
-            "session_id": self.session_id, "clone_path": self.clone_path,
-            "result": self.result, "summary": self.summary,
-            "suggested_next": self.suggested_next, "error": self.error,
+            "session_id": self.session_id,
+            "clone_path": self.clone_path,
+            "result": self.result,
+            "summary": self.summary,
+            "suggested_next": self.suggested_next,
+            "error": self.error,
             "children": [c.to_dict() for c in self.children],
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "Node":
         return cls(
-            id=d["id"], task=d["task"],
+            id=d["id"],
+            task=d["task"],
             state=_state_from_dict(d["state"]),
             parent_lines=d.get("parent_lines", 0),
             duration=d.get("duration", 0.0),
             max_context_tokens_seen=d.get("max_context_tokens_seen", 0),
             call_type=d.get("call_type", "fork"),
-            session_id=d.get("session_id"), clone_path=d.get("clone_path"),
-            result=d.get("result"), summary=d.get("summary"),
-            suggested_next=d.get("suggested_next"), error=d.get("error"),
+            session_id=d.get("session_id"),
+            clone_path=d.get("clone_path"),
+            result=d.get("result"),
+            summary=d.get("summary"),
+            suggested_next=d.get("suggested_next"),
+            error=d.get("error"),
             children=[cls.from_dict(c) for c in d.get("children", [])],
         )
 
@@ -162,8 +173,9 @@ class Node:
 @dataclass
 class Tree:
     """The full execution result."""
+
     root_session: SessionRef
-    nodes: list[Node]                  # one per task
+    nodes: list[Node]  # one per task
     base_depth: int
 
     def to_dict(self) -> dict:
@@ -185,8 +197,7 @@ class Tree:
                 f"before paper-v1-rc1 (schema v1) cannot be resumed."
             )
         return cls(
-            root_session=SessionRef(session_id=d["root_session_id"],
-                                    file=Path(d["root_session_file"])),
+            root_session=SessionRef(session_id=d["root_session_id"], file=Path(d["root_session_file"])),
             nodes=[Node.from_dict(n) for n in d["nodes"]],
             base_depth=d.get("base_depth", 0),
         )
@@ -208,6 +219,7 @@ class Tree:
 
 
 # ---------- Driver ----------
+
 
 class MaxDepthExceeded(Exception):
     pass
@@ -267,13 +279,14 @@ class Driver:
     # `_continue → _perform → _spawn_child` inside the propagate loop
     # doesn't self-deadlock.
     _propagate_lock: threading.RLock = field(
-        default_factory=threading.RLock, init=False, repr=False,
+        default_factory=threading.RLock,
+        init=False,
+        repr=False,
     )
 
     # ---- entry points ----
 
-    def run(self, parent: SessionRef, tasks: list[str], base_depth: int = 0,
-            context: str = "fork") -> Tree:
+    def run(self, parent: SessionRef, tasks: list[str], base_depth: int = 0, context: str = "fork") -> Tree:
         """Execute one or more root tasks. Multiple tasks run in parallel.
 
         context — how root tasks launch their underlying claude session:
@@ -283,8 +296,7 @@ class Driver:
         if context not in ("fork", "fresh"):
             raise ValueError(f"invalid context: {context!r}")
         call_type = self._derive_call_type(context, parent)
-        nodes = [self._new_node(task, context_mode=context, call_type=call_type)
-                 for task in tasks]
+        nodes = [self._new_node(task, context_mode=context, call_type=call_type) for task in tasks]
         tree = Tree(root_session=parent, nodes=nodes, base_depth=base_depth)
         self.last_tree = tree
         self._notify()
@@ -302,11 +314,7 @@ class Driver:
             # PERF-J: reuse the module-level pool instead of constructing a
             # fresh ThreadPoolExecutor per call_many.
             pool = _get_run_pool()
-            futures = [
-                (n, pool.submit(self._drive, n, parent.session_id, parent.file,
-                                base_depth + 1))
-                for n in nodes
-            ]
+            futures = [(n, pool.submit(self._drive, n, parent.session_id, parent.file, base_depth + 1)) for n in nodes]
             cf.wait([fut for _n, fut in futures])
             # CORR-104: collect exceptions per-future so one sibling's
             # unexpected error doesn't strand the others' results.
@@ -328,11 +336,12 @@ class Driver:
                 if not self._sibling_exception_logged:
                     import sys as _sys
                     import traceback as _tb
-                    print(f"[callstack] sibling task raised "
-                          f"(further occurrences suppressed): {err_msg}",
-                          file=_sys.stderr)
-                    _tb.print_exception(type(exc), exc, exc.__traceback__,
-                                        file=_sys.stderr)
+
+                    print(
+                        f"[callstack] sibling task raised (further occurrences suppressed): {err_msg}",
+                        file=_sys.stderr,
+                    )
+                    _tb.print_exception(type(exc), exc, exc.__traceback__, file=_sys.stderr)
                     self._sibling_exception_logged = True
 
         self._persist_if_yielded(tree)
@@ -347,8 +356,7 @@ class Driver:
         parent_dir = parent.cwd or ""
         own_dir = self.cwd or ""
         try:
-            same = (parent_dir and own_dir
-                    and os.path.realpath(parent_dir) == os.path.realpath(own_dir))
+            same = parent_dir and own_dir and os.path.realpath(parent_dir) == os.path.realpath(own_dir)
         except OSError:
             same = False
         return "fresh" if same or not own_dir or not parent_dir else "fresh_cross_project"
@@ -390,20 +398,22 @@ class Driver:
                 # otherwise spam stderr).
                 import sys
                 import traceback
-                print("[callstack] on_progress callback raised "
-                      "(further failures suppressed):", file=sys.stderr)
+
+                print("[callstack] on_progress callback raised (further failures suppressed):", file=sys.stderr)
                 traceback.print_exc(file=sys.stderr)
                 self._notify_failed = True
 
     # ---- private: tree topology helpers ----
 
-    def _new_node(self, task: str, *, context_mode: str = "fork",
-                  call_type: str = "fork") -> Node:
+    def _new_node(self, task: str, *, context_mode: str = "fork", call_type: str = "fork") -> Node:
         nid = uuid.uuid4().hex
         cmode = cast(Literal["fork", "fresh"], context_mode)
-        return Node(id=nid, task=task, call_type=call_type,
-                    state=st.Pending(parent_session_id="", task=task,
-                                     task_id=nid[:8], context_mode=cmode))
+        return Node(
+            id=nid,
+            task=task,
+            call_type=call_type,
+            state=st.Pending(parent_session_id="", task=task, task_id=nid[:8], context_mode=cmode),
+        )
 
     def _depth_of(self, tree: Tree, target: Node) -> int:
         def walk(n: Node, d: int) -> Optional[int]:
@@ -414,6 +424,7 @@ class Driver:
                 if hit is not None:
                     return hit
             return None
+
         for root in tree.nodes:
             d = walk(root, tree.base_depth + 1)
             if d is not None:
@@ -422,6 +433,7 @@ class Driver:
 
     def _parent_file_for(self, tree: Tree, target: Node) -> Path:
         """Session file of `target`'s parent (or root session for top-level)."""
+
         def find_parent(n: Node) -> Optional[Node]:
             for c in n.children:
                 if c is target:
@@ -430,6 +442,7 @@ class Driver:
                 if found is not None:
                     return found
             return None
+
         for root in tree.nodes:
             if root is target:
                 return tree.root_session.file
@@ -461,11 +474,13 @@ class Driver:
                     return
                 if isinstance(node.state, st.Done):
                     event: st.Event = st.ChildDone(
-                        child_id=parent.state.child_id, result=node.state.result,
+                        child_id=parent.state.child_id,
+                        result=node.state.result,
                     )
                 elif isinstance(node.state, st.Failed):
                     event = st.ChildFailed(
-                        child_id=parent.state.child_id, error=node.state.error,
+                        child_id=parent.state.child_id,
+                        error=node.state.error,
                     )
                 else:
                     # Parent stays parked; nothing to do.
@@ -482,8 +497,7 @@ class Driver:
 
     # ---- private: state machine driver ----
 
-    def _drive(self, node: Node, parent_session_id: str,
-               parent_session_file: Path, depth: int) -> None:
+    def _drive(self, node: Node, parent_session_id: str, parent_session_file: Path, depth: int) -> None:
         """Drive `node` from Pending until it terminates, yields, or its current
         child yields. May recurse to drive children synchronously."""
         # Preserve the node's pre-set context_mode (stamped at _new_node time
@@ -491,20 +505,17 @@ class Driver:
         # CALL envelopes). Fresh nodes have no inherited transcript so
         # parent_lines stays at 0.
         prior = node.state
-        cmode: Literal["fork", "fresh"] = (
-            prior.context_mode if isinstance(prior, st.Pending) else "fork"
-        )
+        cmode: Literal["fork", "fresh"] = prior.context_mode if isinstance(prior, st.Pending) else "fork"
         if cmode == "fresh":
             node.parent_lines = 0
         else:
             node.parent_lines = count_lines(parent_session_file)
-        node.state = st.Pending(parent_session_id=parent_session_id,
-                                task=node.task, task_id=node.id[:8],
-                                context_mode=cmode)
+        node.state = st.Pending(
+            parent_session_id=parent_session_id, task=node.task, task_id=node.id[:8], context_mode=cmode
+        )
         self._continue(node, st.Start(), depth, parent_session_file)
 
-    def _continue(self, node: Node, initial_event: st.Event,
-                  depth: int, parent_file: Path) -> None:
+    def _continue(self, node: Node, initial_event: st.Event, depth: int, parent_file: Path) -> None:
         """Step `node` until terminal, suspended, or blocked on a yielded child."""
         event: Optional[st.Event] = initial_event
         while event is not None:
@@ -524,8 +535,7 @@ class Driver:
                 # Effect signalled "we're now blocked downstream" — stop.
                 return
 
-    def _perform(self, effect: st.Effect, node: Node,
-                 depth: int, parent_file: Path) -> Optional[st.Event]:
+    def _perform(self, effect: st.Effect, node: Node, depth: int, parent_file: Path) -> Optional[st.Event]:
         """Run an effect and return the resulting event (or None if blocked)."""
         if isinstance(effect, st.RunTurn):
             return self._run_turn(effect, node, depth, parent_file)
@@ -533,8 +543,7 @@ class Driver:
             return self._spawn_child(effect, node, depth)
         raise TypeError(f"unknown effect: {effect!r}")
 
-    def _run_turn(self, effect: st.RunTurn, node: Node,
-                  depth: int, parent_file: Path) -> st.Event:
+    def _run_turn(self, effect: st.RunTurn, node: Node, depth: int, parent_file: Path) -> st.Event:
         t0 = time.time()
         started_at = _utc_now()
         try:
@@ -558,9 +567,7 @@ class Driver:
             # UUID to use, and its MCP server can read the same value
             # back from CALLSTACK_OWN_SESSION env. Removes the
             # SessionLocator mtime-fallback race on concurrent siblings.
-            preallocated_sid: Optional[str] = (
-                str(uuid.uuid4()) if produces_new_session else None
-            )
+            preallocated_sid: Optional[str] = str(uuid.uuid4()) if produces_new_session else None
 
             def _early_session(sid: str) -> None:
                 if not produces_new_session:
@@ -573,12 +580,12 @@ class Driver:
                 self._notify()
 
             result = self.channel.run_turn(
-                effect.source_session_id, effect.prompt,
-                mode=effect.mode, cwd=self.cwd, timeout=self.timeout,
-                extra_env=(
-                    {"CALLSTACK_FRAME_KEY": node.id}
-                    if produces_new_session else None
-                ),
+                effect.source_session_id,
+                effect.prompt,
+                mode=effect.mode,
+                cwd=self.cwd,
+                timeout=self.timeout,
+                extra_env=({"CALLSTACK_FRAME_KEY": node.id} if produces_new_session else None),
                 on_session_id=_early_session,
                 preallocated_session_id=preallocated_sid,
             )
@@ -592,25 +599,39 @@ class Driver:
         except TurnTimeout as e:
             node.duration += time.time() - t0
             self.trace.write(
-                depth=depth, task=node.task,
+                depth=depth,
+                task=node.task,
                 session_id=node.session_id or "unknown",
-                result=e.partial, duration=node.duration,
-                api_request_id="", input_tokens=0, output_tokens=0,
-                cache_read_tokens=0, cache_creation_tokens=0,
-                started_at_utc=started_at, ended_at_utc=_utc_now(),
-                seed=self.seed, error=str(e),
+                result=e.partial,
+                duration=node.duration,
+                api_request_id="",
+                input_tokens=0,
+                output_tokens=0,
+                cache_read_tokens=0,
+                cache_creation_tokens=0,
+                started_at_utc=started_at,
+                ended_at_utc=_utc_now(),
+                seed=self.seed,
+                error=str(e),
             )
             return st.TurnFailed(error=str(e), partial=e.partial)
         except Exception as e:
             node.duration += time.time() - t0
             self.trace.write(
-                depth=depth, task=node.task,
+                depth=depth,
+                task=node.task,
                 session_id=node.session_id or "unknown",
-                result="", duration=node.duration,
-                api_request_id="", input_tokens=0, output_tokens=0,
-                cache_read_tokens=0, cache_creation_tokens=0,
-                started_at_utc=started_at, ended_at_utc=_utc_now(),
-                seed=self.seed, error=str(e),
+                result="",
+                duration=node.duration,
+                api_request_id="",
+                input_tokens=0,
+                output_tokens=0,
+                cache_read_tokens=0,
+                cache_creation_tokens=0,
+                started_at_utc=started_at,
+                ended_at_utc=_utc_now(),
+                seed=self.seed,
+                error=str(e),
             )
             return st.TurnFailed(error=f"Invocation failed: {e}")
 
@@ -630,14 +651,18 @@ class Driver:
             if resolved is not None:
                 node.clone_path = str(resolved)
         self.trace.write(
-            depth=depth, task=node.task, session_id=result.session_id,
-            result=result.text, duration=node.duration,
+            depth=depth,
+            task=node.task,
+            session_id=result.session_id,
+            result=result.text,
+            duration=node.duration,
             api_request_id=result.api_request_id,
             input_tokens=result.input_tokens,
             output_tokens=result.output_tokens,
             cache_read_tokens=result.cache_read_tokens,
             cache_creation_tokens=result.cache_creation_tokens,
-            started_at_utc=started_at, ended_at_utc=_utc_now(),
+            started_at_utc=started_at,
+            ended_at_utc=_utc_now(),
             seed=self.seed,
         )
         envelope = parse_envelope(result.text)
@@ -659,20 +684,16 @@ class Driver:
                 session_id=result.session_id,
                 partial=result.text,
             )
-        return st.TurnCompleted(envelope=envelope,
-                                session_id=result.session_id)
+        return st.TurnCompleted(envelope=envelope, session_id=result.session_id)
 
-    def _spawn_child(self, effect: st.SpawnChild, node: Node,
-                     depth: int) -> Optional[st.Event]:
+    def _spawn_child(self, effect: st.SpawnChild, node: Node, depth: int) -> Optional[st.Event]:
         # SpawnChild is only emitted by the state machine from the AwaitingChild
         # transition (state.py: AwaitingTurn + TurnCompleted(Call) -> AwaitingChild
         # + [SpawnChild]), so the parent node is always AwaitingChild here and
         # carries the child_id every returned event must echo back. Pin the
         # invariant once instead of re-deriving it (with a dead else-branch)
         # at each of the three return sites below.
-        assert isinstance(node.state, st.AwaitingChild), (
-            "SpawnChild dispatched against non-AwaitingChild parent"
-        )
+        assert isinstance(node.state, st.AwaitingChild), "SpawnChild dispatched against non-AwaitingChild parent"
         child_id = node.state.child_id
 
         if depth + 1 > self.max_depth:
@@ -697,6 +718,7 @@ class Driver:
 
 # ---------- ancestor index (ARCH-3) ----------
 
+
 @dataclass(frozen=True)
 class _TreeIndex:
     """One-shot ancestor index for `_propagate_up`.
@@ -707,6 +729,7 @@ class _TreeIndex:
     is mutable and not hashable. Lifetime is the propagate call only;
     don't cache on Tree (children are appended during execution and
     invalidation would silently rot)."""
+
     parent_of: dict[int, Optional[Node]]
     depth_of: dict[int, int]
     parent_file_of: dict[int, Path]
@@ -735,8 +758,7 @@ class _TreeIndex:
             child_pfile = Path(node.clone_path) if node.clone_path else root_file
             for c in node.children:
                 stack.append((c, node, depth + 1, child_pfile))
-        return cls(parent_of=parent_of, depth_of=depth_of,
-                   parent_file_of=parent_file_of)
+        return cls(parent_of=parent_of, depth_of=depth_of, parent_file_of=parent_file_of)
 
 
 # ---------- internal serialization & helpers ----------

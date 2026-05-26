@@ -7,6 +7,7 @@ envelopes — through the public typed outcomes (`Started`, `CapReached`,
 dict to assert lifecycle behavior: the lifecycle now lives behind one type and
 is verified at that type's boundary.
 """
+
 from __future__ import annotations
 
 import sys
@@ -20,14 +21,20 @@ if str(_PLUGIN) not in sys.path:
     sys.path.insert(0, str(_PLUGIN))
 
 from agent_callstack import (  # type: ignore  # noqa: E402
-    BackgroundRuns, CapReached, Crashed, Done, MultiResult, NotFound,
-    Pending, Result, Started,
+    BackgroundRuns,
+    CapReached,
+    Crashed,
+    Done,
+    MultiResult,
+    NotFound,
+    Pending,
+    Result,
+    Started,
 )
 
 
 def _ok(value: str = "ok") -> Result:
-    return Result(value=value, summary=None, next=None,
-                  duration=0.01, log=None, log_start=0)
+    return Result(value=value, summary=None, next=None, duration=0.01, log=None, log_start=0)
 
 
 class _StubCaller:
@@ -49,11 +56,14 @@ class _BoomCaller:
         raise RuntimeError("simulated internal failure")
 
 
-def _start(runs: BackgroundRuns, caller, *, invoke_id="iid",
-           report_path="/tmp/r.yaml", log_dir=None):
+def _start(runs: BackgroundRuns, caller, *, invoke_id="iid", report_path="/tmp/r.yaml", log_dir=None):
     return runs.start(
-        invoke_id=invoke_id, caller=caller, tasks=["x"], context="fork",
-        report_path=report_path, log_dir=Path(log_dir or "/tmp"),
+        invoke_id=invoke_id,
+        caller=caller,
+        tasks=["x"],
+        context="fork",
+        report_path=report_path,
+        log_dir=Path(log_dir or "/tmp"),
     )
 
 
@@ -137,8 +147,7 @@ async def test_reconcile_crash_pops_and_finalizes_frames(monkeypatch):
     assert "iid" not in runs
     # Frames were finalized for the crashed run.
     assert ("iid", "/tmp/inv", "") in finalized
-    assert any(isinstance(x, str) and "terminal frame state" in x
-               for x in finalized)
+    assert any(isinstance(x, str) and "terminal frame state" in x for x in finalized)
 
 
 @pytest.mark.asyncio
@@ -195,8 +204,7 @@ async def test_polled_pending_result_survives_a_sibling_start():
     finish A -> start B -> reconcile A MUST be Done with A's original result."""
     runs = BackgroundRuns()
     gate = threading.Event()
-    _start(runs, _StubCaller(results=[_ok("A-result")], gate=gate),
-           invoke_id="a", report_path="/tmp/a.yaml")
+    _start(runs, _StubCaller(results=[_ok("A-result")], gate=gate), invoke_id="a", report_path="/tmp/a.yaml")
 
     # Caller polls A while it's still running -> Pending pins the entry.
     assert isinstance(await runs.reconcile("a", timeout=0.05), Pending)

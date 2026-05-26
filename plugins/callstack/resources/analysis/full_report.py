@@ -4,6 +4,7 @@
 Usage:
     full_report.py [path/to/call_trace.jsonl] [--root <session-prefix>]
 """
+
 from __future__ import annotations
 
 import argparse
@@ -14,15 +15,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from agent_callstack.analysis import (  # noqa: E402
-    SessionAnalyzer, format_duration, format_tree,
+    SessionAnalyzer,
+    format_duration,
+    format_tree,
 )
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("trace_file",
-                   help="Path to a call_trace.jsonl "
-                        "(<log_dir>/<invoke_id>/call_trace.jsonl)")
+    p.add_argument("trace_file", help="Path to a call_trace.jsonl (<log_dir>/<invoke_id>/call_trace.jsonl)")
     p.add_argument("--root", help="Root session id (or prefix)")
     args = p.parse_args()
 
@@ -61,10 +62,8 @@ def main():
     print(f"{'session':14s}  {'turns':>6s}  {'errors':>7s}  {'duration':>10s}  pct")
     for sid, d in sorted(dur.items(), key=lambda kv: -kv[1]):
         pct = 100.0 * d / total if total else 0.0
-        print(f"{sid[:14]:14s}  {turns[sid]:>6d}  {errors[sid]:>7d}  "
-              f"{format_duration(d):>10s}  {pct:5.1f}%")
-    print(f"{'TOTAL':14s}  {sum(turns.values()):>6d}  {sum(errors.values()):>7d}  "
-          f"{format_duration(total):>10s}")
+        print(f"{sid[:14]:14s}  {turns[sid]:>6d}  {errors[sid]:>7d}  {format_duration(d):>10s}  {pct:5.1f}%")
+    print(f"{'TOTAL':14s}  {sum(turns.values()):>6d}  {sum(errors.values()):>7d}  {format_duration(total):>10s}")
 
 
 def _resolve_prefix(events: list, prefix: str | None) -> str | None:

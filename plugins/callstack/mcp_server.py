@@ -14,6 +14,7 @@ Each call generates an `invoke_id` and writes:
 The response envelope includes `invoke_id` and `report_path` so the caller
 can open the YAML and see the full nested call tree with inputs/outputs.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -24,10 +25,26 @@ from pathlib import Path
 from typing import Any, Optional
 
 from agent_callstack import (
-    BackgroundRuns, Caller, CallFailed, CallYielded, CapReached, Crashed,
-    Done, ENV_ROOT_INVOKE_ID, ENV_ROOT_LOG_DIR, InvocationReport, MultiResult,
-    NotFound, Pending, Result, SessionLocator, Started, YieldToken,
-    max_fanout, new_invoke_id, root_identity,
+    ENV_ROOT_INVOKE_ID,
+    ENV_ROOT_LOG_DIR,
+    BackgroundRuns,
+    Caller,
+    CallFailed,
+    CallYielded,
+    CapReached,
+    Crashed,
+    Done,
+    InvocationReport,
+    MultiResult,
+    NotFound,
+    Pending,
+    Result,
+    SessionLocator,
+    Started,
+    YieldToken,
+    max_fanout,
+    new_invoke_id,
+    root_identity,
 )
 from mcp.server.fastmcp import FastMCP
 
@@ -55,6 +72,7 @@ def _result_to_dict(item: Any) -> dict:
 # subprocess (RSS 0.5–2 GB), so even one MCP call with a 10k-element
 # array can OOM the host. The cap can be widened via env for users
 # with legitimate batch needs, but never silently exceeded.
+
 
 def _max_fanout() -> int:
     """Thin wrapper kept for backwards-compatible test access; the
@@ -139,8 +157,7 @@ def _resolve_invocation_identity(cwd: str) -> tuple[str, Path]:
     return new_invoke_id(), _log_dir(cwd)
 
 
-def _build_caller(session: str, model: str, cwd: str, timeout: int,
-                  invoke_id: str, log_dir: Path) -> Caller:
+def _build_caller(session: str, model: str, cwd: str, timeout: int, invoke_id: str, log_dir: Path) -> Caller:
     return Caller(
         session=session or None,
         model=model or None,
@@ -162,9 +179,17 @@ def _sensitive_prefixes() -> list[Path]:
     unless the parent project itself happens to live under one of them."""
     home = Path.home()
     return [
-        Path("/etc"), Path("/var"), Path("/usr"), Path("/bin"), Path("/sbin"),
-        Path("/private/etc"), Path("/private/var"),
-        home / ".ssh", home / ".aws", home / ".gnupg", home / ".config",
+        Path("/etc"),
+        Path("/var"),
+        Path("/usr"),
+        Path("/bin"),
+        Path("/sbin"),
+        Path("/private/etc"),
+        Path("/private/var"),
+        home / ".ssh",
+        home / ".aws",
+        home / ".gnupg",
+        home / ".config",
     ]
 
 
@@ -205,8 +230,7 @@ def _resolve_cwd(raw: str) -> tuple[str, Optional[str]]:
             # (e.g. macOS tmp at /private/var/folders/...), the user has
             # already accepted that location as their workspace — don't
             # gate siblings at the same level.
-            if (parent_project == prefix_resolved
-                    or _is_within(parent_project, prefix_resolved)):
+            if parent_project == prefix_resolved or _is_within(parent_project, prefix_resolved):
                 continue
             if resolved == prefix_resolved or _is_within(resolved, prefix_resolved):
                 return str(resolved), (
@@ -250,17 +274,19 @@ def _finalize_at_boundary(log_dir, invoke_id: str, *, reason: str) -> None:
         # cwd is irrelevant to finalize_own_frames (it only needs
         # log_dir + invoke_id to locate this process's frames).
         report = InvocationReport(
-            invoke_id=invoke_id, log_dir=log_dir, cwd="",
+            invoke_id=invoke_id,
+            log_dir=log_dir,
+            cwd="",
         )
         report.finalize_own_frames(reason=reason)
     except Exception as e:
-        print(f"[callstack] WARN finalize_own_frames raised at MCP "
-              f"boundary ({reason}): {type(e).__name__}: {e}",
-              file=sys.stderr)
+        print(
+            f"[callstack] WARN finalize_own_frames raised at MCP boundary ({reason}): {type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
 
 
-def _envelope_from_multi(invoke_id: str, report_path: str,
-                          multi: MultiResult) -> dict:
+def _envelope_from_multi(invoke_id: str, report_path: str, multi: MultiResult) -> dict:
     envelope: dict = {
         "invoke_id": invoke_id,
         "report_path": report_path,
@@ -271,16 +297,21 @@ def _envelope_from_multi(invoke_id: str, report_path: str,
     # rather than silently consuming a stale or missing file.
     if not Path(report_path).is_file():
         envelope["report_warning"] = (
-            f"report file at {report_path!r} does not exist on disk; "
-            f"the live reporter may have failed to write it"
+            f"report file at {report_path!r} does not exist on disk; the live reporter may have failed to write it"
         )
     return envelope
 
 
 @mcp.tool()
-async def call(tasks: list[str], timeout: int = 300, session_id: str = "",
-               model: str = "", cwd: str = "", context: str = "fork",
-               run_in_background: bool = False) -> str:
+async def call(
+    tasks: list[str],
+    timeout: int = 300,
+    session_id: str = "",
+    model: str = "",
+    cwd: str = "",
+    context: str = "fork",
+    run_in_background: bool = False,
+) -> str:
     """Fork sub-agents to execute `tasks` concurrently. Returns an envelope
     `{invoke_id, report_path, results: [...]}`; all tasks share one
     invocation and one YAML report listing the full nested call tree.
@@ -314,41 +345,57 @@ async def call(tasks: list[str], timeout: int = 300, session_id: str = "",
         (bad tasks, bad cwd, fork+cross-project) are still surfaced
         synchronously so the orchestrator can react without polling."""
     if context not in ("fork", "fresh"):
-        return json.dumps({
-            "invoke_id": "", "report_path": "",
-            "results": [{"status": "error",
-                         "error": f"invalid context: {context!r} "
-                                  f"(must be 'fork' or 'fresh')"}],
-        }, indent=2)
+        return json.dumps(
+            {
+                "invoke_id": "",
+                "report_path": "",
+                "results": [{"status": "error", "error": f"invalid context: {context!r} (must be 'fork' or 'fresh')"}],
+            },
+            indent=2,
+        )
     tasks_err = _validate_tasks(tasks)
     if tasks_err:
-        return json.dumps({
-            "invoke_id": "", "report_path": "",
-            "results": [{"status": "error", "error": tasks_err}],
-        }, indent=2)
+        return json.dumps(
+            {
+                "invoke_id": "",
+                "report_path": "",
+                "results": [{"status": "error", "error": tasks_err}],
+            },
+            indent=2,
+        )
     resolved_cwd, cwd_err = _resolve_cwd(cwd)
     if cwd_err:
-        return json.dumps({
-            "invoke_id": "", "report_path": "",
-            "results": [{"status": "error", "error": cwd_err}],
-        }, indent=2)
+        return json.dumps(
+            {
+                "invoke_id": "",
+                "report_path": "",
+                "results": [{"status": "error", "error": cwd_err}],
+            },
+            indent=2,
+        )
     parent_dir = _parent_project_folder()
     if context == "fork" and not _same_project(resolved_cwd, parent_dir):
-        return json.dumps({
-            "invoke_id": "", "report_path": "",
-            "results": [{
-                "status": "error",
-                "error": (
-                    f"context='fork' cannot be combined with a cwd "
-                    f"different from the parent's project folder "
-                    f"(parent={parent_dir}, requested={resolved_cwd}); "
-                    f"use context='fresh' instead"),
-            }],
-        }, indent=2)
+        return json.dumps(
+            {
+                "invoke_id": "",
+                "report_path": "",
+                "results": [
+                    {
+                        "status": "error",
+                        "error": (
+                            f"context='fork' cannot be combined with a cwd "
+                            f"different from the parent's project folder "
+                            f"(parent={parent_dir}, requested={resolved_cwd}); "
+                            f"use context='fresh' instead"
+                        ),
+                    }
+                ],
+            },
+            indent=2,
+        )
 
     invoke_id, log_dir = _resolve_invocation_identity(resolved_cwd)
-    caller = _build_caller(session_id, model, resolved_cwd, timeout,
-                           invoke_id, log_dir)
+    caller = _build_caller(session_id, model, resolved_cwd, timeout, invoke_id, log_dir)
     report_path = _report_path(log_dir, invoke_id)
 
     if run_in_background:
@@ -356,28 +403,41 @@ async def call(tasks: list[str], timeout: int = 300, session_id: str = "",
         # cap, and schedules `caller.call_many` on a worker thread — returning
         # a typed outcome we translate to the wire envelope here.
         outcome = _background.start(
-            invoke_id=invoke_id, caller=caller, tasks=tasks, context=context,
-            report_path=report_path, log_dir=log_dir,
+            invoke_id=invoke_id,
+            caller=caller,
+            tasks=tasks,
+            context=context,
+            report_path=report_path,
+            log_dir=log_dir,
         )
         if isinstance(outcome, CapReached):
-            return json.dumps({
-                "invoke_id": "", "report_path": "",
-                "results": [{
-                    "status": "error",
-                    "error": (
-                        f"background-call registry full: {outcome.outstanding} "
-                        f"outstanding (cap={outcome.cap}). Reconcile pending "
-                        f"invocations with `await_call(invoke_id)` first, or "
-                        f"widen with CALLSTACK_MAX_BACKGROUND."
-                    ),
-                }],
-            }, indent=2)
+            return json.dumps(
+                {
+                    "invoke_id": "",
+                    "report_path": "",
+                    "results": [
+                        {
+                            "status": "error",
+                            "error": (
+                                f"background-call registry full: {outcome.outstanding} "
+                                f"outstanding (cap={outcome.cap}). Reconcile pending "
+                                f"invocations with `await_call(invoke_id)` first, or "
+                                f"widen with CALLSTACK_MAX_BACKGROUND."
+                            ),
+                        }
+                    ],
+                },
+                indent=2,
+            )
         assert isinstance(outcome, Started)
-        return json.dumps({
-            "invoke_id": outcome.invoke_id,
-            "report_path": outcome.report_path,
-            "status": "started",
-        }, indent=2)
+        return json.dumps(
+            {
+                "invoke_id": outcome.invoke_id,
+                "report_path": outcome.report_path,
+                "status": "started",
+            },
+            indent=2,
+        )
 
     # Fix #2: when `caller.call_many` raises before its own finally clause
     # gets to run reporter.finalize, the on-disk frames are left with
@@ -390,16 +450,20 @@ async def call(tasks: list[str], timeout: int = 300, session_id: str = "",
     # for a guaranteed no-op.
     try:
         multi: MultiResult = await asyncio.to_thread(
-            caller.call_many, tasks, context=context,
+            caller.call_many,
+            tasks,
+            context=context,
         )
     except Exception:
         _finalize_at_boundary(
-            log_dir, invoke_id,
+            log_dir,
+            invoke_id,
             reason="call_many raised before recording terminal frame state",
         )
         raise
     return json.dumps(
-        _envelope_from_multi(invoke_id, report_path, multi), indent=2,
+        _envelope_from_multi(invoke_id, report_path, multi),
+        indent=2,
     )
 
 
@@ -421,24 +485,33 @@ async def await_call(invoke_id: str, timeout: int = 60) -> str:
     # typed outcome onto the wire envelope.
     outcome = await _background.reconcile(invoke_id, timeout=timeout)
     if isinstance(outcome, NotFound):
-        return json.dumps({
-            "invoke_id": invoke_id,
-            "status": "error",
-            "error": f"no background call with invoke_id={invoke_id!r}",
-        }, indent=2)
+        return json.dumps(
+            {
+                "invoke_id": invoke_id,
+                "status": "error",
+                "error": f"no background call with invoke_id={invoke_id!r}",
+            },
+            indent=2,
+        )
     if isinstance(outcome, Pending):
-        return json.dumps({
-            "invoke_id": invoke_id,
-            "report_path": outcome.report_path,
-            "status": "pending",
-        }, indent=2)
+        return json.dumps(
+            {
+                "invoke_id": invoke_id,
+                "report_path": outcome.report_path,
+                "status": "pending",
+            },
+            indent=2,
+        )
     if isinstance(outcome, Crashed):
-        return json.dumps({
-            "invoke_id": invoke_id,
-            "report_path": outcome.report_path,
-            "status": "error",
-            "error": f"background call raised: {outcome.error}",
-        }, indent=2)
+        return json.dumps(
+            {
+                "invoke_id": invoke_id,
+                "report_path": outcome.report_path,
+                "status": "error",
+                "error": f"background call raised: {outcome.error}",
+            },
+            indent=2,
+        )
     assert isinstance(outcome, Done)
     return json.dumps(
         _envelope_from_multi(invoke_id, outcome.report_path, outcome.result),
@@ -447,8 +520,7 @@ async def await_call(invoke_id: str, timeout: int = 60) -> str:
 
 
 @mcp.tool()
-async def resume(resume_session: str, user_reply: str,
-                 timeout: int = 300, cwd: str = "") -> str:
+async def resume(resume_session: str, user_reply: str, timeout: int = 300, cwd: str = "") -> str:
     """Resume a previously yielded call session with the user's reply.
 
     Use after a call returned status 'yield' — pass back the session_id and the
@@ -463,10 +535,14 @@ async def resume(resume_session: str, user_reply: str,
     # here (the sensitive-prefix gate still applies).
     resolved_cwd, cwd_err = _resolve_cwd(cwd)
     if cwd_err:
-        return json.dumps({
-            "invoke_id": "", "report_path": "",
-            "status": "error", "error": cwd_err,
-        })
+        return json.dumps(
+            {
+                "invoke_id": "",
+                "report_path": "",
+                "status": "error",
+                "error": cwd_err,
+            }
+        )
     invoke_id, log_dir = _resolve_invocation_identity(resolved_cwd)
     caller = _build_caller("", "", resolved_cwd, timeout, invoke_id, log_dir)
     # Locate the clone path so we can construct a YieldToken. Pass None when
@@ -478,8 +554,7 @@ async def resume(resume_session: str, user_reply: str,
     clone = SessionLocator().resolve(resume_session, cwd=locate_cwd)
     envelope = {"invoke_id": invoke_id, "report_path": _report_path(log_dir, invoke_id)}
     if clone is None:
-        envelope.update({"status": "error",
-                         "error": f"Cannot find session file for {resume_session}"})
+        envelope.update({"status": "error", "error": f"Cannot find session file for {resume_session}"})
         return json.dumps(envelope)
     token = YieldToken(session_id=resume_session, clone_path=str(clone))
     try:

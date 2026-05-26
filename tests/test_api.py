@@ -3,15 +3,20 @@
 These tests inject a ScriptedChannel via Caller's `_driver_for` override so the
 end-to-end translation from Tree → Result/CallYielded/CallFailed is verified
 without spawning subprocesses."""
+
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
 import pytest
-
 from agent_callstack import (
-    Caller, CallFailed, CallYielded, MultiResult, Result, YieldToken,
+    Caller,
+    CallFailed,
+    CallYielded,
+    MultiResult,
+    Result,
+    YieldToken,
 )
 from agent_callstack.channel import ScriptedChannel
 from agent_callstack.driver import Driver
@@ -33,6 +38,7 @@ def parent_file(tmp_path):
 def _make_caller(tmp_path, parent_file, channel: ScriptedChannel) -> Caller:
     """Subclass Caller so all driver creation uses the scripted channel."""
     from agent_callstack.session import encode_project_dir
+
     projects = tmp_path / "projects" / encode_project_dir(str(tmp_path))
     projects.mkdir(parents=True, exist_ok=True)
 
@@ -42,6 +48,7 @@ def _make_caller(tmp_path, parent_file, channel: ScriptedChannel) -> Caller:
             driver = self._scripted_driver()
             tree = driver.run(parent, tasks, base_depth=0, context=context)
             from agent_callstack import _results_from_tree  # type: ignore
+
             return _results_from_tree(tree)
 
         def _scripted_driver(self):
@@ -57,6 +64,7 @@ def _make_caller(tmp_path, parent_file, channel: ScriptedChannel) -> Caller:
 
         def resume(self, token, reply):
             from agent_callstack.driver import Tree
+
             store = TreeStore()
             snapshot = store.load(Path(token.clone_path))
             assert snapshot is not None
@@ -64,6 +72,7 @@ def _make_caller(tmp_path, parent_file, channel: ScriptedChannel) -> Caller:
             driver = self._scripted_driver()
             driver.resume(tree, token.session_id, reply)
             from agent_callstack import _results_from_tree, _unwrap_single  # type: ignore
+
             return _unwrap_single(_results_from_tree(tree)[0])
 
     return _Caller()
@@ -71,6 +80,7 @@ def _make_caller(tmp_path, parent_file, channel: ScriptedChannel) -> Caller:
 
 def _make_clone(tmp_path, name) -> Path:
     from agent_callstack.session import encode_project_dir
+
     p = tmp_path / "projects" / encode_project_dir(str(tmp_path))
     p.mkdir(parents=True, exist_ok=True)
     f = p / f"{name}.jsonl"
@@ -80,11 +90,13 @@ def _make_clone(tmp_path, name) -> Path:
 
 # ---------- Single-task path ----------
 
-class TestCall:
 
+class TestCall:
     def test_returns_result(self, tmp_path, parent_file):
         _make_clone(tmp_path, "00000000-0000-0000-0000-0000000000d5")
-        ch = ScriptedChannel().respond(_envelope("return", result="hi", summary="s"), "00000000-0000-0000-0000-0000000000d5")
+        ch = ScriptedChannel().respond(
+            _envelope("return", result="hi", summary="s"), "00000000-0000-0000-0000-0000000000d5"
+        )
         caller = _make_caller(tmp_path, parent_file, ch)
 
         r = caller.call("do thing")
@@ -107,6 +119,7 @@ class TestCall:
     def test_failure_raises(self, tmp_path, parent_file):
         def boom(*_):
             raise RuntimeError("bad CLI")
+
         ch = ScriptedChannel().respond_with(boom)
         caller = _make_caller(tmp_path, parent_file, ch)
 
@@ -116,29 +129,35 @@ class TestCall:
 
 # ---------- call_many ----------
 
-class TestCallMany:
 
+class TestCallMany:
     def test_mixed_results(self, tmp_path, parent_file):
         from agent_callstack.channel import TurnResult
+
         _make_clone(tmp_path, "00000000-0000-0000-0000-0000000000d6")
         _make_clone(tmp_path, "00000000-0000-0000-0000-0000000000d7")
         responses = {
-            "alpha": ("00000000-0000-0000-0000-0000000000d6",
-                      _envelope("return", result="A!")),
-            "bravo": ("00000000-0000-0000-0000-0000000000d7",
-                      _envelope("yield", question="?")),
+            "alpha": ("00000000-0000-0000-0000-0000000000d6", _envelope("return", result="A!")),
+            "bravo": ("00000000-0000-0000-0000-0000000000d7", _envelope("yield", question="?")),
         }
+
         def respond(_src, prompt, _fork):
             tail = prompt.rsplit("\n\n", 1)[-1]
             for tag, (sid, body) in responses.items():
                 if tag in tail:
                     return TurnResult(
-                        text=body, session_id=sid, duration=0.0,
-                        api_request_id="", input_tokens=0, output_tokens=0,
-                        cache_read_tokens=0, cache_creation_tokens=0,
+                        text=body,
+                        session_id=sid,
+                        duration=0.0,
+                        api_request_id="",
+                        input_tokens=0,
+                        output_tokens=0,
+                        cache_read_tokens=0,
+                        cache_creation_tokens=0,
                         total_cost_usd=0.0,
                     )
             raise AssertionError(prompt[:80])
+
         ch = ScriptedChannel().respond_with(respond).respond_with(respond)
         caller = _make_caller(tmp_path, parent_file, ch)
 
@@ -151,10 +170,10 @@ class TestCallMany:
 
 # ---------- Resume ----------
 
-class TestResume:
 
+class TestResume:
     def test_resume_completes(self, tmp_path, parent_file):
-        clone = _make_clone(tmp_path, "00000000-0000-0000-0000-0000000000d5")
+        _make_clone(tmp_path, "00000000-0000-0000-0000-0000000000d5")
         ch = ScriptedChannel().respond(_envelope("yield", question="MFA?"), "00000000-0000-0000-0000-0000000000d5")
         caller = _make_caller(tmp_path, parent_file, ch)
 
@@ -191,10 +210,8 @@ class TestResumeRealMethod:
         """Drive a real yield so the on-disk state (saved snapshot at a
         resolvable clone path) matches what a host holds when it gets a token."""
         clone = _make_clone(tmp_path, self._SID)
-        parent = SessionRef(
-            session_id="00000000-0000-0000-0000-0000000000d2", file=parent_file)
-        ch = ScriptedChannel().respond(
-            _envelope("yield", question="MFA?"), self._SID)
+        parent = SessionRef(session_id="00000000-0000-0000-0000-0000000000d2", file=parent_file)
+        ch = ScriptedChannel().respond(_envelope("yield", question="MFA?"), self._SID)
         tree = self._scripted_driver(tmp_path, ch).run(parent, ["auth"])
         leaf = tree.yielded_leaves()[0]
         assert Path(leaf.clone_path or "") == clone
@@ -205,8 +222,7 @@ class TestResumeRealMethod:
         resume turn through the channel, seal a report, and return the child's
         Result — the end-to-end contract resume() promises a host."""
         token = self._setup_yield(tmp_path, parent_file)
-        resume_ch = ScriptedChannel().respond(
-            _envelope("return", result="done"), self._SID)
+        resume_ch = ScriptedChannel().respond(_envelope("return", result="done"), self._SID)
 
         test = self
 
@@ -214,8 +230,7 @@ class TestResumeRealMethod:
             def _driver_for(self, parent, *, ctx, depth_base=0):
                 return test._scripted_driver(tmp_path, resume_ch)
 
-        caller = _Caller(log_dir=tmp_path / "logs",
-                         invoke_id="20260101T000000-deadbeef")
+        caller = _Caller(log_dir=tmp_path / "logs", invoke_id="20260101T000000-deadbeef")
         r = caller.resume(token, "847291")
         assert isinstance(r, Result)
         assert r.value == "done"
@@ -226,8 +241,7 @@ class TestResumeRealMethod:
         """A token whose clone path has no .call_tree sidecar must raise
         CallFailed (fail loud), never fabricate an empty Result. Real Caller,
         no channel override — it must bail before spawning anything."""
-        caller = Caller(log_dir=tmp_path / "logs",
-                        invoke_id="20260101T000000-deadbeef")
+        caller = Caller(log_dir=tmp_path / "logs", invoke_id="20260101T000000-deadbeef")
         token = YieldToken(session_id="x", clone_path=str(tmp_path / "ghost.jsonl"))
         with pytest.raises(CallFailed, match="cannot resume"):
             caller.resume(token, "reply")
@@ -264,6 +278,7 @@ class TestEnvPropagation:
         Without this, a grandchild's Driver falls back to the default cap
         (10) — silently exceeding a budget the root explicitly chose."""
         from agent_callstack.session import SessionRef
+
         caller = Caller(max_depth=3)
         parent = SessionRef(
             session_id="00000000-0000-0000-0000-0000000000aa",
@@ -286,6 +301,7 @@ class TestEnvPropagation:
         whole subtree rather than dependent on whether each child happens
         to inherit ENV_MAX_DEPTH from its shell."""
         from agent_callstack.session import SessionRef
+
         caller = Caller()  # max_depth defaults to 10
         parent = SessionRef(
             session_id="00000000-0000-0000-0000-0000000000bb",

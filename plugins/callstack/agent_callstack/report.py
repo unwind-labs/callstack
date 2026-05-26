@@ -20,6 +20,7 @@ optimization (cache, hash-skip) has no honest behavioral expression, but the
 *structural* shape of "make a report, drive it, read the merged doc" now lives
 behind one type.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -33,9 +34,9 @@ from .frames import (
 )
 from .invocation_ctx import _InvocationContext, _utc_now_iso
 from .reporter import (
-    _LiveReporter,
     _atomic_yaml_write,
     _finalize_own_frames,
+    _LiveReporter,
 )
 from .terminal_wait import wait_for_terminal_signals
 
@@ -74,13 +75,17 @@ class InvocationReport:
         # the component form and the `from_context` form (which would
         # silently skip __init__ under the old __new__ idiom). When `ctx`
         # is supplied it is authoritative; otherwise build one from parts.
-        self._ctx = ctx if ctx is not None else _InvocationContext(
-            invoke_id=invoke_id,
-            log_dir=Path(log_dir),
-            cwd=cwd,
-            frame_key=frame_key,
-            is_nested=is_nested,
-            instance_id=instance_id,
+        self._ctx = (
+            ctx
+            if ctx is not None
+            else _InvocationContext(
+                invoke_id=invoke_id,
+                log_dir=Path(log_dir),
+                cwd=cwd,
+                frame_key=frame_key,
+                is_nested=is_nested,
+                instance_id=instance_id,
+            )
         )
 
     @classmethod
@@ -140,16 +145,17 @@ class InvocationReport:
 
     # ---- live writing ----
 
-    def reporter(self, *, kind: str, tasks: Sequence[str],
-                 started_at: str) -> _LiveReporter:
+    def reporter(self, *, kind: str, tasks: Sequence[str], started_at: str) -> _LiveReporter:
         """Return this invocation's `Driver.on_progress` callback. Each tick
         writes a per-frame snapshot and coalesces the merged-report rewrite."""
         return _LiveReporter(
-            ctx=self._ctx, kind=kind, tasks=list(tasks), started_at=started_at,
+            ctx=self._ctx,
+            kind=kind,
+            tasks=list(tasks),
+            started_at=started_at,
         )
 
-    def seal(self, reporter: _LiveReporter, tree,
-             *, finalize_wait_seconds: Optional[float] = None) -> None:
+    def seal(self, reporter: _LiveReporter, tree, *, finalize_wait_seconds: Optional[float] = None) -> None:
         """End-of-run finalize. Gives late `op:return`/`op:yield` envelopes a
         chance to land (so a node that just missed the window becomes
         `Timeout` instead of being sealed as still-running), then forces the
@@ -157,8 +163,7 @@ class InvocationReport:
 
         This is the wait+finalize glue that used to be duplicated inside
         `Caller._invoke` and `Caller.resume`."""
-        budget = (read_finalize_wait_seconds()
-                  if finalize_wait_seconds is None else finalize_wait_seconds)
+        budget = read_finalize_wait_seconds() if finalize_wait_seconds is None else finalize_wait_seconds
         wait_for_terminal_signals(tree, wait_budget_seconds=budget)
         reporter.finalize(tree)
 
@@ -180,8 +185,10 @@ class InvocationReport:
         if not root_frames:
             return None
         return _build_merged_report(
-            invoke_id=self._ctx.invoke_id, frames=frames,
-            root_frame=root_frames[0], ended_at=ts,
+            invoke_id=self._ctx.invoke_id,
+            frames=frames,
+            root_frame=root_frames[0],
+            ended_at=ts,
         )
 
     def write_frame(self, frame: dict, *, key: Optional[str] = None) -> Path:
@@ -212,5 +219,7 @@ class InvocationReport:
         Frames owned by other processes are left untouched. Returns True iff at
         least one frame was rewritten."""
         return _finalize_own_frames(
-            self._ctx.log_dir, self._ctx.invoke_id, reason=reason,
+            self._ctx.log_dir,
+            self._ctx.invoke_id,
+            reason=reason,
         )

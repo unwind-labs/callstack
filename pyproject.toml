@@ -48,3 +48,23 @@ exclude_lines = [
     "raise NotImplementedError",
     "if __name__ == .__main__.:",
 ]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.ruff.lint.isort]
+# Keep `import a` and `import b as c` from the same module in one statement
+# so a single trailing `# noqa` covers the whole block (the codebase has a few
+# intentional late re-export blocks that mix plain and aliased names).
+combine-as-imports = true
+
+[tool.ruff.lint.per-file-ignores]
+# __init__.py re-exports the package's public API (see __all__); the imports
+# are unused locally by design, so F401 (unused-import) does not apply.
+"__init__.py" = ["F401"]
+
+[tool.ruff.format]

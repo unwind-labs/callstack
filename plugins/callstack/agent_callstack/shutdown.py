@@ -30,6 +30,7 @@ install is idempotent and silently no-ops on subsequent calls.
 Anything with an ``_emergency_finalize_on_shutdown()`` method can
 register — the registry is type-agnostic.
 """
+
 from __future__ import annotations
 
 import atexit
@@ -138,8 +139,7 @@ def _chain_signal_handler(sig: int) -> bool:
     except (ValueError, OSError):
         return False
 
-    def handler(signum: int, frame: Any,
-                _prev: Any = prev, _sig: int = sig) -> None:
+    def handler(signum: int, frame: Any, _prev: Any = prev, _sig: int = sig) -> None:
         try:
             flush_active_reporters()
         finally:

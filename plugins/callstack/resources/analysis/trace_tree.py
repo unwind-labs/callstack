@@ -4,6 +4,7 @@
 Usage:
     trace_tree.py [path/to/call_trace.jsonl] [--root <session-prefix>]
 """
+
 from __future__ import annotations
 
 import argparse
@@ -17,9 +18,7 @@ from agent_callstack.analysis import SessionAnalyzer, format_tree  # noqa: E402
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("trace_file",
-                   help="Path to a call_trace.jsonl "
-                        "(<log_dir>/<invoke_id>/call_trace.jsonl)")
+    p.add_argument("trace_file", help="Path to a call_trace.jsonl (<log_dir>/<invoke_id>/call_trace.jsonl)")
     p.add_argument("--root", help="Root session id (or prefix) to render")
     args = p.parse_args()
 
@@ -35,8 +34,7 @@ def main():
     print(format_tree(tree))
 
 
-def _resolve_prefix(analyzer: SessionAnalyzer, trace_file: Path,
-                    prefix: str | None) -> str | None:
+def _resolve_prefix(analyzer: SessionAnalyzer, trace_file: Path, prefix: str | None) -> str | None:
     if prefix is None:
         return None
     sids = {e.session_id for e in analyzer.trace_events(trace_file)}

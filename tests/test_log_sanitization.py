@@ -5,6 +5,7 @@ via `tail -f`. A malicious task string or LLM-controlled `result`
 must not be able to smuggle terminal escape sequences (ANSI / CSI),
 embedded NULs, or any other control char into the viewer's terminal.
 """
+
 from __future__ import annotations
 
 from agent_callstack.frames import _one_line
@@ -50,8 +51,8 @@ def test_replaces_double_quote_with_apostrophe():
 
 def test_strips_delete_char():
     # 0x7F (DEL) can also disrupt terminals.
-    src = "before\x7Fafter"
-    assert "\x7F" not in _one_line(src, 60)
+    src = "before\x7fafter"
+    assert "\x7f" not in _one_line(src, 60)
 
 
 def test_truncation_still_works_after_sanitization():

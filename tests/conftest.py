@@ -19,6 +19,7 @@ The behavior under test is identical either way; only the inherited env
 differs. We clear it once, autouse, so the suite is hermetic regardless of
 where it runs. monkeypatch restores the real environment after each test.
 """
+
 import os
 
 import pytest

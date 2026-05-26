@@ -4,6 +4,7 @@ Claude Code stores each session as `~/.claude/projects/<encoded-cwd>/<uuid>.json
 where `<encoded-cwd>` is the project's working directory with `/` replaced by
 `-`. This module hides that layout behind a single `SessionLocator` class.
 """
+
 from __future__ import annotations
 
 import json
@@ -16,7 +17,6 @@ from pathlib import Path
 from typing import Optional
 
 from .protocol import Envelope, parse_envelope
-
 
 CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -42,9 +42,9 @@ _UUID_RE = re.compile(
 # the user's top-level interactive `claude` session, where the user
 # launched claude themselves and ENV_OWN_SESSION can't have been set by
 # us).
-from .env import (
-    ENV_OWN_SESSION as _ENV_OWN_SESSION,
+from .env import (  # noqa: E402  -- intentional late import; placed after the comment above
     ENV_CLAUDE_SESSION as _ENV_PARENT_UUID,
+    ENV_OWN_SESSION as _ENV_OWN_SESSION,
     ENV_ROOT_INVOKE_ID as _ENV_ROOT_INVOKE_ID,
 )
 
@@ -58,6 +58,7 @@ def encode_project_dir(cwd: str) -> str:
 @dataclass(frozen=True)
 class SessionRef:
     """A reference to a Claude Code session on disk."""
+
     session_id: str
     file: Path
 
@@ -195,7 +196,7 @@ class SessionLocator:
                     for entry in it:
                         if not entry.name.endswith(".jsonl"):
                             continue
-                        sid = entry.name[:-len(".jsonl")]
+                        sid = entry.name[: -len(".jsonl")]
                         discovered[sid] = d.name
                         if sid == session_id and found is None:
                             found = Path(entry.path)
@@ -211,9 +212,7 @@ class SessionLocator:
         ref = self._from_value(value, cwd)
         if ref:
             return ref
-        raise RuntimeError(
-            f"Explicit session '{value}' not found in {self._projects_dir}"
-        )
+        raise RuntimeError(f"Explicit session '{value}' not found in {self._projects_dir}")
 
     def _from_value(self, value: str, cwd: Optional[str]) -> Optional[SessionRef]:
         """Accept a UUID. Path-form values are no longer supported via env
@@ -309,8 +308,7 @@ def most_recent_session(cwd: str) -> Optional[str]:
     the shared locator is recreated to pick it up.
     """
     global _SHARED_LOCATOR
-    if (_SHARED_LOCATOR is None
-            or _SHARED_LOCATOR._projects_dir is not PROJECTS_DIR):
+    if _SHARED_LOCATOR is None or _SHARED_LOCATOR._projects_dir is not PROJECTS_DIR:
         _SHARED_LOCATOR = SessionLocator()
     ref = _SHARED_LOCATOR._most_recent(cwd)
     return ref.session_id if ref else None
@@ -398,17 +396,19 @@ def _load_session_index(projects_dir: Path) -> dict[str, str]:
         return {}
     if not isinstance(data, dict):
         return {}
-    return {k: v for k, v in data.items()
-            if isinstance(k, str) and isinstance(v, str)}
+    return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)}
 
 
 def _save_session_index(projects_dir: Path, idx: dict[str, str]) -> None:
     """Atomic write of the session index. Silently best-effort on error."""
     import tempfile
+
     path = projects_dir / _SESSION_INDEX_FILENAME
     try:
         fd, tmp_name = tempfile.mkstemp(
-            dir=str(projects_dir), prefix=path.name + ".", suffix=".tmp",
+            dir=str(projects_dir),
+            prefix=path.name + ".",
+            suffix=".tmp",
         )
         try:
             with os.fdopen(fd, "w") as f:
@@ -417,8 +417,10 @@ def _save_session_index(projects_dir: Path, idx: dict[str, str]) -> None:
                 os.fsync(f.fileno())
             os.replace(tmp_name, path)
         except Exception:
-            try: os.unlink(tmp_name)
-            except OSError: pass
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
             raise
     except OSError:
         return

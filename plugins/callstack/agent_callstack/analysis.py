@@ -11,6 +11,7 @@ What it consolidates from the previous four scripts:
   metadata (each forked session records its parent session id).
 - Format helpers (durations, sizes, tree rendering).
 """
+
 from __future__ import annotations
 
 import json
@@ -22,12 +23,13 @@ from typing import Iterator, Optional
 
 from .session import PROJECTS_DIR
 
-
 # ---------- Value types ----------
+
 
 @dataclass(frozen=True)
 class TraceEvent:
     """One entry in call_trace.jsonl (written by TraceWriter)."""
+
     timestamp: Optional[datetime]
     depth: int
     session_id: str
@@ -40,6 +42,7 @@ class TraceEvent:
 @dataclass(frozen=True)
 class SessionMessage:
     """One line from a session JSONL."""
+
     timestamp: Optional[datetime]
     type: str
     role: Optional[str]
@@ -50,6 +53,7 @@ class SessionMessage:
 @dataclass
 class CallNode:
     """Reconstructed call tree node."""
+
     session_id: str
     task: str
     depth: int
@@ -61,6 +65,7 @@ class CallNode:
 @dataclass(frozen=True)
 class SessionStats:
     """Summary numbers for one session JSONL."""
+
     message_count: int
     by_type: dict[str, int]
     duration: float
@@ -69,6 +74,7 @@ class SessionStats:
 
 
 # ---------- Analyzer ----------
+
 
 class SessionAnalyzer:
     """Reads session JSONL + call_trace.jsonl files and exposes structured views.
@@ -101,13 +107,15 @@ class SessionAnalyzer:
         out: list[SessionMessage] = []
         for obj in _iter_jsonl(session_file):
             text, tool = _content_preview(obj)
-            out.append(SessionMessage(
-                timestamp=_parse_ts(obj.get("timestamp")),
-                type=obj.get("type", ""),
-                role=obj.get("message", {}).get("role") if isinstance(obj.get("message"), dict) else None,
-                text=text,
-                tool_name=tool,
-            ))
+            out.append(
+                SessionMessage(
+                    timestamp=_parse_ts(obj.get("timestamp")),
+                    type=obj.get("type", ""),
+                    role=obj.get("message", {}).get("role") if isinstance(obj.get("message"), dict) else None,
+                    text=text,
+                    tool_name=tool,
+                )
+            )
         return out
 
     def session_stats(self, session_file: Path) -> SessionStats:
@@ -159,8 +167,7 @@ class SessionAnalyzer:
 
     # ---- call tree reconstruction ----
 
-    def build_tree(self, trace_file: Path,
-                   root_session: Optional[str] = None) -> Optional[CallNode]:
+    def build_tree(self, trace_file: Path, root_session: Optional[str] = None) -> Optional[CallNode]:
         """Reconstruct the call tree from a call_trace.jsonl + session JSONL parents.
 
         Each TraceEvent groups by session_id; sessions are linked into a tree
@@ -206,8 +213,11 @@ class SessionAnalyzer:
             duration = sum(e.duration for e in sess_events)
             errors = [e.error for e in sess_events if e.error]
             node = CallNode(
-                session_id=sid, task=first.task, depth=depth,
-                duration=duration, error=errors[0] if errors else None,
+                session_id=sid,
+                task=first.task,
+                depth=depth,
+                duration=duration,
+                error=errors[0] if errors else None,
             )
             for child_sid in children_of.get(sid, []):
                 node.children.append(build(child_sid, depth + 1))
@@ -218,9 +228,10 @@ class SessionAnalyzer:
 
 # ---------- Format helpers ----------
 
+
 def format_duration(seconds: float) -> str:
     if seconds < 0.1:
-        return f"{seconds*1000:.0f}ms"
+        return f"{seconds * 1000:.0f}ms"
     if seconds < 1:
         return f"{seconds:.2f}s"
     if seconds < 60:
@@ -237,14 +248,14 @@ def format_tree(root: CallNode, *, indent: int = 0) -> str:
     """Render a CallNode as an ASCII tree."""
     pad = "  " * indent
     badge = f" ❌ {root.error}" if root.error else ""
-    lines = [f"{pad}└─ {root.session_id[:8]} ({format_duration(root.duration)}) "
-             f"{root.task[:80]}{badge}"]
+    lines = [f"{pad}└─ {root.session_id[:8]} ({format_duration(root.duration)}) {root.task[:80]}{badge}"]
     for c in root.children:
         lines.append(format_tree(c, indent=indent + 1))
     return "\n".join(lines)
 
 
 # ---------- internal helpers ----------
+
 
 def _iter_jsonl(path: Path) -> Iterator[dict]:
     """Yield parsed JSON objects from a JSONL file, one line at a time.

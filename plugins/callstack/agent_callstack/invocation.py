@@ -18,6 +18,7 @@ re-reads it. That matters: an async host (the MCP server) may pop stale
 env at call time guarantees the factory agrees with that correction instead of
 caching a now-wrong decision.
 """
+
 from __future__ import annotations
 
 import os

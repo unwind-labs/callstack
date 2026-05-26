@@ -17,6 +17,7 @@ For power users (custom session, model, permission handler, etc.):
     caller = Caller(model="opus", timeout=600)
     r = caller.call("...")
 """
+
 from __future__ import annotations
 
 import os
@@ -40,10 +41,10 @@ from .frames import (
 )
 from .invocation import InvocationFactory
 from .invocation_ctx import _InvocationContext, _new_invoke_id, _utc_now_iso
-from .report import InvocationReport, ROOT_FRAME_KEY
+from .report import ROOT_FRAME_KEY, InvocationReport
 from .reporter import (
-    _LiveReporter,
     _atomic_yaml_write,
+    _LiveReporter,
 )
 from .results import (
     CallFailed,
@@ -59,7 +60,6 @@ from .session import PROJECTS_DIR, SessionLocator, SessionRef, encode_project_di
 from .shutdown import install_shutdown_hooks as _install_shutdown_hooks
 from .trace import TraceWriter, TreeStore
 
-
 # REVIEW-202: install shutdown hooks at process startup, on the main
 # thread. Doing this at import time guarantees `signal.signal()` runs
 # from the thread Python booted on — the constructor-side install used
@@ -70,16 +70,31 @@ _install_shutdown_hooks()
 
 
 __all__ = [
-    "call", "call_many", "resume",
-    "Caller", "Result", "YieldToken",
-    "CallYielded", "CallFailed", "MultiResult",
-    "InvocationReport", "ROOT_FRAME_KEY",
+    "call",
+    "call_many",
+    "resume",
+    "Caller",
+    "Result",
+    "YieldToken",
+    "CallYielded",
+    "CallFailed",
+    "MultiResult",
+    "InvocationReport",
+    "ROOT_FRAME_KEY",
     # Background-run lifecycle (used by async hosts like the MCP server).
     "BackgroundRuns",
-    "Started", "CapReached", "Pending", "Done", "Crashed", "NotFound",
+    "Started",
+    "CapReached",
+    "Pending",
+    "Done",
+    "Crashed",
+    "NotFound",
     # Boundary helpers an MCP/host adapter legitimately needs.
-    "SessionLocator", "new_invoke_id",
-    "max_fanout", "max_background", "root_identity",
+    "SessionLocator",
+    "new_invoke_id",
+    "max_fanout",
+    "max_background",
+    "root_identity",
 ]
 
 
@@ -97,29 +112,26 @@ def new_invoke_id() -> str:
 # DRY-101: the constants and the parsing policy live in `env.py`.
 # Re-exported here so external consumers (mcp_server, tests, downstream
 # code) continue importing from `agent_callstack` without churn.
-from .env import (  # noqa: E402
-    ENV_DEPTH,
-    ENV_ROOT_INVOKE_ID,
-    ENV_ROOT_LOG_DIR,
-    ENV_FRAME_KEY,
-    ENV_OWN_SESSION,
-    ENV_CLAUDE_SESSION,
-    ENV_MAX_DEPTH,
-)
-from .env import max_depth as _default_max_depth  # noqa: E402
-
 # Boundary policy readers an MCP/host adapter needs to enforce limits and
 # detect nested invocations. The `env` module itself stays internal; these
 # specific readers are the supported public surface (DRY-101 keeps the
 # parsing policy in env.py).
-from .env import (  # noqa: E402
-    max_fanout,
+from .env import (  # noqa: E402  # noqa: E402
+    ENV_CLAUDE_SESSION,
+    ENV_DEPTH,
+    ENV_FRAME_KEY,
+    ENV_MAX_DEPTH,
+    ENV_OWN_SESSION,
+    ENV_ROOT_INVOKE_ID,
+    ENV_ROOT_LOG_DIR,
     max_background,
+    max_depth as _default_max_depth,  # noqa: E402
+    max_fanout,
     root_identity,
 )
 
-
 # ---------- Caller (power-user entry point) ----------
+
 
 class Caller:
     """Configurable runtime. Reuse across many `call()` invocations to share
@@ -167,8 +179,7 @@ class Caller:
         results = self._invoke([task], context=context)
         return _unwrap_single(results[0])
 
-    def call_many(self, tasks: Sequence[str], *,
-                  context: str = "fork") -> MultiResult:
+    def call_many(self, tasks: Sequence[str], *, context: str = "fork") -> MultiResult:
         return MultiResult(results=self._invoke(list(tasks), context=context))
 
     def close(self) -> None:
@@ -200,7 +211,8 @@ class Caller:
         report = InvocationReport.from_context(ctx)
         reporter = report.reporter(
             kind=ctx.prefix("call_resume"),
-            tasks=[n.task for n in tree.nodes], started_at=started_at,
+            tasks=[n.task for n in tree.nodes],
+            started_at=started_at,
         )
         driver.on_progress = reporter
         # Same try/finally guarantee as `_invoke`: `tree` is already a valid
@@ -234,8 +246,7 @@ class Caller:
         started_at = _utc_now_iso()
         kind = ctx.prefix("call")
         report = InvocationReport.from_context(ctx)
-        reporter = report.reporter(kind=kind, tasks=list(tasks),
-                                   started_at=started_at)
+        reporter = report.reporter(kind=kind, tasks=list(tasks), started_at=started_at)
         driver.on_progress = reporter
         # Try/finally ensures `report.yaml` is always finalized, even if
         # `driver.run` raises. Without this, a debounced merge could be
@@ -279,8 +290,7 @@ class Caller:
         their tree merges under the caller's node in the root's report."""
         return self._inv.context(parent.cwd)
 
-    def _driver_for(self, parent: SessionRef, *, ctx: _InvocationContext,
-                    depth_base: int = 0) -> Driver:
+    def _driver_for(self, parent: SessionRef, *, ctx: _InvocationContext, depth_base: int = 0) -> Driver:
         # Identity + child-env propagation live in the factory; the channel /
         # trace / store wiring is this Caller's runtime config.
         channel = ClaudeChannel(
@@ -323,9 +333,7 @@ def _resolve_caller(seed: Optional[int], timeout: Optional[int]) -> Caller:
     return Caller(timeout=timeout or 300, seed=seed)
 
 
-def call(task: str, *, seed: Optional[int] = None,
-         timeout: Optional[int] = None,
-         context: str = "fork") -> Result:
+def call(task: str, *, seed: Optional[int] = None, timeout: Optional[int] = None, context: str = "fork") -> Result:
     """Fork a child agent on `task`. Returns the child's `Result`. Raises
     `CallYielded` if the agent paused for input, `CallFailed` on error.
 
@@ -342,14 +350,13 @@ def call(task: str, *, seed: Optional[int] = None,
     return _resolve_caller(seed, timeout).call(task, context=context)
 
 
-def call_many(tasks: Sequence[str], *, seed: Optional[int] = None,
-              timeout: Optional[int] = None,
-              context: str = "fork") -> MultiResult:
+def call_many(
+    tasks: Sequence[str], *, seed: Optional[int] = None, timeout: Optional[int] = None, context: str = "fork"
+) -> MultiResult:
     return _resolve_caller(seed, timeout).call_many(tasks, context=context)
 
 
-def resume(token: YieldToken, reply: str, *, seed: Optional[int] = None,
-           timeout: Optional[int] = None) -> Result:
+def resume(token: YieldToken, reply: str, *, seed: Optional[int] = None, timeout: Optional[int] = None) -> Result:
     return _resolve_caller(seed, timeout).resume(token, reply)
 
 

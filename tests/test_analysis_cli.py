@@ -12,6 +12,7 @@ coverage here:
    not-found / empty-trace guards, and the --root prefix resolution that the
    subprocess `--help` runs can never reach.
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -22,10 +23,7 @@ from pathlib import Path
 
 import pytest
 
-_SCRIPTS_DIR = (
-    Path(__file__).resolve().parents[1]
-    / "plugins" / "callstack" / "resources" / "analysis"
-)
+_SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "plugins" / "callstack" / "resources" / "analysis"
 _SCRIPTS = [
     "session_inspect.py",
     "trace_tree.py",
@@ -36,6 +34,7 @@ _SCRIPTS = [
 
 # ---------- subprocess smoke tests (real __main__ entry) ----------
 
+
 @pytest.mark.parametrize("script", _SCRIPTS)
 def test_cli_help_imports_and_parses(script: str) -> None:
     # `--help` forces import of the script + its `agent_callstack.analysis`
@@ -45,11 +44,11 @@ def test_cli_help_imports_and_parses(script: str) -> None:
     path = _SCRIPTS_DIR / script
     proc = subprocess.run(
         [sys.executable, str(path), "--help"],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
-    assert proc.returncode == 0, (
-        f"{script} --help exited {proc.returncode}; stderr:\n{proc.stderr}"
-    )
+    assert proc.returncode == 0, f"{script} --help exited {proc.returncode}; stderr:\n{proc.stderr}"
     assert "usage" in proc.stdout.lower()
 
 
@@ -62,15 +61,15 @@ def test_cli_missing_required_path_arg(script: str) -> None:
     path = _SCRIPTS_DIR / script
     proc = subprocess.run(
         [sys.executable, str(path)],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
-    assert proc.returncode == 2, (
-        f"{script} with no args exited {proc.returncode}, expected 2; "
-        f"stderr:\n{proc.stderr}"
-    )
+    assert proc.returncode == 2, f"{script} with no args exited {proc.returncode}, expected 2; stderr:\n{proc.stderr}"
 
 
 # ---------- in-process helpers (so coverage measures the script body) ----------
+
 
 def _load(script: str):
     """Import a wrapper script by path as a throwaway module.
@@ -121,6 +120,7 @@ def trace_dir(tmp_path) -> Path:
 
 # ---------- session_inspect.py ----------
 
+
 class TestSessionInspect:
     """Wrapper turns one session JSONL into a human-readable stats block."""
 
@@ -128,11 +128,14 @@ class TestSessionInspect:
         """Happy path must surface message count, duration, and per-type tally
         — the whole point of the tool for an operator inspecting a run."""
         sf = _write_session(
-            trace_dir, "s1",
-            {"type": "user", "timestamp": "2026-04-16T10:00:00",
-             "message": {"role": "user", "content": "hi"}},
-            {"type": "assistant", "timestamp": "2026-04-16T10:00:02",
-             "message": {"role": "assistant", "content": "yo"}},
+            trace_dir,
+            "s1",
+            {"type": "user", "timestamp": "2026-04-16T10:00:00", "message": {"role": "user", "content": "hi"}},
+            {
+                "type": "assistant",
+                "timestamp": "2026-04-16T10:00:02",
+                "message": {"role": "assistant", "content": "yo"},
+            },
         )
         _run(monkeypatch, "session_inspect.py", str(sf))
         out = capsys.readouterr().out
@@ -150,6 +153,7 @@ class TestSessionInspect:
 
 
 # ---------- trace_tree.py ----------
+
 
 class TestTraceTree:
     """Wrapper renders the parent→child call tree from a call_trace.jsonl."""
@@ -220,6 +224,7 @@ class TestTraceTree:
 
 # ---------- timing_breakdown.py ----------
 
+
 class TestTimingBreakdown:
     """Wrapper aggregates duration/turns/errors per session into a table."""
 
@@ -256,6 +261,7 @@ class TestTimingBreakdown:
 
 # ---------- full_report.py ----------
 
+
 class TestFullReport:
     """Wrapper combines the call tree and the per-session breakdown."""
 
@@ -263,8 +269,7 @@ class TestFullReport:
         f = _write_trace(
             trace_dir,
             {"session_id": "rootaaaa", "task": "main", "duration_seconds": 2.0},
-            {"session_id": "childbbb", "task": "sub", "duration_seconds": 1.0,
-             "error": "boom"},
+            {"session_id": "childbbb", "task": "sub", "duration_seconds": 1.0, "error": "boom"},
         )
         _write_session(trace_dir, "rootaaaa", {"type": "user"})
         _write_session(trace_dir, "childbbb", parent="rootaaaa")

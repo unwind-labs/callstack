@@ -1,13 +1,13 @@
 """Tests for the pure state machine: every (state, event) → (new_state, [effects])."""
+
 from __future__ import annotations
 
 import pytest
-
 from agent_callstack import state as st
 from agent_callstack.protocol import Call, Return, Yield
 
-
 # ---------- helpers ----------
+
 
 def _start_node(parent="parent-sess", task="do thing", task_id="n1"):
     return st.Pending(parent_session_id=parent, task=task, task_id=task_id)
@@ -15,8 +15,8 @@ def _start_node(parent="parent-sess", task="do thing", task_id="n1"):
 
 # ---------- Pending → AwaitingTurn ----------
 
-class TestStart:
 
+class TestStart:
     def test_pending_to_awaiting_turn_via_runturn(self):
         new_state, effects = st.step(_start_node(), st.Start())
         assert isinstance(new_state, st.AwaitingTurn)
@@ -30,8 +30,7 @@ class TestStart:
         assert "[n1]" in eff.prompt
 
     def test_pending_with_fresh_context_emits_fresh_runturn(self):
-        node = st.Pending(parent_session_id="parent-sess", task="do thing",
-                          task_id="n1", context_mode="fresh")
+        node = st.Pending(parent_session_id="parent-sess", task="do thing", task_id="n1", context_mode="fresh")
         _, effects = st.step(node, st.Start())
         eff = effects[0]
         assert isinstance(eff, st.RunTurn)
@@ -46,13 +45,12 @@ class TestStart:
 
 # ---------- AwaitingTurn → terminal/intermediate ----------
 
-class TestTurnCompleted:
 
+class TestTurnCompleted:
     def test_return_terminates(self):
         new_state, effects = st.step(
             st.AwaitingTurn(session_id=None),
-            st.TurnCompleted(envelope=Return(result="ok", summary="s", suggested_next="n"),
-                             session_id="forked"),
+            st.TurnCompleted(envelope=Return(result="ok", summary="s", suggested_next="n"), session_id="forked"),
         )
         assert isinstance(new_state, st.Done)
         assert new_state.session_id == "forked"
@@ -100,8 +98,8 @@ class TestTurnCompleted:
 
 # ---------- AwaitingChild → resume self ----------
 
-class TestChildEvents:
 
+class TestChildEvents:
     def _state(self, child_id="c1"):
         return st.AwaitingChild(session_id="sess", child_id=child_id)
 
@@ -134,8 +132,8 @@ class TestChildEvents:
 
 # ---------- AwaitingUser → resume agent ----------
 
-class TestUserResume:
 
+class TestUserResume:
     def test_user_replied_resumes(self):
         new_state, effects = st.step(
             st.AwaitingUser(session_id="sess", question="?"),
@@ -152,8 +150,8 @@ class TestUserResume:
 
 # ---------- Predicates ----------
 
-class TestPredicates:
 
+class TestPredicates:
     def test_terminal_states(self):
         assert st.is_terminal(st.Done())
         assert st.is_terminal(st.Failed(error="x"))
@@ -184,8 +182,8 @@ class TestPredicates:
 
 # ---------- Bad transitions ----------
 
-class TestInvalidTransitions:
 
+class TestInvalidTransitions:
     def test_done_plus_anything_raises(self):
         with pytest.raises(AssertionError):
             st.step(st.Done(), st.Start())
@@ -197,11 +195,11 @@ class TestInvalidTransitions:
 
 # ---------- End-to-end micro-trace ----------
 
-class TestFullTrace:
 
+class TestFullTrace:
     def test_call_then_return_round_trip(self):
         """Pending → Start → AwaitingTurn → TurnCompleted(Call) → AwaitingChild
-           → ChildDone → AwaitingTurn → TurnCompleted(Return) → Done."""
+        → ChildDone → AwaitingTurn → TurnCompleted(Return) → Done."""
         s = _start_node(parent="root")
 
         # 1. Start
@@ -210,8 +208,7 @@ class TestFullTrace:
         assert isinstance(effs[0], st.RunTurn) and effs[0].mode == "fork"
 
         # 2. Turn produces a CALL
-        s, effs = st.step(s, st.TurnCompleted(envelope=Call(task="sub"),
-                                              session_id="me-forked"))
+        s, effs = st.step(s, st.TurnCompleted(envelope=Call(task="sub"), session_id="me-forked"))
         assert isinstance(s, st.AwaitingChild)
         spawn = effs[0]
         assert isinstance(spawn, st.SpawnChild)
@@ -223,8 +220,7 @@ class TestFullTrace:
         assert isinstance(effs[0], st.RunTurn) and effs[0].mode == "resume"
 
         # 4. Self resumes and returns
-        s, effs = st.step(s, st.TurnCompleted(envelope=Return(result="done"),
-                                              session_id="me-forked"))
+        s, effs = st.step(s, st.TurnCompleted(envelope=Return(result="done"), session_id="me-forked"))
         assert isinstance(s, st.Done)
         assert s.result == "done"
         assert effs == []

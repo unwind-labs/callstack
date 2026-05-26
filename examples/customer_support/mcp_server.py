@@ -101,21 +101,21 @@ RETURN_POLICIES = {
 
 # MFA state — persisted to a temp file so state survives across MCP server restarts
 # (each `claude --print` session spawns its own MCP server process)
-import tempfile
+import tempfile  # noqa: E402  -- intentional late import; see comment above
 
 _MFA_STATE_FILE = os.path.join(tempfile.gettempdir(), "mcp_mfa_codes.json")
 
 
 def _load_mfa_codes() -> dict[str, str]:
     try:
-        with open(_MFA_STATE_FILE, 'r') as f:
+        with open(_MFA_STATE_FILE, "r") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 
 def _save_mfa_codes(codes: dict[str, str]) -> None:
-    with open(_MFA_STATE_FILE, 'w') as f:
+    with open(_MFA_STATE_FILE, "w") as f:
         json.dump(codes, f)
 
 
@@ -271,17 +271,19 @@ def check_refund_eligibility(order_id: str, customer_id: str) -> dict:
     items_eligibility = []
     for item in order["items"]:
         policy = RETURN_POLICIES.get(item["category"], {})
-        items_eligibility.append({
-            "product_id": item["product_id"],
-            "name": item["name"],
-            "category": item["category"],
-            "quantity": item["quantity"],
-            "unit_price": item["unit_price"],
-            "eligible": True,
-            "return_window_days": policy.get("return_window_days"),
-            "within_return_window": True,
-            "base_restocking_fee_pct": policy.get("base_restocking_fee_pct"),
-        })
+        items_eligibility.append(
+            {
+                "product_id": item["product_id"],
+                "name": item["name"],
+                "category": item["category"],
+                "quantity": item["quantity"],
+                "unit_price": item["unit_price"],
+                "eligible": True,
+                "return_window_days": policy.get("return_window_days"),
+                "within_return_window": True,
+                "base_restocking_fee_pct": policy.get("base_restocking_fee_pct"),
+            }
+        )
 
     return {
         "order_id": order_id,
@@ -346,23 +348,23 @@ def calculate_refund(order_id: str, item_condition: str) -> dict:
             if promo.get("clawback_on_return"):
                 # Check exception: remaining order value > 50% of total
                 remaining_value = sum(
-                    i["unit_price"] * i["quantity"]
-                    for i in order["items"]
-                    if i["product_id"] != item["product_id"]
+                    i["unit_price"] * i["quantity"] for i in order["items"] if i["product_id"] != item["product_id"]
                 )
                 threshold = order["total"] * 0.5
                 if remaining_value < threshold:
                     clawback = item.get("promo_discount", 0.0)
                     total_clawback += clawback
 
-        item_breakdown.append({
-            "product_id": item["product_id"],
-            "name": item["name"],
-            "subtotal": subtotal,
-            "restocking_fee": restocking_fee,
-            "restocking_fee_pct": fee_pct,
-            "promo_clawback": clawback,
-        })
+        item_breakdown.append(
+            {
+                "product_id": item["product_id"],
+                "name": item["name"],
+                "subtotal": subtotal,
+                "restocking_fee": restocking_fee,
+                "restocking_fee_pct": fee_pct,
+                "promo_clawback": clawback,
+            }
+        )
 
     net_refund = round(items_total - total_restocking - total_clawback, 2)
 

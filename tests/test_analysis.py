@@ -1,14 +1,18 @@
 """Tests for the SessionAnalyzer + format helpers."""
+
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
 import pytest
-
 from agent_callstack.analysis import (
-    SessionAnalyzer, format_duration, format_size, format_tree,
-    _content_preview, _parse_ts,
+    SessionAnalyzer,
+    _content_preview,
+    _parse_ts,
+    format_duration,
+    format_size,
+    format_tree,
 )
 
 
@@ -42,13 +46,19 @@ def _write_session(trace_dir: Path, sid: str, *messages: dict, parent: str | Non
 
 
 class TestTraceEvents:
-
     def test_parses_entries(self, trace_dir):
-        f = _write_trace(trace_dir,
-                         {"timestamp": "2026-04-16T10:00:00.000",
-                          "call_depth": 1, "session_id": "s1",
-                          "task": "do thing", "duration_seconds": 1.5,
-                          "result_length": 42, "error": None})
+        f = _write_trace(
+            trace_dir,
+            {
+                "timestamp": "2026-04-16T10:00:00.000",
+                "call_depth": 1,
+                "session_id": "s1",
+                "task": "do thing",
+                "duration_seconds": 1.5,
+                "result_length": 42,
+                "error": None,
+            },
+        )
         events = SessionAnalyzer().trace_events(f)
         assert len(events) == 1
         e = events[0]
@@ -63,23 +73,30 @@ class TestTraceEvents:
 
     def test_skips_unparseable_lines(self, trace_dir):
         path = trace_dir / "call_trace.jsonl"
-        path.write_text('{"valid": "json", "session_id": "s"}\n'
-                        'not json at all\n'
-                        '{"valid": "again", "session_id": "s2"}\n')
+        path.write_text(
+            '{"valid": "json", "session_id": "s"}\nnot json at all\n{"valid": "again", "session_id": "s2"}\n'
+        )
         events = SessionAnalyzer().trace_events(path)
         assert len(events) == 2
 
 
 class TestSessionStats:
-
     def test_counts_messages_by_type(self, trace_dir):
-        _write_session(trace_dir, "s1",
-                       {"type": "user", "timestamp": "2026-04-16T10:00:00",
-                        "message": {"role": "user", "content": "hi"}},
-                       {"type": "assistant", "timestamp": "2026-04-16T10:00:01",
-                        "message": {"role": "assistant", "content": "hello"}},
-                       {"type": "assistant", "timestamp": "2026-04-16T10:00:02",
-                        "message": {"role": "assistant", "content": "again"}})
+        _write_session(
+            trace_dir,
+            "s1",
+            {"type": "user", "timestamp": "2026-04-16T10:00:00", "message": {"role": "user", "content": "hi"}},
+            {
+                "type": "assistant",
+                "timestamp": "2026-04-16T10:00:01",
+                "message": {"role": "assistant", "content": "hello"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-04-16T10:00:02",
+                "message": {"role": "assistant", "content": "again"},
+            },
+        )
         stats = SessionAnalyzer().session_stats(trace_dir / "s1.jsonl")
         assert stats.message_count == 3
         assert stats.by_type == {"user": 1, "assistant": 2}
@@ -90,9 +107,12 @@ class TestSessionStats:
         per-message type + timestamp, so it must stream the file and accumulate
         in O(1) message memory — NOT route through session_messages(), which
         builds the full SessionMessage list. Pin that it does not call it."""
-        _write_session(trace_dir, "s1",
-                       {"type": "user", "timestamp": "2026-04-16T10:00:00"},
-                       {"type": "assistant", "timestamp": "2026-04-16T10:00:05"})
+        _write_session(
+            trace_dir,
+            "s1",
+            {"type": "user", "timestamp": "2026-04-16T10:00:00"},
+            {"type": "assistant", "timestamp": "2026-04-16T10:00:05"},
+        )
         analyzer = SessionAnalyzer()
         called = False
         orig = analyzer.session_messages
@@ -106,17 +126,19 @@ class TestSessionStats:
         stats = analyzer.session_stats(trace_dir / "s1.jsonl")
         assert stats.message_count == 2
         assert stats.duration == 5.0
-        assert not called, (
-            "session_stats must stream, not materialize via session_messages")
+        assert not called, "session_stats must stream, not materialize via session_messages"
 
     def test_duplicate_timestamps_do_not_widen_window(self, trace_dir):
         """Duration is last-minus-first; messages sharing a timestamp must
         leave the min/max window unchanged (neither earlier nor later), so a
         burst of same-instant messages doesn't inflate the reported duration."""
-        _write_session(trace_dir, "s1",
-                       {"type": "user", "timestamp": "2026-04-16T10:00:00"},
-                       {"type": "assistant", "timestamp": "2026-04-16T10:00:00"},
-                       {"type": "assistant", "timestamp": "2026-04-16T10:00:00"})
+        _write_session(
+            trace_dir,
+            "s1",
+            {"type": "user", "timestamp": "2026-04-16T10:00:00"},
+            {"type": "assistant", "timestamp": "2026-04-16T10:00:00"},
+            {"type": "assistant", "timestamp": "2026-04-16T10:00:00"},
+        )
         stats = SessionAnalyzer().session_stats(trace_dir / "s1.jsonl")
         assert stats.message_count == 3
         assert stats.duration == 0.0
@@ -135,11 +157,12 @@ class TestSessionStats:
         window. The duration here comes only from the two real timestamps."""
         path = trace_dir / "s1.jsonl"
         path.write_text(
-            '{"type": "system"}\n'                                   # no timestamp
-            "\n"                                                     # blank line
+            '{"type": "system"}\n'  # no timestamp
+            "\n"  # blank line
             '{"type": "user", "timestamp": "2026-04-16T10:00:00"}\n'
-            '{"type": "assistant", "timestamp": "not-a-date"}\n'      # unparseable ts
-            '{"type": "assistant", "timestamp": "2026-04-16T10:00:03"}\n')
+            '{"type": "assistant", "timestamp": "not-a-date"}\n'  # unparseable ts
+            '{"type": "assistant", "timestamp": "2026-04-16T10:00:03"}\n'
+        )
         stats = SessionAnalyzer().session_stats(path)
         assert stats.message_count == 4
         assert stats.duration == 3.0
@@ -151,12 +174,16 @@ class TestSessionMessages:
     so a wrong preview = wrong displayed trace."""
 
     def test_extracts_role_text_and_tool(self, trace_dir):
-        _write_session(trace_dir, "s1",
-                       {"type": "user", "timestamp": "2026-04-16T10:00:00",
-                        "message": {"role": "user", "content": "hello there"}},
-                       {"type": "assistant", "timestamp": "2026-04-16T10:00:01",
-                        "message": {"role": "assistant",
-                                    "content": [{"type": "tool_use", "name": "Bash"}]}})
+        _write_session(
+            trace_dir,
+            "s1",
+            {"type": "user", "timestamp": "2026-04-16T10:00:00", "message": {"role": "user", "content": "hello there"}},
+            {
+                "type": "assistant",
+                "timestamp": "2026-04-16T10:00:01",
+                "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash"}]},
+            },
+        )
         msgs = SessionAnalyzer().session_messages(trace_dir / "s1.jsonl")
         assert [m.role for m in msgs] == ["user", "assistant"]
         assert msgs[0].text == "hello there"
@@ -166,8 +193,7 @@ class TestSessionMessages:
     def test_role_none_when_message_absent(self, trace_dir):
         """System lines often carry no `message` field at all — role must fall
         back to None (not raise) so those lines still render as rows."""
-        _write_session(trace_dir, "s1",
-                       {"type": "system", "timestamp": "2026-04-16T10:00:00"})
+        _write_session(trace_dir, "s1", {"type": "system", "timestamp": "2026-04-16T10:00:00"})
         msgs = SessionAnalyzer().session_messages(trace_dir / "s1.jsonl")
         assert len(msgs) == 1
         assert msgs[0].role is None
@@ -197,8 +223,7 @@ class TestContentPreview:
     def test_tool_result_non_string_content(self):
         """tool_result content can be a list of blocks (not a str); preview
         must degrade to empty text, never index into a non-str."""
-        obj = {"message": {"content": [
-            {"type": "tool_result", "content": [{"type": "text", "text": "x"}]}]}}
+        obj = {"message": {"content": [{"type": "tool_result", "content": [{"type": "text", "text": "x"}]}]}}
         assert _content_preview(obj) == ("", None)
 
     def test_non_dict_block_is_skipped(self):
@@ -233,7 +258,6 @@ class TestContentPreview:
 
 
 class TestParseTs:
-
     def test_bad_timestamp_returns_none(self):
         """_parse_ts must never raise on garbage — a malformed ts in one line
         can't be allowed to abort reading the whole log."""
@@ -250,7 +274,6 @@ class TestParseTs:
 
 
 class TestParentResolution:
-
     def test_finds_parent_in_metadata(self, trace_dir):
         _write_session(trace_dir, "child", parent="parent-id")
         assert SessionAnalyzer().parent_session_id(trace_dir / "child.jsonl") == "parent-id"
@@ -266,10 +289,7 @@ class TestParentResolution:
         """Live session logs may have blank/torn lines before the metadata
         line — the parent scan must skip them, not give up at the first."""
         path = trace_dir / "s1.jsonl"
-        path.write_text("\n"
-                        "not json\n"
-                        '{"type": "system"}\n'
-                        '{"parentSessionId": "p1"}\n')
+        path.write_text('\nnot json\n{"type": "system"}\n{"parentSessionId": "p1"}\n')
         assert SessionAnalyzer().parent_session_id(path) == "p1"
 
     def test_stops_scanning_after_50_lines(self, trace_dir):
@@ -284,11 +304,12 @@ class TestParentResolution:
 
 
 class TestBuildTree:
-
     def test_two_node_tree(self, trace_dir):
-        f = _write_trace(trace_dir,
-                         {"session_id": "root", "task": "main", "duration_seconds": 2.0},
-                         {"session_id": "child", "task": "sub", "duration_seconds": 1.0})
+        f = _write_trace(
+            trace_dir,
+            {"session_id": "root", "task": "main", "duration_seconds": 2.0},
+            {"session_id": "child", "task": "sub", "duration_seconds": 1.0},
+        )
         _write_session(trace_dir, "root", {"type": "user"})
         _write_session(trace_dir, "child", parent="root")
 
@@ -309,16 +330,17 @@ class TestBuildTree:
         """If parent links form a cycle (every session's parent is itself in
         the trace), there is no root to anchor on — build_tree must return None
         rather than loop or pick arbitrarily."""
-        f = _write_trace(trace_dir,
-                         {"session_id": "a", "task": "A", "duration_seconds": 1.0},
-                         {"session_id": "b", "task": "B", "duration_seconds": 1.0})
+        f = _write_trace(
+            trace_dir,
+            {"session_id": "a", "task": "A", "duration_seconds": 1.0},
+            {"session_id": "b", "task": "B", "duration_seconds": 1.0},
+        )
         _write_session(trace_dir, "a", parent="b")
         _write_session(trace_dir, "b", parent="a")
         assert SessionAnalyzer().build_tree(f, root_session=None) is None
 
 
 class TestFormatHelpers:
-
     def test_duration_units(self):
         assert format_duration(0.05) == "50ms"
         assert format_duration(0.5) == "0.50s"
@@ -331,9 +353,14 @@ class TestFormatHelpers:
 
     def test_tree_render(self):
         from agent_callstack.analysis import CallNode
-        root = CallNode(session_id="root123", task="Main task", depth=0, duration=2.5,
-                        children=[CallNode(session_id="child123", task="sub",
-                                           depth=1, duration=1.0)])
+
+        root = CallNode(
+            session_id="root123",
+            task="Main task",
+            depth=0,
+            duration=2.5,
+            children=[CallNode(session_id="child123", task="sub", depth=1, duration=1.0)],
+        )
         out = format_tree(root)
         assert "root123" in out
         assert "child123" in out

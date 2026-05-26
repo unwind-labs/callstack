@@ -1,6 +1,7 @@
 """Tests for ClaudeChannel: CLI flag construction (_build_cmd), the
 permission control-request handler (_answer_control_request, incl. the SEC-011
 fail-closed deny), and the NDJSON reader loop teardown branches."""
+
 from __future__ import annotations
 
 import io
@@ -8,12 +9,19 @@ import json
 import subprocess
 import time
 
-import pytest
-
 import agent_callstack.channel as ch_mod
+import pytest
 from agent_callstack.channel import (
-    ClaudeChannel, ClaudePool, TurnTimeout, _NDJSON_MAX_LINE, _PooledProcess,
-    _fire_on_session_id, _get_pool, _process_log_path, allow_all, shutdown_pool,
+    _NDJSON_MAX_LINE,
+    ClaudeChannel,
+    ClaudePool,
+    TurnTimeout,
+    _fire_on_session_id,
+    _get_pool,
+    _PooledProcess,
+    _process_log_path,
+    allow_all,
+    shutdown_pool,
 )
 
 
@@ -125,8 +133,7 @@ class TestAnswerControlRequest:
     def _can_use_tool(self, tool="Bash", inp=None) -> dict:
         return {
             "request_id": "rq-1",
-            "request": {"subtype": "can_use_tool", "tool_name": tool,
-                        "input": inp or {}},
+            "request": {"subtype": "can_use_tool", "tool_name": tool, "input": inp or {}},
         }
 
     def test_handler_response_is_forwarded(self):
@@ -144,6 +151,7 @@ class TestAnswerControlRequest:
     def test_handler_raise_is_fail_closed_deny(self, capsys):
         """SEC-011: handler raises => deny payload (not allow, not empty) AND a
         stderr line naming the tool + exception, so the failure is auditable."""
+
         def boom(tool, inp):
             raise RuntimeError("handler bug")
 
@@ -169,8 +177,7 @@ class TestAnswerControlRequest:
 
         ch = ClaudeChannel(permission_handler=handler)
         stdin = io.StringIO()
-        ch._answer_control_request(
-            stdin, {"request_id": "rq-2", "request": {"subtype": "initialize"}})
+        ch._answer_control_request(stdin, {"request_id": "rq-2", "request": {"subtype": "initialize"}})
         sent = json.loads(stdin.getvalue())["response"]
         assert sent["request_id"] == "rq-2"
         assert sent["response"] == {}
@@ -185,8 +192,12 @@ class TestReadUntilResult:
 
     def _stdout(self, *lines: str):
         class _Stdout:
-            def __init__(self, q): self._q = list(q)
-            def readline(self, *_a): return self._q.pop(0) if self._q else ""
+            def __init__(self, q):
+                self._q = list(q)
+
+            def readline(self, *_a):
+                return self._q.pop(0) if self._q else ""
+
         return _Stdout(lines)
 
     def test_answers_permission_then_returns_on_result(self):
@@ -203,13 +214,17 @@ class TestReadUntilResult:
         stdin, log = io.StringIO(), io.StringIO()
         stdout = self._stdout(
             json.dumps({"type": "control_response", "request_id": "init"}) + "\n",
-            json.dumps({"type": "assistant",
-                        "message": {"content": [{"type": "text", "text": "hi"}]}}) + "\n",
-            json.dumps({"type": "control_request", "request_id": "rq",
-                        "request": {"subtype": "can_use_tool",
-                                    "tool_name": "Bash", "input": {}}}) + "\n",
-            json.dumps({"type": "result", "session_id": "sid-9",
-                        "result": "fallback", "usage": {"input_tokens": 5}}) + "\n",
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}}) + "\n",
+            json.dumps(
+                {
+                    "type": "control_request",
+                    "request_id": "rq",
+                    "request": {"subtype": "can_use_tool", "tool_name": "Bash", "input": {}},
+                }
+            )
+            + "\n",
+            json.dumps({"type": "result", "session_id": "sid-9", "result": "fallback", "usage": {"input_tokens": 5}})
+            + "\n",
         )
         text_parts: list[str] = []
         meta: dict = {}
@@ -225,8 +240,8 @@ class TestReadUntilResult:
         string is used as the turn output — otherwise the turn would be blank."""
         ch = ClaudeChannel()
         stdout = self._stdout(
-            json.dumps({"type": "result", "session_id": "s",
-                        "result": "the-answer", "usage": {}}) + "\n")
+            json.dumps({"type": "result", "session_id": "s", "result": "the-answer", "usage": {}}) + "\n"
+        )
         parts: list[str] = []
         ch._read_until_result(io.StringIO(), stdout, parts, io.StringIO(), {})
         assert parts == ["the-answer"]
@@ -245,8 +260,8 @@ class TestReadUntilResult:
         """A torn/garbage NDJSON line must be skipped, not abort the turn."""
         ch = ClaudeChannel()
         stdout = self._stdout(
-            "this is not json\n",
-            json.dumps({"type": "result", "session_id": "s2", "usage": {}}) + "\n")
+            "this is not json\n", json.dumps({"type": "result", "session_id": "s2", "usage": {}}) + "\n"
+        )
         sid = ch._read_until_result(io.StringIO(), stdout, [], io.StringIO(), {})
         assert sid == "s2"
 
@@ -266,20 +281,16 @@ class TestReadUntilResult:
         fired: list[str] = []
         stdout = self._stdout(
             json.dumps({"type": "system", "session_id": "early-1"}) + "\n",
-            json.dumps({"type": "assistant", "session_id": "early-1",
-                        "message": {"content": []}}) + "\n",
+            json.dumps({"type": "assistant", "session_id": "early-1", "message": {"content": []}}) + "\n",
             json.dumps({"type": "result", "session_id": "early-1", "usage": {}}) + "\n",
         )
-        ch._read_until_result(io.StringIO(), stdout, [], io.StringIO(), {},
-                              on_session_id=fired.append)
+        ch._read_until_result(io.StringIO(), stdout, [], io.StringIO(), {}, on_session_id=fired.append)
         assert fired == ["early-1"]  # once, not three times
 
     def test_blank_lines_are_skipped(self):
         """Heartbeat/blank lines on the stream must be ignored, not parsed."""
         ch = ClaudeChannel()
-        stdout = self._stdout(
-            "   \n", "\n",
-            json.dumps({"type": "result", "session_id": "s3", "usage": {}}) + "\n")
+        stdout = self._stdout("   \n", "\n", json.dumps({"type": "result", "session_id": "s3", "usage": {}}) + "\n")
         assert ch._read_until_result(io.StringIO(), stdout, [], io.StringIO(), {}) == "s3"
 
 
@@ -305,26 +316,37 @@ class TestRunOneTurn:
 
     def _entry(self, *lines: str, returncode=None) -> _PooledProcess:
         class _Stdout:
-            def __init__(self, q): self._q = list(q)
-            def readline(self, *_a): return self._q.pop(0) if self._q else ""
+            def __init__(self, q):
+                self._q = list(q)
+
+            def readline(self, *_a):
+                return self._q.pop(0) if self._q else ""
+
         return _PooledProcess(
-            proc=_FakeProc(returncode), stdin=io.StringIO(),
-            stdout=_Stdout(lines), log=io.StringIO(),
-            log_path="/tmp/turn.log", cwd="/tmp",
+            proc=_FakeProc(returncode),
+            stdin=io.StringIO(),
+            stdout=_Stdout(lines),
+            log=io.StringIO(),
+            log_path="/tmp/turn.log",
+            cwd="/tmp",
         )
 
     def test_happy_turn_returns_result(self):
         """A clean turn yields a TurnResult carrying the streamed text, session
         id, and usage counters the driver needs."""
         entry = self._entry(
-            json.dumps({"type": "assistant",
-                        "message": {"content": [{"type": "text", "text": "done"}]}}) + "\n",
-            json.dumps({"type": "result", "session_id": "sid-ok",
-                        "usage": {"input_tokens": 7, "output_tokens": 3},
-                        "total_cost_usd": 0.01}) + "\n",
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}}) + "\n",
+            json.dumps(
+                {
+                    "type": "result",
+                    "session_id": "sid-ok",
+                    "usage": {"input_tokens": 7, "output_tokens": 3},
+                    "total_cost_usd": 0.01,
+                }
+            )
+            + "\n",
         )
-        r = ClaudeChannel()._run_one_turn(entry, "go", timeout=10,
-                                          on_session_id=None, do_handshake=False)
+        r = ClaudeChannel()._run_one_turn(entry, "go", timeout=10, on_session_id=None, do_handshake=False)
         assert r.session_id == "sid-ok"
         assert r.text == "done"
         assert r.input_tokens == 7 and r.output_tokens == 3
@@ -333,32 +355,26 @@ class TestRunOneTurn:
     def test_no_session_id_raises(self):
         """A result without a session id leaves the driver unable to locate the
         child — must raise, not return an unusable TurnResult."""
-        entry = self._entry(
-            json.dumps({"type": "result", "result": "hi", "usage": {}}) + "\n")
+        entry = self._entry(json.dumps({"type": "result", "result": "hi", "usage": {}}) + "\n")
         with pytest.raises(RuntimeError, match="without reporting a session id"):
-            ClaudeChannel()._run_one_turn(entry, "go", timeout=10,
-                                          on_session_id=None, do_handshake=False)
+            ClaudeChannel()._run_one_turn(entry, "go", timeout=10, on_session_id=None, do_handshake=False)
 
     def test_nonzero_exit_without_output_raises(self):
         """claude exited non-zero AND produced no text => nothing to salvage;
         fail loud rather than hand back an empty turn."""
-        entry = self._entry(
-            json.dumps({"type": "result", "session_id": "s", "usage": {}}) + "\n",
-            returncode=1)
+        entry = self._entry(json.dumps({"type": "result", "session_id": "s", "usage": {}}) + "\n", returncode=1)
         with pytest.raises(RuntimeError, match="returncode=1"):
-            ClaudeChannel()._run_one_turn(entry, "go", timeout=10,
-                                          on_session_id=None, do_handshake=False)
+            ClaudeChannel()._run_one_turn(entry, "go", timeout=10, on_session_id=None, do_handshake=False)
 
     def test_nonzero_exit_with_output_warns_and_returns(self):
         """Non-zero exit WITH output is downgraded to a logged warning — the
         envelope parser, not the exit code, decides the turn's outcome."""
         entry = self._entry(
-            json.dumps({"type": "assistant",
-                        "message": {"content": [{"type": "text", "text": "partial"}]}}) + "\n",
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "partial"}]}}) + "\n",
             json.dumps({"type": "result", "session_id": "s", "usage": {}}) + "\n",
-            returncode=2)
-        r = ClaudeChannel()._run_one_turn(entry, "go", timeout=10,
-                                          on_session_id=None, do_handshake=False)
+            returncode=2,
+        )
+        r = ClaudeChannel()._run_one_turn(entry, "go", timeout=10, on_session_id=None, do_handshake=False)
         assert r.text == "partial"
         assert "returncode=2" in entry.log.getvalue()
 
@@ -366,22 +382,18 @@ class TestRunOneTurn:
         """If the wire session id differs from the UUID we pinned via
         --session-id, Claude Code's contract changed and the subtree would
         cross-fork — refuse rather than write a corrupted report."""
-        entry = self._entry(
-            json.dumps({"type": "result", "session_id": "actual", "usage": {}}) + "\n")
+        entry = self._entry(json.dumps({"type": "result", "session_id": "actual", "usage": {}}) + "\n")
         with pytest.raises(RuntimeError, match="pre-allocated"):
             ClaudeChannel()._run_one_turn(
-                entry, "go", timeout=10, on_session_id=None,
-                do_handshake=False, preallocated_session_id="expected")
+                entry, "go", timeout=10, on_session_id=None, do_handshake=False, preallocated_session_id="expected"
+            )
 
     def test_handshake_sent_once_on_first_turn(self):
         """The stream-json `initialize` handshake must be sent before the first
         user message on a fresh process, and the entry marked initialized so a
         later reuse turn (do_handshake=False) never re-sends it."""
-        entry = self._entry(
-            json.dumps({"type": "result", "session_id": "s",
-                        "result": "ok", "usage": {}}) + "\n")
-        ClaudeChannel()._run_one_turn(entry, "go", timeout=10,
-                                      on_session_id=None, do_handshake=True)
+        entry = self._entry(json.dumps({"type": "result", "session_id": "s", "result": "ok", "usage": {}}) + "\n")
+        ClaudeChannel()._run_one_turn(entry, "go", timeout=10, on_session_id=None, do_handshake=True)
         assert "initialize" in entry.stdin.getvalue()
         assert entry.initialized is True
 
@@ -393,8 +405,7 @@ class TestAllowAll:
 
     def test_allows_and_echoes_input(self, capsys):
         decision = allow_all("Bash", {"command": "ls"})
-        assert decision == {"behavior": "allow",
-                            "updatedInput": {"command": "ls"}}
+        assert decision == {"behavior": "allow", "updatedInput": {"command": "ls"}}
         assert "allowing Bash" in capsys.readouterr().err
 
 
@@ -406,8 +417,7 @@ class TestProcessLogPath:
     into a world-readable temp path."""
 
     def test_uses_root_log_dir_when_invocation_active(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(ch_mod._env, "root_identity",
-                            lambda: ("inv-7", str(tmp_path)))
+        monkeypatch.setattr(ch_mod._env, "root_identity", lambda: ("inv-7", str(tmp_path)))
         path = _process_log_path("abc")
         assert path.startswith(str(tmp_path / "inv-7" / "process_logs"))
         assert path.endswith(".log")
@@ -419,6 +429,7 @@ class TestProcessLogPath:
         # A real, private (0600) file was created as the fallback.
         import os
         import stat
+
         try:
             mode = stat.S_IMODE(os.stat(path).st_mode)
             assert mode == 0o600
@@ -479,9 +490,12 @@ class TestPooledProcessLifecycle:
 
     def _entry(self, proc, *, stdin=None, log=None) -> _PooledProcess:
         return _PooledProcess(
-            proc=proc, stdin=stdin or io.StringIO(),
-            stdout=io.StringIO(), log=log or io.StringIO(),
-            log_path="/tmp/x.log", cwd="/tmp",
+            proc=proc,
+            stdin=stdin or io.StringIO(),
+            stdout=io.StringIO(),
+            log=log or io.StringIO(),
+            log_path="/tmp/x.log",
+            cwd="/tmp",
         )
 
     def test_is_alive_false_when_closed(self):
@@ -569,8 +583,7 @@ class TestRunTurnArgValidation:
 
     def test_non_uuid_preallocation_rejected(self):
         with pytest.raises(ValueError, match="preallocated_session_id"):
-            ClaudeChannel().run_turn("", "p", mode="fresh",
-                                     preallocated_session_id="not-a-uuid")
+            ClaudeChannel().run_turn("", "p", mode="fresh", preallocated_session_id="not-a-uuid")
 
 
 class TestLogSemWait:
@@ -640,13 +653,13 @@ class TestSpawn:
 
         monkeypatch.setattr(ch_mod.subprocess, "Popen", fake_popen)
         uuid = "00000000-0000-0000-0000-0000000000ab"
-        entry = ClaudeChannel()._spawn(
-            "", "fresh", "/tmp", None, preallocated_session_id=uuid)
+        entry = ClaudeChannel()._spawn("", "fresh", "/tmp", None, preallocated_session_id=uuid)
         try:
             # Child's own-session env var was stamped from the preallocated UUID.
             assert captured["env"][ch_mod._env.ENV_OWN_SESSION] == uuid
 
             from pathlib import Path
+
             deadline = time.time() + 2.0
             log_text = ""
             while time.time() < deadline:
@@ -654,7 +667,7 @@ class TestSpawn:
                 if "capped at" in log_text:
                     break
                 time.sleep(0.01)
-            assert "STDERR: aa" in log_text       # first line written
+            assert "STDERR: aa" in log_text  # first line written
             assert "capped at 8 bytes" in log_text  # SEC-005 cap tripped
         finally:
             entry.close()
@@ -662,6 +675,7 @@ class TestSpawn:
     def test_spawn_failure_wrapped_as_runtime_error(self, monkeypatch):
         """A Popen that fails (e.g. `claude` not on PATH) must surface as a
         clear RuntimeError, not a bare OSError from deep in spawn."""
+
         def boom(*_a, **_k):
             raise OSError("no claude binary")
 
@@ -701,14 +715,15 @@ class TestWatchdogTimeout:
 
     def test_turn_timeout_raised_and_kill_error_swallowed(self):
         entry = _PooledProcess(
-            proc=_KillRaisesProc(), stdin=io.StringIO(),
-            stdout=_SlowStdout(0.3), log=io.StringIO(),
-            log_path="/tmp/x.log", cwd="/tmp",
+            proc=_KillRaisesProc(),
+            stdin=io.StringIO(),
+            stdout=_SlowStdout(0.3),
+            log=io.StringIO(),
+            log_path="/tmp/x.log",
+            cwd="/tmp",
         )
         with pytest.raises(TurnTimeout):
-            ClaudeChannel()._run_one_turn(
-                entry, "go", timeout=0.05, on_session_id=None,
-                do_handshake=False)
+            ClaudeChannel()._run_one_turn(entry, "go", timeout=0.05, on_session_id=None, do_handshake=False)
         assert "TIMEOUT after" in entry.log.getvalue()
 
 
@@ -724,6 +739,7 @@ class TestReadUntilResultRemainingBranches:
 
             def readline(self, *_a):
                 return self._q.pop(0) if self._q else ""
+
         return _Stdout(lines)
 
     def test_message_without_session_id_does_not_fire_callback(self):
@@ -734,8 +750,7 @@ class TestReadUntilResultRemainingBranches:
             json.dumps({"type": "control_response", "request_id": "x"}) + "\n",
             json.dumps({"type": "result", "session_id": "s", "usage": {}}) + "\n",
         )
-        ch._read_until_result(io.StringIO(), stdout, [], io.StringIO(), {},
-                              on_session_id=fired.append)
+        ch._read_until_result(io.StringIO(), stdout, [], io.StringIO(), {}, on_session_id=fired.append)
         # Fires once, on the result's session_id — never on the id-less message.
         assert fired == ["s"]
 
@@ -743,10 +758,18 @@ class TestReadUntilResultRemainingBranches:
         ch = ClaudeChannel()
         parts: list = []
         stdout = self._stdout(
-            json.dumps({"type": "assistant", "message": {"content": [
-                {"type": "tool_use", "name": "Bash"},
-                {"type": "text", "text": "kept"},
-            ]}}) + "\n",
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "tool_use", "name": "Bash"},
+                            {"type": "text", "text": "kept"},
+                        ]
+                    },
+                }
+            )
+            + "\n",
             json.dumps({"type": "result", "session_id": "s", "usage": {}}) + "\n",
         )
         ch._read_until_result(io.StringIO(), stdout, parts, io.StringIO(), {})

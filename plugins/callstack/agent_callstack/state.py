@@ -9,6 +9,7 @@ Each node runs its own state machine. The tree topology and child→parent
 result propagation are the driver's job; this module only knows about a
 single node.
 """
+
 from __future__ import annotations
 
 import uuid
@@ -24,12 +25,13 @@ from .protocol import (
     starting_prompt,
 )
 
-
 # ---------- States ----------
+
 
 @dataclass(frozen=True)
 class Pending:
     """Node created, not yet started. Carries what's needed to issue first turn."""
+
     parent_session_id: str
     task: str
     task_id: Optional[str] = None
@@ -44,6 +46,7 @@ class Pending:
 class AwaitingTurn:
     """An LLM turn is in flight. session_id is None on the very first turn
     (we're forking and the new id will arrive with TurnCompleted)."""
+
     session_id: Optional[str]
     kind: Literal["awaiting_turn"] = "awaiting_turn"
 
@@ -51,6 +54,7 @@ class AwaitingTurn:
 @dataclass(frozen=True)
 class AwaitingChild:
     """A CALL is in flight. We're paused until the child terminates."""
+
     session_id: str
     child_id: str
     kind: Literal["awaiting_child"] = "awaiting_child"
@@ -59,6 +63,7 @@ class AwaitingChild:
 @dataclass(frozen=True)
 class AwaitingUser:
     """The agent YIELDed. Suspended until the user replies."""
+
     session_id: str
     question: str
     kind: Literal["awaiting_user"] = "awaiting_user"
@@ -87,6 +92,7 @@ class Timeout:
     envelope on the child JSONL and never received one. Distinct from
     Failed so reports can distinguish "the child errored" from "we gave
     up waiting for the child's envelope"."""
+
     error: str = "wait-for-terminal-envelope budget elapsed"
     session_id: Optional[str] = None
     kind: Literal["timeout"] = "timeout"
@@ -108,13 +114,13 @@ class Abandoned:
     simply never got the chance to record the terminal envelope. Distinct
     from Timeout because we did not even wait for a JSONL envelope; the
     decision was made by an external signal."""
+
     error: str
     session_id: Optional[str] = None
     kind: Literal["abandoned"] = "abandoned"
 
 
-State = Union[Pending, AwaitingTurn, AwaitingChild, AwaitingUser, Done, Failed,
-              Timeout, Abandoned]
+State = Union[Pending, AwaitingTurn, AwaitingChild, AwaitingUser, Done, Failed, Timeout, Abandoned]
 
 TERMINAL = ("done", "failed", "timeout", "abandoned")
 SUSPENDED = ("awaiting_user",)  # node is parked, waiting for an out-of-band event
@@ -178,6 +184,7 @@ def status_label(state: object) -> str:
 
 # ---------- Events ----------
 
+
 @dataclass(frozen=True)
 class Start:
     """Begin executing a Pending node — issues the first (forked) turn."""
@@ -186,6 +193,7 @@ class Start:
 @dataclass(frozen=True)
 class TurnCompleted:
     """An LLM turn produced an envelope; carries the (possibly new) session id."""
+
     envelope: Envelope
     session_id: str
 
@@ -193,6 +201,7 @@ class TurnCompleted:
 @dataclass(frozen=True)
 class TurnFailed:
     """An LLM turn raised (timeout, subprocess error)."""
+
     error: str
     session_id: Optional[str] = None
     partial: Any = None
@@ -220,6 +229,7 @@ Event = Union[Start, TurnCompleted, TurnFailed, ChildDone, ChildFailed, UserRepl
 
 # ---------- Effects ----------
 
+
 @dataclass(frozen=True)
 class RunTurn:
     """Run an LLM turn against the channel.
@@ -230,6 +240,7 @@ class RunTurn:
                    session id is reported via TurnCompleted.
     mode="resume": `--resume <source>` only — appends `prompt` to an existing session.
     """
+
     source_session_id: str
     prompt: str
     mode: Literal["fork", "fresh", "resume"]
@@ -239,6 +250,7 @@ class RunTurn:
 class SpawnChild:
     """Drive a child node forked from `parent_session_id`. Eventually emits
     ChildDone or ChildFailed back to this node."""
+
     parent_session_id: str
     task: str
 
@@ -248,6 +260,7 @@ Effect = Union[RunTurn, SpawnChild]
 
 # ---------- Pure transition ----------
 
+
 def step(state: State, event: Event) -> tuple[State, list[Effect]]:
     """Compute the next state and the effects to perform.
 
@@ -255,28 +268,22 @@ def step(state: State, event: Event) -> tuple[State, list[Effect]]:
     (firing the wrong event for the current state)."""
     match (state, event):
         # ---- Pending: kick off the first turn ----
-        case (Pending(parent_session_id=psid, task=task, task_id=tid,
-                      context_mode=cmode), Start()):
+        case (Pending(parent_session_id=psid, task=task, task_id=tid, context_mode=cmode), Start()):
             return (
                 AwaitingTurn(session_id=None),
-                [RunTurn(source_session_id=psid,
-                         prompt=starting_prompt(task, tid),
-                         mode=cmode)],
+                [RunTurn(source_session_id=psid, prompt=starting_prompt(task, tid), mode=cmode)],
             )
 
         # ---- AwaitingTurn: an envelope arrived ----
         case (AwaitingTurn(), TurnCompleted(envelope=Return() as r, session_id=sid)):
-            return (Done(session_id=sid, result=r.result,
-                         summary=r.summary, suggested_next=r.suggested_next),
-                    [])
+            return (Done(session_id=sid, result=r.result, summary=r.summary, suggested_next=r.suggested_next), [])
 
         case (AwaitingTurn(), TurnCompleted(envelope=Yield(question=q), session_id=sid)):
             return (AwaitingUser(session_id=sid, question=q), [])
 
         case (AwaitingTurn(), TurnCompleted(envelope=Call(task=t), session_id=sid)):
             child_id = _fresh_child_id()
-            return (AwaitingChild(session_id=sid, child_id=child_id),
-                    [SpawnChild(parent_session_id=sid, task=t)])
+            return (AwaitingChild(session_id=sid, child_id=child_id), [SpawnChild(parent_session_id=sid, task=t)])
 
         case (AwaitingTurn(session_id=sid), TurnFailed(error=e, session_id=tsid, partial=p)):
             return (Failed(error=e, session_id=tsid or sid, partial=p), [])
@@ -290,17 +297,13 @@ def step(state: State, event: Event) -> tuple[State, list[Effect]]:
         # cannot occur. If one ever did (e.g. a future event queue), it falls
         # through to the exhaustiveness AssertionError below and fails loud
         # rather than silently resuming on the wrong child.
-        case (AwaitingChild(session_id=sid, child_id=cid),
-              ChildDone(child_id=ec, result=res)) if cid == ec:
+        case (AwaitingChild(session_id=sid, child_id=cid), ChildDone(child_id=ec, result=res)) if cid == ec:
             return (
                 AwaitingTurn(session_id=sid),
-                [RunTurn(source_session_id=sid,
-                         prompt=child_returned_prompt(res),
-                         mode="resume")],
+                [RunTurn(source_session_id=sid, prompt=child_returned_prompt(res), mode="resume")],
             )
 
-        case (AwaitingChild(session_id=sid, child_id=cid),
-              ChildFailed(child_id=ec, error=err)) if cid == ec:
+        case (AwaitingChild(session_id=sid, child_id=cid), ChildFailed(child_id=ec, error=err)) if cid == ec:
             return (Failed(error=f"Child failed: {err}", session_id=sid), [])
 
         # ---- AwaitingUser: user replied, resume the agent ----

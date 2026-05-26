@@ -1,43 +1,42 @@
 """Tests for SessionLocator: discovery + resolution against Claude's project layout."""
+
 from __future__ import annotations
 
 import json
 import os
 from pathlib import Path
 
-import pytest
-
 import agent_callstack.session as session_mod
+import pytest
 from agent_callstack.session import (
+    _SESSION_INDEX_FILENAME,
     SessionLocator,
     _extract_cwd,
     _load_session_index,
     _save_session_index,
-    _SESSION_INDEX_FILENAME,
     count_lines,
     encode_project_dir,
     envelope_from_session_record,
     session_record_epoch,
 )
 
-
 # Tests use stable UUID-shaped ids — SessionLocator validates session_id
 # shape before any filesystem probe (SEC-003), so placeholder strings
 # like "abc123" are rejected.
 _SID = {
-    "abc123":      "00000000-0000-0000-0000-0000000000a1",
-    "shared":      "00000000-0000-0000-0000-0000000000a2",
+    "abc123": "00000000-0000-0000-0000-0000000000a1",
+    "shared": "00000000-0000-0000-0000-0000000000a2",
     "explicit-id": "00000000-0000-0000-0000-0000000000a3",
-    "from-path":   "00000000-0000-0000-0000-0000000000a4",
-    "ghost":       "00000000-0000-0000-0000-0000000000a5",
-    "env-id":      "00000000-0000-0000-0000-0000000000a6",
-    "uuid-env":    "00000000-0000-0000-0000-0000000000a7",
-    "old":         "00000000-0000-0000-0000-0000000000a8",
-    "new":         "00000000-0000-0000-0000-0000000000a9",
-    "in-cwd":      "00000000-0000-0000-0000-0000000000b0",
-    "elsewhere":   "00000000-0000-0000-0000-0000000000b1",
-    "inside":      "00000000-0000-0000-0000-0000000000b2",
-    "nothing":     "00000000-0000-0000-0000-0000000000b3",
+    "from-path": "00000000-0000-0000-0000-0000000000a4",
+    "ghost": "00000000-0000-0000-0000-0000000000a5",
+    "env-id": "00000000-0000-0000-0000-0000000000a6",
+    "uuid-env": "00000000-0000-0000-0000-0000000000a7",
+    "old": "00000000-0000-0000-0000-0000000000a8",
+    "new": "00000000-0000-0000-0000-0000000000a9",
+    "in-cwd": "00000000-0000-0000-0000-0000000000b0",
+    "elsewhere": "00000000-0000-0000-0000-0000000000b1",
+    "inside": "00000000-0000-0000-0000-0000000000b2",
+    "nothing": "00000000-0000-0000-0000-0000000000b3",
 }
 
 
@@ -61,7 +60,6 @@ def _make_session(project_dir: Path, name: str, *, cwd: str = "/tmp") -> Path:
 
 
 class TestResolve:
-
     def test_resolve_finds_in_any_project_dir(self, projects):
         f = _make_session(projects / "proj-a", "abc123")
         loc = SessionLocator(projects_dir=projects)
@@ -73,6 +71,7 @@ class TestResolve:
 
     def test_resolve_prefers_cwd_matching_project(self, tmp_path, projects):
         from agent_callstack.session import encode_project_dir
+
         cwd = str(tmp_path / "myproj")
         f = _make_session(projects / encode_project_dir(cwd), "shared", cwd=cwd)
         # Also a different project dir with the same uuid
@@ -83,7 +82,6 @@ class TestResolve:
 
 
 class TestLocate:
-
     def test_explicit_uuid(self, projects):
         f = _make_session(projects / "p", "explicit-id")
         loc = SessionLocator(projects_dir=projects)
@@ -111,8 +109,7 @@ class TestLocate:
         ref = loc.locate()
         assert ref.session_id == _sid("uuid-env")
 
-    def test_own_session_wins_over_claude_code_session(self, tmp_path, projects,
-                                                        monkeypatch):
+    def test_own_session_wins_over_claude_code_session(self, tmp_path, projects, monkeypatch):
         """REGRESSION (the core /call invariant): when both env vars are
         present, CALLSTACK_OWN_SESSION (stamped by the spawning parent
         alongside `claude --session-id <uuid>`) wins over
@@ -121,6 +118,7 @@ class TestLocate:
         behavior across `--fork-session` is opaque), so we cannot rely
         on it inside a spawned child."""
         from agent_callstack.session import encode_project_dir
+
         cwd = str(tmp_path / "proj")
         proj = projects / encode_project_dir(cwd)
         # Stale CLAUDE_CODE_SESSION_ID inherited from grandparent.
@@ -140,6 +138,7 @@ class TestLocate:
 
     def test_mtime_fallback_picks_most_recent(self, projects, monkeypatch):
         from agent_callstack.session import encode_project_dir
+
         cwd = "/some/proj"
         proj = projects / encode_project_dir(cwd)
         old = _make_session(proj, "old", cwd=cwd)
@@ -157,6 +156,7 @@ class TestLocate:
         the parent. Cross-project guessing is what produced wrong
         parent_session values in real reports."""
         from agent_callstack.session import encode_project_dir
+
         cwd = "/proj/here"
         primary = projects / encode_project_dir(cwd)
         old = _make_session(primary, "in-cwd", cwd=cwd)
@@ -173,6 +173,7 @@ class TestLocate:
         """If the cwd-matching project dir has no sessions, refuse rather
         than reach into other projects."""
         from agent_callstack.session import encode_project_dir
+
         cwd = "/empty/proj"
         (projects / encode_project_dir(cwd)).mkdir(parents=True)
         _make_session(projects / "other-proj", "elsewhere", cwd="/other")
@@ -182,14 +183,14 @@ class TestLocate:
         with pytest.raises(RuntimeError, match="Could not discover"):
             loc.locate(cwd=cwd)
 
-    def test_legacy_parent_session_env_is_ignored(self, projects, tmp_path,
-                                                    monkeypatch, capsys):
+    def test_legacy_parent_session_env_is_ignored(self, projects, tmp_path, monkeypatch, capsys):
         """The legacy CALLSTACK_PARENT_SESSION env was removed (it caused
         cross-fork by inheriting a grandparent's value through arbitrary
         nesting depth). Setting it must be a no-op — the locator must
         not open the file it points at, even if that file is a valid
         session under PROJECTS_DIR."""
         from agent_callstack.session import encode_project_dir
+
         # Legacy env points at an arbitrary jsonl that DOES exist.
         rogue_proj = projects / "rogue"
         rogue = _make_session(rogue_proj, "in-cwd")
@@ -203,9 +204,7 @@ class TestLocate:
         monkeypatch.delenv("CALLSTACK_ROOT_INVOKE_ID", raising=False)
         loc = SessionLocator(projects_dir=projects)
         ref = loc.locate(cwd=cwd)
-        assert ref.file == legit, (
-            "legacy CALLSTACK_PARENT_SESSION must not influence locate()"
-        )
+        assert ref.file == legit, "legacy CALLSTACK_PARENT_SESSION must not influence locate()"
 
     def test_no_session_anywhere_raises(self, projects, monkeypatch):
         monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
@@ -229,9 +228,9 @@ class TestLocate:
 
 
 class TestSessionRefCwd:
-
     def test_extracts_cwd_from_first_message(self, tmp_path):
         from agent_callstack.session import SessionRef
+
         f = tmp_path / "s.jsonl"
         f.write_text(json.dumps({"cwd": str(tmp_path), "type": "user"}) + "\n")
         ref = SessionRef(session_id="s", file=f)
@@ -239,6 +238,7 @@ class TestSessionRefCwd:
 
     def test_returns_none_if_no_cwd(self, tmp_path):
         from agent_callstack.session import SessionRef
+
         f = tmp_path / "s.jsonl"
         f.write_text(json.dumps({"type": "user"}) + "\n")
         ref = SessionRef(session_id="s", file=f)
@@ -252,6 +252,7 @@ class TestLocateConcurrency:
 
     def test_concurrent_explicit_resolution(self, projects, monkeypatch):
         from concurrent.futures import ThreadPoolExecutor
+
         from agent_callstack.session import encode_project_dir
 
         # Build N distinct sessions in N distinct project dirs.
@@ -275,13 +276,10 @@ class TestLocateConcurrency:
         order = list(range(n)) * 4  # 64 lookups, interleaved
         with ThreadPoolExecutor(max_workers=8) as ex:
             got = list(ex.map(resolve, order))
-        assert got == [sids[i] for i in order], (
-            "concurrent locate() returned wrong sessions — shared state leak"
-        )
+        assert got == [sids[i] for i in order], "concurrent locate() returned wrong sessions — shared state leak"
 
 
 class TestCountLines:
-
     def test_counts(self, tmp_path):
         f = tmp_path / "x.jsonl"
         f.write_text("a\nb\nc\n")
@@ -301,6 +299,7 @@ class TestMostRecentSession:
     def test_returns_none_for_empty_project_dir(self, projects, monkeypatch):
         import agent_callstack.session as session_mod
         from agent_callstack.session import encode_project_dir
+
         cwd = "/some/proj"
         (projects / encode_project_dir(cwd)).mkdir(parents=True)
         monkeypatch.setattr(session_mod, "PROJECTS_DIR", projects)
@@ -308,12 +307,14 @@ class TestMostRecentSession:
 
     def test_returns_none_when_no_project_dir(self, projects, monkeypatch):
         import agent_callstack.session as session_mod
+
         monkeypatch.setattr(session_mod, "PROJECTS_DIR", projects)
         assert session_mod.most_recent_session("/never/created") is None
 
     def test_picks_newest_by_mtime(self, projects, monkeypatch):
         import agent_callstack.session as session_mod
         from agent_callstack.session import encode_project_dir
+
         cwd = "/some/proj"
         proj = projects / encode_project_dir(cwd)
         old = _make_session(proj, "old", cwd=cwd)
@@ -323,15 +324,14 @@ class TestMostRecentSession:
         monkeypatch.setattr(session_mod, "PROJECTS_DIR", projects)
         assert session_mod.most_recent_session(cwd) == _sid("new")
 
-    def test_recreates_shared_locator_when_projects_dir_swapped(
-        self, tmp_path, monkeypatch
-    ):
+    def test_recreates_shared_locator_when_projects_dir_swapped(self, tmp_path, monkeypatch):
         """The module-level shared locator binds PROJECTS_DIR at construction.
         Swapping the global (as tests and a reloaded runtime do) must
         transparently recreate it so the new tree is honored — otherwise a
         stale locator would keep scanning the old directory."""
         import agent_callstack.session as session_mod
         from agent_callstack.session import encode_project_dir
+
         cwd = "/swap/proj"
         first = tmp_path / "first"
         first.mkdir()
@@ -344,14 +344,13 @@ class TestMostRecentSession:
         monkeypatch.setattr(session_mod, "PROJECTS_DIR", second)
         assert session_mod.most_recent_session(cwd) == _sid("new")
 
-    def test_reflects_newer_session_added_after_first_call(
-        self, projects, monkeypatch
-    ):
+    def test_reflects_newer_session_added_after_first_call(self, projects, monkeypatch):
         """The shared locator caches per-cwd results keyed on the project
         dir's mtime; a newer session added later must invalidate that cache.
         Encodes the no-stale-read guarantee, not the optimization itself."""
         import agent_callstack.session as session_mod
         from agent_callstack.session import encode_project_dir
+
         cwd = "/grow/proj"
         proj = projects / encode_project_dir(cwd)
         old = _make_session(proj, "old", cwd=cwd)
@@ -441,8 +440,7 @@ class TestMostRecentBranches:
         first = loc._most_recent(cwd)
         # Second call with the dir mtime unchanged must return the cached ref
         # without a rescan — make a rescan fail loudly to prove it isn't run.
-        monkeypatch.setattr(session_mod.os, "scandir",
-                            lambda *_a: pytest.fail("rescanned despite cache hit"))
+        monkeypatch.setattr(session_mod.os, "scandir", lambda *_a: pytest.fail("rescanned despite cache hit"))
         assert loc._most_recent(cwd) is first
 
     def test_skips_non_jsonl_files(self, projects):
@@ -466,27 +464,29 @@ class TestEnvelopeFromSessionRecord:
 
     def test_returns_envelope_from_text_block(self):
         from agent_callstack.protocol import Return
-        rec = self._assistant([
-            {"type": "text",
-             "text": "```json\n{\"op\": \"return\", \"result\": \"ok\"}\n```"},
-        ])
+
+        rec = self._assistant(
+            [
+                {"type": "text", "text": '```json\n{"op": "return", "result": "ok"}\n```'},
+            ]
+        )
         env = envelope_from_session_record(rec)
         assert isinstance(env, Return) and env.result == "ok"
 
     def test_non_assistant_row_ignored(self):
-        assert envelope_from_session_record(
-            {"message": {"role": "user", "content": []}}) is None
+        assert envelope_from_session_record({"message": {"role": "user", "content": []}}) is None
 
     def test_content_not_a_list_returns_none(self):
-        assert envelope_from_session_record(
-            {"message": {"role": "assistant", "content": "oops"}}) is None
+        assert envelope_from_session_record({"message": {"role": "assistant", "content": "oops"}}) is None
 
     def test_non_text_blocks_and_no_envelope_returns_none(self):
-        rec = self._assistant([
-            {"type": "tool_use", "name": "Bash"},        # non-text block skipped
-            {"type": "text", "text": 123},                 # text not a str skipped
-            {"type": "text", "text": "just prose, no fence"},  # parses to None
-        ])
+        rec = self._assistant(
+            [
+                {"type": "tool_use", "name": "Bash"},  # non-text block skipped
+                {"type": "text", "text": 123},  # text not a str skipped
+                {"type": "text", "text": "just prose, no fence"},  # parses to None
+            ]
+        )
         assert envelope_from_session_record(rec) is None
 
 

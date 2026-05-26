@@ -49,6 +49,7 @@ via `Caller.close()` / `shutdown_pool()`.
   by tests so the entire driver/state machine can be exercised without ever
   spawning a subprocess.
 """
+
 from __future__ import annotations
 
 import atexit
@@ -60,8 +61,8 @@ import tempfile
 import threading
 import time
 import uuid
-from pathlib import Path
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional, Protocol, TextIO
 
 from . import env as _env
@@ -85,7 +86,10 @@ def _process_log_path(stem: str) -> str:
     # NamedTemporaryFile(delete=False) creates the file with mode 0600,
     # unlike a bare `open()` which inherits the (typically 022) umask.
     tmp = tempfile.NamedTemporaryFile(
-        mode="w", prefix=f"callstack_{stem}_", suffix=".log", delete=False,
+        mode="w",
+        prefix=f"callstack_{stem}_",
+        suffix=".log",
+        delete=False,
     )
     path = tmp.name
     tmp.close()
@@ -120,15 +124,20 @@ _IN_FLIGHT_SEMAPHORE = threading.BoundedSemaphore(value=_MAX_IN_FLIGHT_TURNS)
 # SEC-005: bound the worst-case NDJSON line and per-turn stderr drain.
 # `claude` lines are normally <100 KB; the cap exists so a malicious or
 # stuck child can't drive parent RSS without bound.
-_NDJSON_MAX_LINE = 4 * 1024 * 1024            # 4 MiB per line
-_STDERR_LOG_CAP = 16 * 1024 * 1024            # 16 MiB per turn before truncate
+_NDJSON_MAX_LINE = 4 * 1024 * 1024  # 4 MiB per line
+_STDERR_LOG_CAP = 16 * 1024 * 1024  # 16 MiB per turn before truncate
 
 # SEC-013: argv-input validation. `claude --permission-mode <X>` and
 # `claude --resume <UUID>` accept these from us; reject anything outside
 # the known set / UUID shape before subprocess spawn.
-_VALID_PERMISSION_MODES = frozenset({
-    "default", "acceptEdits", "plan", "bypassPermissions",
-})
+_VALID_PERMISSION_MODES = frozenset(
+    {
+        "default",
+        "acceptEdits",
+        "plan",
+        "bypassPermissions",
+    }
+)
 # UUID shape regex is owned by `session.py` (the lowest-level module that
 # knows what a session id looks like); import it here so the same pattern
 # governs both `--session-id` argv validation and on-disk session lookups.
@@ -153,6 +162,7 @@ class TurnResult:
 
 class TurnTimeout(Exception):
     """Raised when an LLM turn exceeds its timeout. Carries any partial text."""
+
     def __init__(self, message: str, partial: str = ""):
         super().__init__(message)
         self.partial = partial
@@ -166,8 +176,7 @@ def allow_all(tool_name: str, input_data: dict) -> dict:
     return {"behavior": "allow", "updatedInput": input_data}
 
 
-def _fire_on_session_id(cb: Callable[[str], None], sid: str,
-                        log: Optional[TextIO] = None) -> None:
+def _fire_on_session_id(cb: Callable[[str], None], sid: str, log: Optional[TextIO] = None) -> None:
     """SEC-011: invoke an advisory on_session_id callback, surfacing any
     exception to stderr (and the per-turn `log`, when given) instead of
     swallowing it silently. The callback is an advisory observer, so a raise
@@ -175,8 +184,7 @@ def _fire_on_session_id(cb: Callable[[str], None], sid: str,
     try:
         cb(sid)
     except Exception as e:
-        msg = (f"on_session_id callback raised: "
-               f"{type(e).__name__}: {str(e)[:200]}")
+        msg = f"on_session_id callback raised: {type(e).__name__}: {str(e)[:200]}"
         print(f"[callstack] {msg}", file=sys.stderr)
         if log is not None:
             log.write(msg + "\n")
@@ -202,6 +210,7 @@ class Channel(Protocol):
 # Process pool
 # --------------------------------------------------------------------------
 
+
 class _PooledProcess:
     """A long-lived `claude` subprocess bound to one session_id.
 
@@ -214,8 +223,7 @@ class _PooledProcess:
     has been sent — required once per process, never re-sent on reuse.
     """
 
-    def __init__(self, proc: subprocess.Popen, stdin, stdout, log,
-                 log_path: str, cwd: str):
+    def __init__(self, proc: subprocess.Popen, stdin, stdout, log, log_path: str, cwd: str):
         self.proc = proc
         self.stdin = stdin
         self.stdout = stdout
@@ -264,8 +272,7 @@ class ClaudePool:
     ordering; injectable so tests can drive eviction order deterministically
     instead of relying on real sub-millisecond sleeps to separate timestamps."""
 
-    def __init__(self, max_size: int,
-                 clock: Callable[[], float] = time.monotonic):
+    def __init__(self, max_size: int, clock: Callable[[], float] = time.monotonic):
         self._max_size = max_size
         self._processes: dict[str, _PooledProcess] = {}
         self._lock = threading.Lock()
@@ -335,8 +342,11 @@ class ClaudePool:
 
     # ---- private ----
 
-    def _evict_excess_locked(self, *, protect: Optional[str] = None,
-                              ) -> list[_PooledProcess]:
+    def _evict_excess_locked(
+        self,
+        *,
+        protect: Optional[str] = None,
+    ) -> list[_PooledProcess]:
         """Pop entries beyond `max_size`, preferring idle (lock-free) ones
         and lowest `last_used` first. Caller holds `self._lock`. Returns
         entries the caller must `close()` outside the lock.
@@ -354,8 +364,7 @@ class ClaudePool:
         if len(self._processes) <= self._max_size:
             return to_close
         # One-shot LRU ordering: oldest `last_used` first.
-        ranked = sorted(self._processes.items(),
-                        key=lambda kv: kv[1].last_used)
+        ranked = sorted(self._processes.items(), key=lambda kv: kv[1].last_used)
         for k, v in ranked:
             if len(self._processes) <= self._max_size:
                 break
@@ -406,6 +415,7 @@ def shutdown_pool() -> None:
 # Real Claude CLI channel
 # --------------------------------------------------------------------------
 
+
 class ClaudeChannel:
     """Spawns `claude` and exchanges NDJSON over stdio. Maintains a
     process-per-session pool — see module docstring."""
@@ -423,8 +433,7 @@ class ClaudeChannel:
         # the claude argv.
         if permission_mode not in _VALID_PERMISSION_MODES:
             raise ValueError(
-                f"invalid permission_mode {permission_mode!r}; expected one "
-                f"of {sorted(_VALID_PERMISSION_MODES)}"
+                f"invalid permission_mode {permission_mode!r}; expected one of {sorted(_VALID_PERMISSION_MODES)}"
             )
         self._model = model
         self._permission_mode = permission_mode
@@ -452,16 +461,9 @@ class ClaudeChannel:
         # SEC-013: when a session id is supplied (fork/resume), it must be
         # a real UUID. `fresh` mode passes an empty string and is exempt.
         if source_session_id and not _UUID_RE.fullmatch(source_session_id):
-            raise ValueError(
-                f"invalid source_session_id {source_session_id!r}; must be a "
-                f"UUID"
-            )
-        if (preallocated_session_id is not None
-                and not _UUID_RE.fullmatch(preallocated_session_id)):
-            raise ValueError(
-                f"invalid preallocated_session_id "
-                f"{preallocated_session_id!r}; must be a UUID"
-            )
+            raise ValueError(f"invalid source_session_id {source_session_id!r}; must be a UUID")
+        if preallocated_session_id is not None and not _UUID_RE.fullmatch(preallocated_session_id):
+            raise ValueError(f"invalid preallocated_session_id {preallocated_session_id!r}; must be a UUID")
         effective_cwd = cwd or os.getcwd()
         pool = _get_pool()
 
@@ -485,12 +487,22 @@ class ClaudeChannel:
         try:
             if pooled is not None:
                 return self._reuse_turn(
-                    pooled, source_session_id, prompt, timeout,
-                    on_session_id, sem_wait,
+                    pooled,
+                    source_session_id,
+                    prompt,
+                    timeout,
+                    on_session_id,
+                    sem_wait,
                 )
             return self._fresh_spawn_turn(
-                source_session_id, prompt, mode, effective_cwd,
-                extra_env, timeout, on_session_id, sem_wait,
+                source_session_id,
+                prompt,
+                mode,
+                effective_cwd,
+                extra_env,
+                timeout,
+                on_session_id,
+                sem_wait,
                 preallocated_session_id=preallocated_session_id,
             )
         finally:
@@ -498,18 +510,28 @@ class ClaudeChannel:
 
     # ---- private: top-level turn paths ----
 
-    def _reuse_turn(self, pooled: _PooledProcess, source_session_id: str,
-                    prompt: str, timeout: int,
-                    on_session_id: Optional[Callable[[str], None]],
-                    sem_wait: float) -> TurnResult:
+    def _reuse_turn(
+        self,
+        pooled: _PooledProcess,
+        source_session_id: str,
+        prompt: str,
+        timeout: int,
+        on_session_id: Optional[Callable[[str], None]],
+        sem_wait: float,
+    ) -> TurnResult:
         """Run one turn on an existing pooled process. Evicts on failure."""
         self._log_sem_wait(pooled.log, sem_wait)
         try:
-            print(f"[callstack] reuse (session={source_session_id[:8]}..., "
-                  f"cwd={pooled.cwd}, log={pooled.log_path})", file=sys.stderr)
+            print(
+                f"[callstack] reuse (session={source_session_id[:8]}..., cwd={pooled.cwd}, log={pooled.log_path})",
+                file=sys.stderr,
+            )
             with pooled.lock:
                 return self._run_one_turn(
-                    pooled, prompt, timeout, on_session_id,
+                    pooled,
+                    prompt,
+                    timeout,
+                    on_session_id,
                     do_handshake=False,
                 )
         except Exception:
@@ -517,14 +539,19 @@ class ClaudeChannel:
             _get_pool().evict(source_session_id)
             raise
 
-    def _fresh_spawn_turn(self, source_session_id: str, prompt: str, mode: str,
-                          effective_cwd: str, extra_env: Optional[dict],
-                          timeout: int,
-                          on_session_id: Optional[Callable[[str], None]],
-                          sem_wait: float,
-                          *,
-                          preallocated_session_id: Optional[str] = None,
-                          ) -> TurnResult:
+    def _fresh_spawn_turn(
+        self,
+        source_session_id: str,
+        prompt: str,
+        mode: str,
+        effective_cwd: str,
+        extra_env: Optional[dict],
+        timeout: int,
+        on_session_id: Optional[Callable[[str], None]],
+        sem_wait: float,
+        *,
+        preallocated_session_id: Optional[str] = None,
+    ) -> TurnResult:
         """Spawn a new claude subprocess, run one turn, and pool it on success.
 
         Holds `_SPAWN_SEMAPHORE` for the full first turn — that's the phase
@@ -538,7 +565,10 @@ class ClaudeChannel:
         try:
             try:
                 pooled = self._spawn(
-                    source_session_id, mode, effective_cwd, extra_env,
+                    source_session_id,
+                    mode,
+                    effective_cwd,
+                    extra_env,
                     preallocated_session_id=preallocated_session_id,
                 )
             except Exception as e:
@@ -548,7 +578,10 @@ class ClaudeChannel:
             try:
                 with pooled.lock:
                     result = self._run_one_turn(
-                        pooled, prompt, timeout, on_session_id,
+                        pooled,
+                        prompt,
+                        timeout,
+                        on_session_id,
                         do_handshake=True,
                         preallocated_session_id=preallocated_session_id,
                     )
@@ -568,31 +601,30 @@ class ClaudeChannel:
         if sem_wait <= 0.5:
             return
         try:
-            log.write(f"semaphore-wait: {sem_wait:.2f}s "
-                      f"(cap={_MAX_CONCURRENT_FORKS})\n")
+            log.write(f"semaphore-wait: {sem_wait:.2f}s (cap={_MAX_CONCURRENT_FORKS})\n")
             log.flush()
         except (OSError, ValueError):
             pass
 
     # ---- private: spawn ----
 
-    def _spawn(self, source_session_id: str, mode: str,
-               effective_cwd: str, extra_env: Optional[dict],
-               *, preallocated_session_id: Optional[str] = None,
-               ) -> _PooledProcess:
-        cmd = self._build_cmd(source_session_id, mode,
-                              preallocated_session_id=preallocated_session_id)
+    def _spawn(
+        self,
+        source_session_id: str,
+        mode: str,
+        effective_cwd: str,
+        extra_env: Optional[dict],
+        *,
+        preallocated_session_id: Optional[str] = None,
+    ) -> _PooledProcess:
+        cmd = self._build_cmd(source_session_id, mode, preallocated_session_id=preallocated_session_id)
         env = {**os.environ, **self._env_extra, **(extra_env or {})}
         # Stamp the child's own session UUID into its env so its MCP
         # server resolves itself deterministically without depending on
         # Claude Code's env-propagation behavior. Pre-allocated for
         # fork/fresh (the same UUID is passed to claude via --session-id);
         # equal to the resumed id for resume mode.
-        own_session = (
-            preallocated_session_id
-            if mode in ("fork", "fresh")
-            else source_session_id
-        )
+        own_session = preallocated_session_id if mode in ("fork", "fresh") else source_session_id
         if own_session:
             env[_env.ENV_OWN_SESSION] = own_session
         stem = (preallocated_session_id or source_session_id or "")[:8] or "fresh"
@@ -604,17 +636,28 @@ class ClaudeChannel:
         log = open(log_path, "w", buffering=1)
         log.write(f"cmd: {' '.join(cmd)}\ncwd: {effective_cwd}\n")
         log.flush()
-        print(f"[callstack] spawn (mode={mode}, source={stem}..., "
-              f"cwd={effective_cwd}, log={log_path})", file=sys.stderr)
+        print(
+            f"[callstack] spawn (mode={mode}, source={stem}..., cwd={effective_cwd}, log={log_path})",
+            file=sys.stderr,
+        )
 
         proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, cwd=effective_cwd, env=env,
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=effective_cwd,
+            env=env,
         )
         assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
         entry = _PooledProcess(
-            proc=proc, stdin=proc.stdin, stdout=proc.stdout,
-            log=log, log_path=log_path, cwd=effective_cwd,
+            proc=proc,
+            stdin=proc.stdin,
+            stdout=proc.stdout,
+            log=log,
+            log_path=log_path,
+            cwd=effective_cwd,
         )
         # Drain stderr for the LIFETIME of the process — survives across
         # multiple pooled turns, so we don't restart on each reuse.
@@ -625,6 +668,7 @@ class ClaudeChannel:
         stderr = proc.stderr
         bytes_written = [0]
         capped = [False]
+
         def _drain():
             for line in stderr:
                 if capped[0]:
@@ -632,27 +676,29 @@ class ClaudeChannel:
                 try:
                     n = len(line)
                     if bytes_written[0] + n > _STDERR_LOG_CAP:
-                        log.write(
-                            f"STDERR: ...stderr log capped at "
-                            f"{_STDERR_LOG_CAP} bytes; further lines "
-                            f"discarded\n"
-                        )
+                        log.write(f"STDERR: ...stderr log capped at {_STDERR_LOG_CAP} bytes; further lines discarded\n")
                         capped[0] = True
                         continue
                     log.write(f"STDERR: {line}")
                     bytes_written[0] += n
                 except (OSError, ValueError):
                     return
+
         threading.Thread(target=_drain, daemon=True).start()
         return entry
 
     # ---- private: per-turn I/O ----
 
-    def _run_one_turn(self, entry: _PooledProcess, prompt: str, timeout: int,
-                      on_session_id: Optional[Callable[[str], None]],
-                      *, do_handshake: bool,
-                      preallocated_session_id: Optional[str] = None,
-                      ) -> TurnResult:
+    def _run_one_turn(
+        self,
+        entry: _PooledProcess,
+        prompt: str,
+        timeout: int,
+        on_session_id: Optional[Callable[[str], None]],
+        *,
+        do_handshake: bool,
+        preallocated_session_id: Optional[str] = None,
+    ) -> TurnResult:
         """Send one user message + read until result. Per-turn watchdog only
         kills the process if THIS turn exceeds `timeout`; otherwise the
         process stays alive for pool reuse."""
@@ -672,6 +718,7 @@ class ClaudeChannel:
                     entry.proc.kill()
                 except OSError:
                     pass
+
         threading.Thread(target=_watchdog, daemon=True).start()
 
         text_parts: list[str] = []
@@ -683,7 +730,11 @@ class ClaudeChannel:
                 entry.initialized = True
             self._send_user_message(entry.stdin, prompt, entry.log)
             session_id = self._read_until_result(
-                entry.stdin, entry.stdout, text_parts, entry.log, result_meta,
+                entry.stdin,
+                entry.stdout,
+                text_parts,
+                entry.log,
+                result_meta,
                 on_session_id=on_session_id,
             )
         finally:
@@ -707,10 +758,7 @@ class ClaudeChannel:
         rc = entry.proc.returncode
         if rc is not None and rc != 0:
             if not text:
-                raise RuntimeError(
-                    f"claude CLI exited with returncode={rc} and no output "
-                    f"(log={entry.log_path})"
-                )
+                raise RuntimeError(f"claude CLI exited with returncode={rc} and no output (log={entry.log_path})")
             try:
                 entry.log.write(
                     f"WARN: claude CLI exited with returncode={rc} after "
@@ -728,8 +776,7 @@ class ClaudeChannel:
         # subtree would resolve a UUID that doesn't match what
         # CALLSTACK_OWN_SESSION says, cross-forking siblings. Fail
         # loud here rather than write a corrupted report.
-        if (preallocated_session_id is not None
-                and session_id != preallocated_session_id):
+        if preallocated_session_id is not None and session_id != preallocated_session_id:
             raise RuntimeError(
                 f"claude reported session_id {session_id} but callstack "
                 f"pre-allocated {preallocated_session_id} via "
@@ -754,16 +801,24 @@ class ClaudeChannel:
 
     # ---- private: cmd + protocol ----
 
-    def _build_cmd(self, source_session_id: str, mode: str,
-                   *, preallocated_session_id: Optional[str] = None,
-                   ) -> list[str]:
+    def _build_cmd(
+        self,
+        source_session_id: str,
+        mode: str,
+        *,
+        preallocated_session_id: Optional[str] = None,
+    ) -> list[str]:
         cmd = [
             "claude",
-            "--output-format", "stream-json",
-            "--input-format", "stream-json",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
             "--verbose",
-            "--permission-prompt-tool", "stdio",
-            "--permission-mode", self._permission_mode,
+            "--permission-prompt-tool",
+            "stdio",
+            "--permission-mode",
+            self._permission_mode,
         ]
         if mode == "fork":
             cmd.extend(["--resume", source_session_id, "--fork-session"])
@@ -775,8 +830,7 @@ class ClaudeChannel:
         # mtime guessing. Verified empirically that `--session-id`
         # composes with `--resume + --fork-session` on Claude Code
         # 2026 (test in commit msg).
-        if (mode in ("fork", "fresh") and preallocated_session_id
-                and _UUID_RE.fullmatch(preallocated_session_id)):
+        if mode in ("fork", "fresh") and preallocated_session_id and _UUID_RE.fullmatch(preallocated_session_id):
             cmd.extend(["--session-id", preallocated_session_id])
         if self._model:
             cmd.extend(["--model", self._model])
@@ -788,27 +842,40 @@ class ClaudeChannel:
         stdin.flush()
 
     def _handshake(self, stdin, log) -> None:
-        log.write("→ initialize\n"); log.flush()
-        self._send(stdin, {
-            "type": "control_request",
-            "request_id": f"req_init_{uuid.uuid4().hex[:8]}",
-            "request": {"subtype": "initialize", "hooks": None},
-        })
+        log.write("→ initialize\n")
+        log.flush()
+        self._send(
+            stdin,
+            {
+                "type": "control_request",
+                "request_id": f"req_init_{uuid.uuid4().hex[:8]}",
+                "request": {"subtype": "initialize", "hooks": None},
+            },
+        )
 
     def _send_user_message(self, stdin, prompt: str, log) -> None:
-        log.write(f"→ user message ({len(prompt)} chars)\n"); log.flush()
-        self._send(stdin, {
-            "type": "user",
-            "session_id": "",
-            "message": {"role": "user", "content": prompt},
-            "parent_tool_use_id": None,
-        })
+        log.write(f"→ user message ({len(prompt)} chars)\n")
+        log.flush()
+        self._send(
+            stdin,
+            {
+                "type": "user",
+                "session_id": "",
+                "message": {"role": "user", "content": prompt},
+                "parent_tool_use_id": None,
+            },
+        )
 
-    def _read_until_result(self, stdin, stdout, text_parts: list, log,
-                            result_meta: dict,
-                            *,
-                            on_session_id: Optional[Callable[[str], None]] = None,
-                            ) -> Optional[str]:
+    def _read_until_result(
+        self,
+        stdin,
+        stdout,
+        text_parts: list,
+        log,
+        result_meta: dict,
+        *,
+        on_session_id: Optional[Callable[[str], None]] = None,
+    ) -> Optional[str]:
         """Read NDJSON lines, collecting assistant text and answering permission
         requests, until a `result` message arrives or stdout closes.
 
@@ -832,18 +899,13 @@ class ClaudeChannel:
             # protocol error and ends the turn.
             raw = stdout.readline(_NDJSON_MAX_LINE)
             if not raw:
-                log.write("← EOF\n"); log.flush()
+                log.write("← EOF\n")
+                log.flush()
                 return session_id
             if len(raw) == _NDJSON_MAX_LINE and not raw.endswith("\n"):
-                log.write(
-                    f"← line exceeded {_NDJSON_MAX_LINE} bytes — protocol "
-                    f"error; ending turn\n"
-                )
+                log.write(f"← line exceeded {_NDJSON_MAX_LINE} bytes — protocol error; ending turn\n")
                 log.flush()
-                raise RuntimeError(
-                    f"claude stdout exceeded {_NDJSON_MAX_LINE}-byte NDJSON "
-                    f"line cap; aborting turn"
-                )
+                raise RuntimeError(f"claude stdout exceeded {_NDJSON_MAX_LINE}-byte NDJSON line cap; aborting turn")
             raw = raw.strip()
             if not raw:
                 continue
@@ -851,11 +913,13 @@ class ClaudeChannel:
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
-                log.write(f"← unparseable: {raw[:200]}\n"); log.flush()
+                log.write(f"← unparseable: {raw[:200]}\n")
+                log.flush()
                 continue
 
             mtype = msg.get("type")
-            log.write(f"← {mtype}\n"); log.flush()
+            log.write(f"← {mtype}\n")
+            log.flush()
 
             # Fire early-session-id callback the moment we see one on any
             # message type (system init carries it first; assistant messages
@@ -904,20 +968,24 @@ class ClaudeChannel:
             try:
                 response = self._handler(tool_name, request.get("input", {}))
             except Exception as e:
-                print(f"[callstack] permission_handler raised on tool={tool_name!r}: "
-                      f"{type(e).__name__}: {str(e)[:200]} — denying request",
-                      file=sys.stderr)
+                print(
+                    f"[callstack] permission_handler raised on tool={tool_name!r}: "
+                    f"{type(e).__name__}: {str(e)[:200]} — denying request",
+                    file=sys.stderr,
+                )
                 response = {
                     "behavior": "deny",
-                    "message": (f"permission_handler raised "
-                                f"{type(e).__name__}; request denied"),
+                    "message": (f"permission_handler raised {type(e).__name__}; request denied"),
                 }
         else:
             response = {}
-        self._send(stdin, {
-            "type": "control_response",
-            "response": {"subtype": "success", "request_id": request_id, "response": response},
-        })
+        self._send(
+            stdin,
+            {
+                "type": "control_response",
+                "response": {"subtype": "success", "request_id": request_id, "response": response},
+            },
+        )
 
 
 # --------------------------------------------------------------------------
@@ -933,7 +1001,14 @@ from .testing import (  # noqa: E402
 )
 
 __all__ = [
-    "Channel", "ClaudeChannel", "TurnResult", "TurnTimeout",
-    "PermissionHandler", "allow_all", "shutdown_pool",
-    "ScriptedChannel", "ScriptedEntry", "ScriptedResponse",
+    "Channel",
+    "ClaudeChannel",
+    "TurnResult",
+    "TurnTimeout",
+    "PermissionHandler",
+    "allow_all",
+    "shutdown_pool",
+    "ScriptedChannel",
+    "ScriptedEntry",
+    "ScriptedResponse",
 ]

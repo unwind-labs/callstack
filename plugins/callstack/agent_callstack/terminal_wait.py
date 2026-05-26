@@ -19,6 +19,7 @@ Reuses `session.envelope_from_session_record` (record-shape decoding) and
 `state.step` (the transition machine) — this module owns only the polling
 loop and the recovered-duration arithmetic.
 """
+
 from __future__ import annotations
 
 import json
@@ -30,7 +31,6 @@ from . import state as st
 from .driver import Node, Tree, _denormalize
 from .protocol import Return, Yield
 from .session import envelope_from_session_record, session_record_epoch
-
 
 # Polling cadence for the wait loop. Small enough that a 1s late envelope
 # is observed promptly; large enough that the loop is cheap on the
@@ -56,8 +56,7 @@ def wait_for_terminal_signals(
         # state the tree is in. Tests use this to assert pre-fix shape.
         return
 
-    waiters = [_NodeWaiter(node) for node in _all_nodes(tree)
-               if st.is_eligible_for_abandonment(node.state.kind)]
+    waiters = [_NodeWaiter(node) for node in _all_nodes(tree) if st.is_eligible_for_abandonment(node.state.kind)]
     if not waiters:
         return
 
@@ -74,6 +73,7 @@ def wait_for_terminal_signals(
 
 
 # ---------- internals ----------
+
 
 def _all_nodes(tree: Tree):
     """Pre-order traversal of every node in `tree`."""
@@ -196,15 +196,14 @@ class _NodeWaiter:
             return False
         sid = _session_id_of(node.state) or node.session_id or "unknown"
         new_state, _ = st.step(
-            node.state, st.TurnCompleted(envelope=envelope, session_id=sid),
+            node.state,
+            st.TurnCompleted(envelope=envelope, session_id=sid),
         )
         node.state = new_state
         # Recompute duration from the JSONL's own timestamps rather than
         # the finalize-wait latency: a 200s task that lands its envelope
         # 0.2s into the wait must record ~200s, not 0.2s.
-        if (isinstance(new_state, st.Done)
-                and self._session_start_epoch is not None
-                and end_epoch is not None):
+        if isinstance(new_state, st.Done) and self._session_start_epoch is not None and end_epoch is not None:
             node.duration = max(0.0, end_epoch - self._session_start_epoch)
         _denormalize(node)
         return True

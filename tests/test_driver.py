@@ -1,20 +1,20 @@
 """Driver tests with ScriptedChannel — exercises the full state machine end-to-end
 without spawning any subprocess."""
+
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
+import agent_callstack.state as st
 import pytest
-
 from agent_callstack.channel import ScriptedChannel, TurnResult, TurnTimeout
 from agent_callstack.driver import Driver, Node, Tree, _TreeIndex
 from agent_callstack.session import SessionLocator, SessionRef
 from agent_callstack.trace import TraceWriter, TreeStore
-import agent_callstack.state as st
-
 
 # ---------- helpers ----------
+
 
 def _envelope(op: str, **fields) -> str:
     return "```json\n" + json.dumps({"op": op, **fields}) + "\n```"
@@ -41,8 +41,8 @@ def _make_driver(tmp_path, channel: ScriptedChannel, *, max_depth: int = 5) -> D
 
 # ---------- single-task happy path ----------
 
-class TestRunSingleTask:
 
+class TestRunSingleTask:
     def test_complete_directly(self, tmp_path, parent_session):
         ch = ScriptedChannel().respond(_envelope("return", result="hello"), "child-1")
         driver = _make_driver(tmp_path, ch)
@@ -117,10 +117,12 @@ class TestRunSingleTask:
 
     def test_call_then_complete(self, tmp_path, parent_session):
         """Parent CALLs, child returns, parent resumes and returns."""
-        ch = (ScriptedChannel()
-              .respond(_envelope("call", task="sub-task"), "parent-fork")
-              .respond(_envelope("return", result="sub-result"), "00000000-0000-0000-0000-0000000000d1")
-              .respond(_envelope("return", result="all done"), "parent-fork"))
+        ch = (
+            ScriptedChannel()
+            .respond(_envelope("call", task="sub-task"), "parent-fork")
+            .respond(_envelope("return", result="sub-result"), "00000000-0000-0000-0000-0000000000d1")
+            .respond(_envelope("return", result="all done"), "parent-fork")
+        )
         driver = _make_driver(tmp_path, ch)
 
         tree = driver.run(parent_session, ["main"])
@@ -136,9 +138,11 @@ class TestRunSingleTask:
 
     def test_child_yield_propagates_pause(self, tmp_path, parent_session):
         """Child yields → tree is paused; parent stays in awaiting_child."""
-        ch = (ScriptedChannel()
-              .respond(_envelope("call", task="sub"), "parent-fork")
-              .respond(_envelope("yield", question="Code?"), "00000000-0000-0000-0000-0000000000d1"))
+        ch = (
+            ScriptedChannel()
+            .respond(_envelope("call", task="sub"), "parent-fork")
+            .respond(_envelope("yield", question="Code?"), "00000000-0000-0000-0000-0000000000d1")
+        )
         driver = _make_driver(tmp_path, ch)
 
         tree = driver.run(parent_session, ["main"])
@@ -152,6 +156,7 @@ class TestRunSingleTask:
     def test_invocation_error(self, tmp_path, parent_session):
         def boom(*_):
             raise RuntimeError("CLI not found")
+
         ch = ScriptedChannel().respond_with(boom)
         driver = _make_driver(tmp_path, ch)
 
@@ -164,6 +169,7 @@ class TestRunSingleTask:
     def test_timeout(self, tmp_path, parent_session):
         def slow(*_):
             raise TurnTimeout("turn timed out after 10s", partial="some text")
+
         ch = ScriptedChannel().respond_with(slow)
         driver = _make_driver(tmp_path, ch)
 
@@ -178,8 +184,7 @@ class TestRunSingleTask:
         the driver must surface it as `upstream_rate_limited:` rather than
         the generic envelope-parse failure — so the parent agent can act
         on a transient upstream condition."""
-        synthetic = ("API Error: Server is temporarily limiting requests "
-                     "(not your usage limit) · Rate limited")
+        synthetic = "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited"
         ch = ScriptedChannel().respond(synthetic, "child-rl")
         driver = _make_driver(tmp_path, ch)
 
@@ -206,8 +211,8 @@ class TestRunSingleTask:
 
 # ---------- parallel root tasks ----------
 
-class TestParallel:
 
+class TestParallel:
     def test_two_tasks_complete(self, tmp_path, parent_session):
         # Order across threads is non-deterministic; key on the unique tail of the
         # prompt (which always ends with the task text after a "\n\n").
@@ -215,6 +220,7 @@ class TestParallel:
             "Task: task ALPHA": _envelope("return", result="ALPHA done"),
             "Task: task BRAVO": _envelope("return", result="BRAVO done"),
         }
+
         def respond(_src, prompt, _fork):
             tail = prompt.rsplit("\n\n", 1)[-1]
             body = marker_to_response.get(tail)
@@ -222,11 +228,17 @@ class TestParallel:
                 raise AssertionError(f"unrecognized task tail: {tail!r}")
             sid = "alpha-fork" if "ALPHA" in tail else "bravo-fork"
             return TurnResult(
-                text=body, session_id=sid, duration=0.0,
-                api_request_id="", input_tokens=0, output_tokens=0,
-                cache_read_tokens=0, cache_creation_tokens=0,
+                text=body,
+                session_id=sid,
+                duration=0.0,
+                api_request_id="",
+                input_tokens=0,
+                output_tokens=0,
+                cache_read_tokens=0,
+                cache_creation_tokens=0,
                 total_cost_usd=0.0,
             )
+
         ch = ScriptedChannel().respond_with(respond).respond_with(respond)
         driver = _make_driver(tmp_path, ch)
 
@@ -236,13 +248,13 @@ class TestParallel:
         assert {n.result for n in tree.nodes} == {"ALPHA done", "BRAVO done"}
         assert all(n.status == "complete" for n in tree.nodes)
 
-    def test_propagate_up_serializes_concurrent_callers(
-            self, tmp_path, parent_session, monkeypatch):
+    def test_propagate_up_serializes_concurrent_callers(self, tmp_path, parent_session, monkeypatch):
         """CONC-3: ``_propagate_up`` is guarded by an RLock so concurrent
         producers of ChildDone/ChildFailed can't double-step the same
         ancestor. Verify the lock actually serializes — only one thread
         inside the critical section at a time."""
         import threading
+
         ch = ScriptedChannel().respond(_envelope("return", result="ok"), "x-fork")
         driver = _make_driver(tmp_path, ch)
         tree = Tree(root_session=parent_session, nodes=[], base_depth=0)
@@ -269,10 +281,10 @@ class TestParallel:
                     concurrent -= 1
 
         import agent_callstack.driver as drv_mod
+
         # monkeypatch restores _TreeIndex.build automatically at teardown,
         # so a mid-test failure can't leak the slow stub into other tests.
-        monkeypatch.setattr(drv_mod._TreeIndex, "build",
-                            staticmethod(slow_build))
+        monkeypatch.setattr(drv_mod._TreeIndex, "build", staticmethod(slow_build))
         t1 = threading.Thread(
             target=lambda: driver._propagate_up(tree, None),  # type: ignore[arg-type]
         )
@@ -286,44 +298,42 @@ class TestParallel:
         t2.join()
 
         assert peak == 1, (
-            f"_propagate_up allowed {peak} concurrent threads inside; "
-            f"the CONC-3 lock failed to serialize."
+            f"_propagate_up allowed {peak} concurrent threads inside; the CONC-3 lock failed to serialize."
         )
 
-    def test_one_sibling_raises_others_still_return(
-            self, tmp_path, parent_session):
+    def test_one_sibling_raises_others_still_return(self, tmp_path, parent_session):
         """CORR-104: when one sibling's `_drive` raises (e.g. unexpected
         resolver / OS error), the others must still complete and their
         results survive in the tree. The failing sibling lands in
         ``Failed`` state with the exception text — not lost on the
         worker thread."""
+
         def respond(_src, prompt, _fork):
             tail = prompt.rsplit("\n\n", 1)[-1]
             if "EXPLODE" in tail:
                 raise RuntimeError("simulated worker crash")
             return TurnResult(
                 text=_envelope("return", result="ok"),
-                session_id="ok-fork", duration=0.0,
-                api_request_id="", input_tokens=0, output_tokens=0,
-                cache_read_tokens=0, cache_creation_tokens=0,
+                session_id="ok-fork",
+                duration=0.0,
+                api_request_id="",
+                input_tokens=0,
+                output_tokens=0,
+                cache_read_tokens=0,
+                cache_creation_tokens=0,
                 total_cost_usd=0.0,
             )
-        ch = (ScriptedChannel()
-              .respond_with(respond)
-              .respond_with(respond)
-              .respond_with(respond))
+
+        ch = ScriptedChannel().respond_with(respond).respond_with(respond).respond_with(respond)
         driver = _make_driver(tmp_path, ch)
 
-        tree = driver.run(parent_session,
-                          ["task ALPHA", "task EXPLODE", "task BRAVO"])
+        tree = driver.run(parent_session, ["task ALPHA", "task EXPLODE", "task BRAVO"])
 
         # Three nodes, exactly one failed. The other two return real
         # results — regression-flag for the bug where the first raised
         # exception aborted the result-collection loop.
         statuses = [n.status for n in tree.nodes]
-        assert statuses.count("error") == 1, (
-            f"expected exactly one error node, got {statuses}"
-        )
+        assert statuses.count("error") == 1, f"expected exactly one error node, got {statuses}"
         assert statuses.count("complete") == 2
 
         failed = next(n for n in tree.nodes if n.status == "error")
@@ -332,18 +342,16 @@ class TestParallel:
 
 # ---------- parent-session invariant ----------
 
+
 class TestParentSessionInvariant:
     """The core /call invariant at the Driver layer: `Driver.run(parent=P)`
     forks from P's session, regardless of what env vars are present. The
     Driver must NOT consult process env for parent identity."""
 
-    def test_forks_from_supplied_parent_ignoring_stale_env(self, tmp_path,
-                                                            parent_session,
-                                                            monkeypatch):
+    def test_forks_from_supplied_parent_ignoring_stale_env(self, tmp_path, parent_session, monkeypatch):
         # Plant stale values that resemble the recursive-/call scenario.
         monkeypatch.setenv("CALLSTACK_PARENT_SESSION", "/some/stale/path.jsonl")
-        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID",
-                           "00000000-0000-0000-0000-0000000000ee")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "00000000-0000-0000-0000-0000000000ee")
 
         ch = ScriptedChannel().respond(_envelope("return", result="ok"), "c1")
         driver = _make_driver(tmp_path, ch)
@@ -359,8 +367,8 @@ class TestParentSessionInvariant:
 
 # ---------- max-depth enforcement ----------
 
-class TestMaxDepth:
 
+class TestMaxDepth:
     def test_root_below_limit_proceeds(self, tmp_path, parent_session):
         ch = ScriptedChannel().respond(_envelope("return", result="ok"), "f")
         driver = _make_driver(tmp_path, ch, max_depth=3)
@@ -379,14 +387,15 @@ class TestMaxDepth:
 
 # ---------- resume ----------
 
-class TestResume:
 
+class TestResume:
     def test_yield_persists_then_resume_completes(self, tmp_path, parent_session):
         """Driver.run yields → snapshot saved → resume continues."""
         # Prepare a clone path the locator can resolve. After SEC-003,
         # resolve(cwd=...) only looks in the cwd-matching project dir,
         # so the clone must live there.
         from agent_callstack.session import encode_project_dir
+
         project_dir = tmp_path / "_no_real_projects" / encode_project_dir(str(tmp_path))
         project_dir.mkdir(parents=True)
         clone_path = project_dir / "00000000-0000-0000-0000-0000000000d1.jsonl"
@@ -420,14 +429,17 @@ class TestResume:
     def test_resume_unblocks_parent(self, tmp_path, parent_session):
         """Child yields, blocking parent. After child resume, parent is unblocked."""
         from agent_callstack.session import encode_project_dir
+
         project_dir = tmp_path / "_no_real_projects" / encode_project_dir(str(tmp_path))
         project_dir.mkdir(parents=True, exist_ok=True)
         (project_dir / "00000000-0000-0000-0000-0000000000d4.jsonl").write_text("")
         (project_dir / "00000000-0000-0000-0000-0000000000d1.jsonl").write_text("")
 
-        ch = (ScriptedChannel()
-              .respond(_envelope("call", task="sub"), "00000000-0000-0000-0000-0000000000d4")
-              .respond(_envelope("yield", question="MFA?"), "00000000-0000-0000-0000-0000000000d1"))
+        ch = (
+            ScriptedChannel()
+            .respond(_envelope("call", task="sub"), "00000000-0000-0000-0000-0000000000d4")
+            .respond(_envelope("yield", question="MFA?"), "00000000-0000-0000-0000-0000000000d1")
+        )
         driver = _make_driver(tmp_path, ch)
         tree = driver.run(parent_session, ["main"])
         root, child = tree.nodes[0], tree.nodes[0].children[0]
@@ -446,20 +458,26 @@ class TestResume:
 
 # ---------- paper-v1 instrumentation ----------
 
-class TestInstrumentation:
 
+class TestInstrumentation:
     def test_max_context_tokens_seen_includes_cache_reads(self, tmp_path, parent_session):
         """Effective context = input_tokens + cache_read_tokens. A turn with
         5 uncached input tokens and 20000 cache-read tokens must report peak
         of 20005, not 5 — cache reads are still IN the model's context."""
+
         def respond(_src, _prompt, _fork):
             return TurnResult(
                 text=_envelope("return", result="ok"),
-                session_id="f", duration=0.0,
-                api_request_id="req", input_tokens=5, output_tokens=1,
-                cache_read_tokens=20000, cache_creation_tokens=100,
+                session_id="f",
+                duration=0.0,
+                api_request_id="req",
+                input_tokens=5,
+                output_tokens=1,
+                cache_read_tokens=20000,
+                cache_creation_tokens=100,
                 total_cost_usd=0.0,
             )
+
         ch = ScriptedChannel().respond_with(respond)
         driver = _make_driver(tmp_path, ch)
         tree = driver.run(parent_session, ["t"])
@@ -467,6 +485,7 @@ class TestInstrumentation:
 
     def test_max_context_tokens_seen_tracks_peak(self, tmp_path, parent_session):
         """Node.max_context_tokens_seen should track the max input_tokens across turns."""
+
         def respond(src, prompt, fork):
             # Return increasing then decreasing input_tokens to verify we keep the peak.
             sequence = [1000, 5000, 3000]
@@ -482,12 +501,17 @@ class TestInstrumentation:
                 body = _envelope("return", result="all done")
                 sid = "parent-fork"
             return TurnResult(
-                text=body, session_id=sid, duration=0.0,
+                text=body,
+                session_id=sid,
+                duration=0.0,
                 api_request_id=f"req_{idx}",
-                input_tokens=toks, output_tokens=100,
-                cache_read_tokens=0, cache_creation_tokens=0,
+                input_tokens=toks,
+                output_tokens=100,
+                cache_read_tokens=0,
+                cache_creation_tokens=0,
                 total_cost_usd=0.0,
             )
+
         ch = ScriptedChannel().respond_with(respond).respond_with(respond).respond_with(respond)
         driver = _make_driver(tmp_path, ch)
 
@@ -507,18 +531,26 @@ class TestInstrumentation:
 
     def test_tree_from_dict_rejects_wrong_schema(self):
         with pytest.raises(ValueError, match="schema_version"):
-            Tree.from_dict({
-                "schema_version": "1",
-                "root_session_id": "x", "root_session_file": "/tmp/x",
-                "base_depth": 0, "nodes": [],
-            })
+            Tree.from_dict(
+                {
+                    "schema_version": "1",
+                    "root_session_id": "x",
+                    "root_session_file": "/tmp/x",
+                    "base_depth": 0,
+                    "nodes": [],
+                }
+            )
 
     def test_tree_from_dict_rejects_missing_schema(self):
         with pytest.raises(ValueError, match="schema_version"):
-            Tree.from_dict({
-                "root_session_id": "x", "root_session_file": "/tmp/x",
-                "base_depth": 0, "nodes": [],
-            })
+            Tree.from_dict(
+                {
+                    "root_session_id": "x",
+                    "root_session_file": "/tmp/x",
+                    "base_depth": 0,
+                    "nodes": [],
+                }
+            )
 
     def test_node_from_dict_tolerates_missing_max_context_tokens(self):
         # `max_context_tokens_seen` was added *within* schema v2, so the
@@ -550,6 +582,7 @@ class TestInstrumentation:
 
 # ---------- ARCH-3: deep propagate_up via _TreeIndex ----------
 
+
 class TestDeepPropagate:
     """Pin correctness of the index-driven ancestor walk on a deeper chain
     than other tests reach. Pre-ARCH-3, _propagate_up did three O(N) walks
@@ -568,13 +601,12 @@ class TestDeepPropagate:
         # back up via _propagate_up.
         ch = ScriptedChannel()
         for i in range(depth - 1):
-            ch.respond(_envelope("call", task=f"level-{i+1}"), f"sess-{i}")
+            ch.respond(_envelope("call", task=f"level-{i + 1}"), f"sess-{i}")
         # Leaf yields:
-        ch.respond(_envelope("yield", question="ok?"), f"sess-{depth-1}")
+        ch.respond(_envelope("yield", question="ok?"), f"sess-{depth - 1}")
         # After resume(): leaf returns, then ancestors return in unwind order
         # (deepest ancestor first up to the root).
-        ch.respond(_envelope("return", result="leaf-after-resume"),
-                   f"sess-{depth-1}")
+        ch.respond(_envelope("return", result="leaf-after-resume"), f"sess-{depth - 1}")
         for i in reversed(range(depth - 1)):
             ch.respond(_envelope("return", result=f"r{i}"), f"sess-{i}")
 
@@ -583,7 +615,7 @@ class TestDeepPropagate:
 
         # After run(): the whole chain is built but stalled on the leaf yield.
         # Each ancestor is AwaitingChild; leaf is AwaitingUser.
-        leaf_sid = f"sess-{depth-1}"
+        leaf_sid = f"sess-{depth - 1}"
         leaf = tree.find_by_session(leaf_sid)
         assert leaf is not None
         assert leaf.state.kind == "awaiting_user"
@@ -596,12 +628,9 @@ class TestDeepPropagate:
         # right result.
         node = tree.nodes[0]
         for i in range(depth - 1):
-            assert node.state.kind == "done", \
-                f"level {i} stuck in {node.state.kind}"
-            assert len(node.children) == 1, \
-                f"level {i} expected 1 child, got {len(node.children)}"
-            assert node.result == f"r{i}", \
-                f"level {i} result was {node.result!r}"
+            assert node.state.kind == "done", f"level {i} stuck in {node.state.kind}"
+            assert len(node.children) == 1, f"level {i} expected 1 child, got {len(node.children)}"
+            assert node.result == f"r{i}", f"level {i} result was {node.result!r}"
             node = node.children[0]
         assert node.state.kind == "done"
         assert node.result == "leaf-after-resume"
@@ -624,7 +653,8 @@ class TestTreeIndexMissingClone:
 
         def mk(node_id: str, clone: Path | None) -> Node:
             n = Node(
-                id=node_id, task=node_id,
+                id=node_id,
+                task=node_id,
                 state=st.Pending(parent_session_id="root", task=node_id),
             )
             if clone is not None:
@@ -653,12 +683,12 @@ class TestTreeIndexMissingClone:
         assert idx.parent_file_of[id(a)] == root_file
         assert idx.parent_file_of[id(b)] == a_clone
         assert idx.parent_file_of[id(c)] == root_file, (
-            f"C's parent_file leaked to grandparent: {idx.parent_file_of[id(c)]} "
-            f"(expected root sentinel {root_file})"
+            f"C's parent_file leaked to grandparent: {idx.parent_file_of[id(c)]} (expected root sentinel {root_file})"
         )
 
 
 # ---------- Timeout state (PRD: don't seal report.yaml prematurely) ----------
+
 
 class TestTimeoutState:
     """Timeout is the explicit terminal state recorded by
