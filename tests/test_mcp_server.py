@@ -153,6 +153,118 @@ class TestCallToolGuards:
         assert "cannot be combined" in env["results"][0]["error"]
 
 
+class TestResumeToolGuards:
+    """M-A2: resume() must apply the SAME cwd hardening as call() —
+    {PWD} expansion, canonicalization, and sensitive-prefix gating —
+    because it accepts the same conceptual `cwd` parameter. Before the
+    fix it passed the raw cwd straight through, so a {PWD} token was
+    taken literally and /etc / ~/.ssh were never refused. These tests
+    pin the parity (and the two deliberate divergences: cross-project
+    cwd stays allowed, and an empty cwd still triggers cross-project
+    session discovery)."""
+
+    _UUID = "12345678-1234-1234-1234-123456789abc"
+
+    def _patch_caller(self, monkeypatch, captured: dict):
+        """Replace _build_caller with a stub that records the cwd it was
+        handed and whose .resume returns a Result without spawning claude."""
+        class _ResumeStub:
+            def resume(self, _token, _reply):
+                return _ok_result("resumed")
+
+        def _factory(session, model, cwd, timeout, invoke_id, log_dir):
+            captured["build_cwd"] = cwd
+            return _ResumeStub()
+
+        monkeypatch.setattr(mcp_server, "_build_caller", _factory)
+
+    def _patch_locator(self, monkeypatch, captured: dict, clone: Path):
+        """Replace SessionLocator with a fake that records the cwd passed to
+        resolve() and returns a fixed clone path (bypassing the real disk
+        scan)."""
+        class _FakeLocator:
+            def resolve(self, _session_id, cwd=None):
+                captured["locate_cwd"] = cwd
+                return clone
+
+        monkeypatch.setattr(mcp_server, "SessionLocator", lambda: _FakeLocator())
+
+    @pytest.mark.asyncio
+    async def test_pwd_substitution_expands_for_explicit_cwd(
+        self, tmp_path, monkeypatch,
+    ):
+        """An explicit {PWD}/sibling cwd must be expanded and canonicalized
+        before it reaches the caller AND the session locator — the same
+        contract call() enforces."""
+        sibling = tmp_path / "sibling"
+        sibling.mkdir()
+        monkeypatch.chdir(tmp_path)
+        captured: dict = {}
+        self._patch_caller(monkeypatch, captured)
+        self._patch_locator(monkeypatch, captured, sibling / "clone.jsonl")
+        raw = await mcp_server.resume(
+            resume_session=self._UUID, user_reply="hi", cwd="{PWD}/sibling",
+        )
+        env = json.loads(raw)
+        # resume() merges the single Result envelope flat into its response.
+        assert env["status"] == "complete"
+        # Both the caller and the locator received the expanded, real path.
+        assert Path(captured["build_cwd"]).resolve() == sibling.resolve()
+        assert Path(captured["locate_cwd"]).resolve() == sibling.resolve()
+
+    @pytest.mark.asyncio
+    async def test_nonexistent_cwd_returns_structured_error(
+        self, tmp_path, monkeypatch,
+    ):
+        """A bad cwd must yield a structured error envelope (not a crash)
+        and must short-circuit BEFORE building a caller — parity with
+        call()'s pre-spawn validation."""
+        monkeypatch.chdir(tmp_path)
+        built: list = []
+        monkeypatch.setattr(
+            mcp_server, "_build_caller",
+            lambda *a, **kw: built.append(1),
+        )
+        raw = await mcp_server.resume(
+            resume_session=self._UUID, user_reply="hi", cwd="{PWD}/nope",
+        )
+        env = json.loads(raw)
+        assert env["status"] == "error"
+        assert "not an existing directory" in env["error"]
+        assert built == [], "must not build a caller when cwd is invalid"
+
+    @pytest.mark.asyncio
+    async def test_sensitive_prefix_refused(self, tmp_path, monkeypatch):
+        """resume() must refuse a sensitive system location (/etc) just as
+        call() does — the gate cannot be bypassed via the resume path."""
+        monkeypatch.chdir(tmp_path)
+        raw = await mcp_server.resume(
+            resume_session=self._UUID, user_reply="hi", cwd="/etc",
+        )
+        env = json.loads(raw)
+        assert env["status"] == "error"
+        assert "sensitive" in env["error"]
+
+    @pytest.mark.asyncio
+    async def test_empty_cwd_preserves_cross_project_discovery(
+        self, tmp_path, monkeypatch,
+    ):
+        """WHY: SessionLocator.resolve only does its cross-project full scan
+        when cwd is None. A resumed `fresh` cross-project session lives
+        outside the parent project, so when the caller passes no cwd we must
+        forward None — NOT the parent project folder _resolve_cwd defaults
+        to — or that session becomes unfindable."""
+        monkeypatch.chdir(tmp_path)
+        captured: dict = {}
+        self._patch_caller(monkeypatch, captured)
+        self._patch_locator(monkeypatch, captured, tmp_path / "clone.jsonl")
+        await mcp_server.resume(resume_session=self._UUID, user_reply="hi")
+        assert captured["locate_cwd"] is None, (
+            "empty cwd must reach SessionLocator.resolve as None to keep "
+            "cross-project session discovery working"
+        )
+
+
 class TestTaskValidation:
     """SEC-102: the MCP boundary caps `len(tasks)` and rejects malformed
     inputs before any subprocess gets spawned. These checks return error

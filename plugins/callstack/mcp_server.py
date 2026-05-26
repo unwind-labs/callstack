@@ -448,10 +448,29 @@ async def resume(resume_session: str, user_reply: str,
 
     Use after a call returned status 'yield' — pass back the session_id and the
     user's answer. The clone_path comes from the same yield envelope."""
-    invoke_id, log_dir = _invocation_identity(cwd)
-    caller = _build_caller("", "", cwd, timeout, invoke_id, log_dir)
-    # Locate the clone path so we can construct a YieldToken.
-    clone = SessionLocator().resolve(resume_session, cwd=cwd or None)
+    # M-A2: apply the same cwd hardening call() does — {PWD} expansion,
+    # symlink canonicalization, existence/dir check, sensitive-prefix gating.
+    # Without this, resume() honored a raw {PWD} token literally and would
+    # happily run inside /etc or ~/.ssh, a divergent contract for the same
+    # conceptual parameter. We do NOT replicate call()'s fork+cross-project
+    # block: resume has no `context` param and legitimately continues a
+    # `fresh` cross-project yielded session, so cross-project cwd is allowed
+    # here (the sensitive-prefix gate still applies).
+    resolved_cwd, cwd_err = _resolve_cwd(cwd)
+    if cwd_err:
+        return json.dumps({
+            "invoke_id": "", "report_path": "",
+            "status": "error", "error": cwd_err,
+        })
+    invoke_id, log_dir = _invocation_identity(resolved_cwd)
+    caller = _build_caller("", "", resolved_cwd, timeout, invoke_id, log_dir)
+    # Locate the clone path so we can construct a YieldToken. Pass None when
+    # the caller gave no explicit cwd: SessionLocator.resolve only does the
+    # cross-project full scan when cwd is None, and a resumed `fresh`
+    # cross-project session may live outside the parent project. An explicit
+    # cwd stays caller-scoped, now canonicalized to match call()'s contract.
+    locate_cwd = resolved_cwd if cwd else None
+    clone = SessionLocator().resolve(resume_session, cwd=locate_cwd)
     envelope = {"invoke_id": invoke_id, "report_path": _report_path(log_dir, invoke_id)}
     if clone is None:
         envelope.update({"status": "error",
