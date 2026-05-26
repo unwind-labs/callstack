@@ -168,6 +168,18 @@ class TestParentProjectCwd:
         f = _factory(explicit_cwd=str(tmp_path / "explicit"))
         assert f.parent_project_cwd() == str(tmp_path / "explicit")
 
+    def test_partial_root_env_treated_as_root_here_too(self, tmp_path,
+                                                       monkeypatch):
+        # L1: parent_project_cwd() and context() must agree on the nested
+        # predicate. With only ROOT_INVOKE_ID set, root_identity() is None, so
+        # this is a root call — parent_project_cwd() must use explicit_cwd, not
+        # getcwd() (the nested branch). Previously this method used a looser
+        # predicate (invoke_id alone) and would wrongly return getcwd().
+        monkeypatch.setenv(ENV_ROOT_INVOKE_ID, "root-iv")
+        monkeypatch.chdir(tmp_path)
+        f = _factory(explicit_cwd=str(tmp_path / "explicit"))
+        assert f.parent_project_cwd() == str(tmp_path / "explicit")
+
     def test_root_falls_back_to_getcwd_without_explicit_cwd(self, tmp_path,
                                                             monkeypatch):
         monkeypatch.chdir(tmp_path)

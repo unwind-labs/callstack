@@ -184,6 +184,75 @@ async def test_finished_unreconciled_runs_are_reaped_on_next_start():
 
 
 @pytest.mark.asyncio
+async def test_polled_pending_result_survives_a_sibling_start():
+    """Regression for H1: a run that was reconciled-to-Pending must keep its
+    result even if it finishes before the next poll AND an unrelated `start`
+    runs in between. Earlier, `start`'s reaper dropped any finished entry —
+    including a polled one whose caller was about to ask for it — stranding the
+    `MultiResult` and turning the next `reconcile` into a spurious `NotFound`.
+
+    Sequence: start A (gated) -> reconcile A (short) => Pending -> release &
+    finish A -> start B -> reconcile A MUST be Done with A's original result."""
+    runs = BackgroundRuns()
+    gate = threading.Event()
+    _start(runs, _StubCaller(results=[_ok("A-result")], gate=gate),
+           invoke_id="a", report_path="/tmp/a.yaml")
+
+    # Caller polls A while it's still running -> Pending pins the entry.
+    assert isinstance(await runs.reconcile("a", timeout=0.05), Pending)
+
+    # A finishes before the caller's next poll.
+    gate.set()
+    task_a = runs.task_for("a")
+    assert task_a is not None
+    await task_a
+    assert task_a.done()
+
+    # An unrelated run is launched (this is what used to reap A).
+    assert isinstance(
+        _start(runs, _StubCaller(results=[_ok("B-result")]), invoke_id="b"),
+        Started,
+    )
+    # A's finished-but-pinned result must NOT have been reaped away.
+    assert "a" in runs
+
+    # The caller's next poll delivers A's original result, not NotFound.
+    outcome = await runs.reconcile("a", timeout=5)
+    assert isinstance(outcome, Done), f"expected Done, got {type(outcome).__name__}"
+    assert outcome.result.results[0].value == "A-result"
+    assert "a" not in runs
+    # Drain B.
+    await runs.reconcile("b", timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_cap_counts_inflight_not_finished_undelivered():
+    """The cap bounds live (subprocess-holding) runs, not finished ones still
+    parked for delivery. A run that finished after being polled-to-Pending must
+    not consume a cap slot — otherwise the cap fix that keeps it parked (H1)
+    would deadlock new launches."""
+    runs = BackgroundRuns(max_outstanding=lambda: 1)
+    gate = threading.Event()
+    _start(runs, _StubCaller(results=[_ok()], gate=gate), invoke_id="a")
+    # Poll -> Pending pins A; then let A finish.
+    assert isinstance(await runs.reconcile("a", timeout=0.05), Pending)
+    gate.set()
+    task_a = runs.task_for("a")
+    assert task_a is not None
+    await task_a
+    # A is finished-but-pinned (still in registry). Under cap=1 a naive
+    # all-entries count would reject B; the in-flight count is 0, so B starts.
+    assert "a" in runs
+    assert isinstance(
+        _start(runs, _StubCaller(results=[_ok()]), invoke_id="b"),
+        Started,
+    )
+    # Drain.
+    await runs.reconcile("a", timeout=5)
+    await runs.reconcile("b", timeout=5)
+
+
+@pytest.mark.asyncio
 async def test_default_cap_reads_env(monkeypatch):
     """With no injected provider, the cap is read from CALLSTACK_MAX_BACKGROUND
     *per start*, so a host changing it mid-process is honored."""

@@ -249,8 +249,3 @@ def own_session() -> Optional[str]:
 
 def claude_code_session() -> Optional[str]:
     return os.environ.get(ENV_CLAUDE_SESSION)
-
-
-def in_nested_invocation() -> bool:
-    """True iff the env claims we're inside an already-running invocation."""
-    return os.environ.get(ENV_ROOT_INVOKE_ID) is not None

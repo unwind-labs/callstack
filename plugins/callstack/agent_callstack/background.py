@@ -100,6 +100,13 @@ class _Run:
     report_path: str
     log_dir: Path
     invoke_id: str
+    # Set True once `reconcile` has returned `Pending` for this run, i.e. a
+    # caller is actively polling it. A polled run's result is pinned in the
+    # registry until the next `reconcile` delivers it — `reap` must never drop
+    # it (doing so would strand the `MultiResult`). Distinguishes an
+    # awaited-will-poll-again run from a fire-and-forget one that was never
+    # reconciled.
+    polled: bool = False
 
 
 class BackgroundRuns:
@@ -123,16 +130,24 @@ class BackgroundRuns:
               tasks: Sequence[str], context: str,
               report_path: str, log_dir: Path) -> StartOutcome:
         """Schedule `caller.call_many(tasks, context=...)` on a worker thread
-        and park it under `invoke_id`. First reaps finished-but-unreconciled
+        and park it under `invoke_id`. First reaps abandoned fire-and-forget
         runs (so a host that fires fast background calls and never awaits them
-        doesn't trip the cap), then enforces the cap. Returns `Started` on
-        success or `CapReached` when the registry is full.
+        doesn't trip the cap), then enforces the cap against *in-flight* runs
+        only. Returns `Started` on success or `CapReached` when the cap is hit.
+
+        The cap counts in-flight (not-yet-finished) runs rather than all parked
+        entries: a finished run holds only a cheap `MultiResult`, not the
+        ~0.5–2 GB `claude` subprocess the cap exists to bound. Counting
+        finished-undelivered runs against the cap would force `reap` to drop
+        them to free slots — and that is exactly what would strand a polled
+        run's result (see `_Run.polled` / `reap`).
 
         Must be called with a running event loop (it creates a task)."""
         self.reap()
         cap = self._max_outstanding()
-        if len(self._runs) >= cap:
-            return CapReached(cap=cap, outstanding=len(self._runs))
+        inflight = self._inflight()
+        if inflight >= cap:
+            return CapReached(cap=cap, outstanding=inflight)
         task: "asyncio.Task[MultiResult]" = asyncio.create_task(
             asyncio.to_thread(caller.call_many, list(tasks), context=context)
         )
@@ -162,6 +177,9 @@ class BackgroundRuns:
             )
         except asyncio.TimeoutError:
             # Healthy and still running — keep the entry, do NOT finalize.
+            # Pin it: a caller is now polling, so even if the task finishes
+            # before the next reconcile, `reap` must not drop its result.
+            run.polled = True
             return Pending(invoke_id, run.report_path)
         except Exception as e:
             self._runs.pop(invoke_id, None)
@@ -179,15 +197,26 @@ class BackgroundRuns:
         return Done(invoke_id, run.report_path, multi)
 
     def reap(self) -> None:
-        """Drop registry entries whose task already finished but was never
-        reconciled via `reconcile`. Their results are unreachable (no caller is
-        listening) so they shouldn't burn a slot against the cap. Any pending
-        exception is consumed so asyncio doesn't warn at GC."""
-        stale = [iid for iid, r in self._runs.items() if r.task.done()]
+        """Drop finished runs that were never polled — i.e. fire-and-forget
+        calls a host started and then abandoned. Their results are unreachable
+        (no caller is listening) so they shouldn't linger in the registry.
+
+        A `reconcile` that returned `Pending` pins the entry (`_Run.polled`),
+        so its result survives here until the next `reconcile` delivers it.
+        Only `done() and not polled` entries are truly abandoned. Any pending
+        exception on a reaped task is consumed so asyncio doesn't warn at GC."""
+        stale = [iid for iid, r in self._runs.items()
+                 if r.task.done() and not r.polled]
         for iid in stale:
             run = self._runs.pop(iid)
             if not run.task.cancelled():
                 run.task.exception()  # consume so asyncio stays quiet
+
+    def _inflight(self) -> int:
+        """Count of runs whose task has not yet finished. This is what the
+        cap bounds — a finished-but-undelivered run holds only its result, not
+        a live subprocess."""
+        return sum(1 for r in self._runs.values() if not r.task.done())
 
     def task_for(self, invoke_id: str) -> "Optional[asyncio.Task[MultiResult]]":
         """The asyncio.Task backing a parked run, or None. Lets an advanced

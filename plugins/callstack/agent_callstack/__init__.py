@@ -62,7 +62,6 @@ from .results import (
 )
 from .session import PROJECTS_DIR, SessionLocator, SessionRef, encode_project_dir
 from .shutdown import install_shutdown_hooks as _install_shutdown_hooks
-from .terminal_wait import wait_for_terminal_signals
 from .trace import TraceWriter, TreeStore
 
 

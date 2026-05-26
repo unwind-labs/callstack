@@ -50,12 +50,15 @@ class InvocationFactory:
         fresh calls where `explicit_cwd` is the child's target, not the
         parent's project. Falls back through env, explicit cwd, then
         `os.getcwd()`."""
-        # We're inside a nested invocation iff the parent stamped its root
-        # identity into our env. ENV_ROOT_INVOKE_ID is the canonical "we're
-        # nested" signal; the legacy ENV_PARENT_SESSION env var was removed
-        # (its inherited value caused the regression where grandchildren
-        # forked from root instead of their immediate parent).
-        if env.in_nested_invocation():
+        # We're inside a nested invocation iff the parent stamped a *complete*
+        # root identity into our env. Use the same predicate as `context()`
+        # below — `root_identity()` requires BOTH ENV_ROOT_INVOKE_ID and
+        # ENV_ROOT_LOG_DIR — so a partial env (one var set) is treated as root
+        # by both methods rather than nested here and root there (L1). The
+        # legacy ENV_PARENT_SESSION env var was removed (its inherited value
+        # caused the regression where grandchildren forked from root instead
+        # of their immediate parent).
+        if env.root_identity() is not None:
             try:
                 # The MCP server's os.getcwd() is reliably the caller's
                 # project folder; trust it over explicit_cwd (which may be a
