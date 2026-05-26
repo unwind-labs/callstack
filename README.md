@@ -276,12 +276,14 @@ Claude Code stores each conversation as a JSONL session file on disk.
 When you `/call` with the default `context="fork"`, the runtime (the `agent_callstack` package) discovers the parent's session file (via `CLAUDE_SESSION_ID` env var or by finding the most recently modified session JSONL in the caller's project) and spawns a forked child:
 
 ```
-claude --resume <session-id> --fork-session \
+claude --resume <session-id> --fork-session --session-id <uuid> \
        --output-format stream-json --input-format stream-json \
        --permission-prompt-tool stdio
 ```
 
 `--fork-session` creates an independent copy of the session — the child wakes up with the parent's full message history plus the new task appended. It doesn't know it's a fork. It just continues the conversation.
+
+`--session-id <uuid>` pins the forked child's own session id to a UUID the runtime preallocates, instead of letting Claude Code assign one. That id is also stamped into the child's environment (`CALLSTACK_OWN_SESSION`), so the child's MCP server can identify its own session deterministically rather than guessing by JSONL mtime; a hard guard refuses to continue if the two disagree.
 
 With `context="fresh"` the runtime drops `--resume` and `--fork-session`, so `claude` starts a brand-new session. Only the task string crosses the boundary. The same NDJSON protocol still drives it, so fresh children retain `call`/`yield`/`return` semantics, depth, and report grafting — just without inherited context. Nested calls *inside* a fresh child still fork from that child's session (a fresh root can grow a normal sub-tree of forks beneath it).
 
@@ -316,7 +318,7 @@ The parent asks the user, then calls `resume(resume_session="abc-123", user_repl
 The child runs, does its work, and emits exactly one JSON envelope wrapped in a fenced ` ```json ` code block as its final output. The `op` field selects one of three operations:
 
 - `{"op": "return", "result": ..., "summary": ..., "next": ...}` — done. The runtime captures the result, saves a trace to `call_traces/`, and hands the compact result back to the parent as JSON. `summary` and `next` are optional.
-- `{"op": "call", "task": "..."}` — the child wants to delegate further. The runtime adds a child node to the execution tree and forks again. Same mechanism, one level deeper (up to depth 64).
+- `{"op": "call", "task": "..."}` — the child wants to delegate further. The runtime adds a child node to the execution tree and forks again. Same mechanism, one level deeper (default depth 10, widenable via `CALLSTACK_MAX_DEPTH` up to a hard ceiling of 32).
 - `{"op": "yield", "question": "..."}` — needs user input. The tree is persisted to disk so the session can be resumed later.
 
 ### Execution tree
@@ -327,15 +329,28 @@ The runtime manages an **execution tree** rather than a linear stack. Each node 
 
 ```
 plugins/callstack/agent_callstack/
-  __init__.py    Public API: call, call_many, resume, Caller, Result
-  state.py       Pure state machine: discriminated unions + step()
-  driver.py      Effect runner: ties channel + state + tree together
-  channel.py     Claude CLI subprocess + NDJSON protocol (the only seam)
-  protocol.py    SYSTEM_INSTRUCTION + envelope parser
-  session.py     SessionLocator: ~/.claude/projects discovery
-  trace.py       TraceWriter (JSONL) + TreeStore (sidecar snapshots)
-  analysis.py    SessionAnalyzer: post-execution structured inspection
+  __init__.py        Public API: call, call_many, resume, Caller, Result
+  state.py           Pure state machine: discriminated unions + step()
+  driver.py          Effect runner: ties channel + state + tree together
+  channel.py         Claude CLI subprocess + NDJSON protocol (the live subprocess seam)
+  testing.py         ScriptedChannel: in-memory channel seam for tests
+  protocol.py        SYSTEM_INSTRUCTION + envelope parser
+  invocation.py      InvocationFactory: root-vs-nested identity decision
+  invocation_ctx.py  Per-invocation context (ids, paths, env snapshot)
+  session.py         SessionLocator: ~/.claude/projects discovery
+  background.py      run_in_background registry + reconcile/reap lifecycle
+  shutdown.py        Signal-handler chaining + active-reporter flushing
+  terminal_wait.py   Pre-seal wait for late return/yield; timeout expiry
+  env.py             Typed readers for all CALLSTACK_* env knobs
+  frames.py          On-disk frame reconciliation + merged-report grafting
+  trace.py           TraceWriter (JSONL) + TreeStore (sidecar snapshots)
+  report.py          InvocationReport facade over the report.yaml
+  reporter.py        LiveReporter: debounced, lock-serialized YAML merge
+  results.py         Terminal-node → Result/CallFailed translation
+  analysis.py        SessionAnalyzer: post-execution structured inspection
 ```
+
+`channel.py` is the live subprocess seam; `testing.py` provides a scripted in-memory channel so the driver and state machine can be tested without spawning `claude`.
 
 ## How is `/call` better than `/fork`?
 
@@ -349,7 +364,7 @@ Both `/call` and Anthropic's experimental `/fork` are built on the same underlyi
 | Observability| None — fork runs in a side panel                           | [unwind](https://pypi.org/project/unwind-labs/): live web UI of the call tree across all sessions |
 | Concurrency  | Implicit                                                   | `CALLSTACK_MAX_CONCURRENT_FORKS` semaphore for wide fan-out            |
 
-**Depth.** `/fork` is one level deep — a fork cannot itself fork. Real workflows nest: "implement app" calls "implement auth module" calls "write JWT middleware". `/call` is recursive (default cap 5 levels), so the whole tree runs as a proper call stack instead of being flattened into the parent.
+**Depth.** `/fork` is one level deep — a fork cannot itself fork. Real workflows nest: "implement app" calls "implement auth module" calls "write JWT middleware". `/call` is recursive (default cap 10 levels, widenable via `CALLSTACK_MAX_DEPTH` up to a hard ceiling of 32), so the whole tree runs as a proper call stack instead of being flattened into the parent.
 
 **Interactivity at every level.** A `/fork` runs in the background and returns a message when done. A `/call` can pause mid-execution with `{"op": "yield", "question": "..."}` and ask the user — at any depth. Auth flows that need an MFA code, refund flows that need a damage assessment, deployments that need a confirmation: the user drops into the exact frame that needs them, then control returns to the stack.
 
@@ -378,6 +393,21 @@ export CALLSTACK_MAX_CONCURRENT_FORKS=24
 ```
 
 Rule of thumb: keep `N × 2 GB` comfortably below total RAM. Excess logical calls queue on the semaphore instead of spawning, so correctness is unaffected — only wall-clock latency.
+
+### All environment knobs
+
+Every knob is read through a typed, clamped reader in [plugins/callstack/agent_callstack/env.py](plugins/callstack/agent_callstack/env.py); an unset, non-numeric, or out-of-range value falls back to the default.
+
+| Env var | Default | Clamp / ceiling | Purpose |
+|---------|---------|-----------------|---------|
+| `CALLSTACK_MAX_DEPTH` | `10` | hard ceiling `32` | Max recursion depth of the call tree. Stamped onto every child so the budget is inherited. |
+| `CALLSTACK_MAX_FANOUT` | `64` | must be `> 0` | Max `len(tasks)` accepted in one `call` at the MCP boundary (DoS guard — each task forks a `claude` process). |
+| `CALLSTACK_MAX_CONCURRENT_FORKS` | `8` | must be `> 0` | Semaphore bounding how many forked `claude` subprocesses run physically at once. |
+| `CALLSTACK_MAX_IN_FLIGHT_TURNS` | `2 × MAX_CONCURRENT_FORKS` (16) | must be `> 0` | Cap on simultaneously in-flight subprocess turns. |
+| `CALLSTACK_MAX_BACKGROUND` | `64` | must be `> 0` | Max `run_in_background=True` invocations parked awaiting `await_call`. Hitting it is a loud error, not a silent eviction. |
+| `CALLSTACK_REPORT_DEBOUNCE_SECS` | `0.25` | `>= 0` | Debounce window before the live reporter flushes a merged `report.yaml`. `0` = synchronous merge. |
+| `CALLSTACK_FINALIZE_WAIT_SECONDS` | `120` | `[0, 600]` | How long the runtime blocks waiting for late `return`/`yield` envelopes before sealing the report. `0` = seal immediately. |
+| `CALLSTACK_ORPHAN_TTL_SECONDS` | `1200` | `[0, 86400]` | Wall-clock age past which a frame's writer is treated as abandoned regardless of `os.kill(pid, 0)` (PID-reuse defense). `0` = rely on liveness probe alone. |
 
 ## Credits
 
