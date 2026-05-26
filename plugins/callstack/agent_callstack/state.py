@@ -281,6 +281,14 @@ def step(state: State, event: Event) -> tuple[State, list[Effect]]:
             return (Failed(error=e, session_id=tsid or sid, partial=p), [])
 
         # ---- AwaitingChild: child terminated, resume ourselves ----
+        # The `cid == ec` guard is defense-in-depth, not a real branch: both
+        # producers of these events (driver._spawn_child and
+        # driver._propagate_up) read child_id straight from the same
+        # AwaitingChild state instance the event is then stepped against, and
+        # _propagate_lock (CONC-3) serializes propagation — so a mismatched id
+        # cannot occur. If one ever did (e.g. a future event queue), it falls
+        # through to the exhaustiveness AssertionError below and fails loud
+        # rather than silently resuming on the wrong child.
         case (AwaitingChild(session_id=sid, child_id=cid),
               ChildDone(child_id=ec, result=res)) if cid == ec:
             return (

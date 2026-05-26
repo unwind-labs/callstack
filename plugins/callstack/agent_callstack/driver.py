@@ -664,9 +664,20 @@ class Driver:
 
     def _spawn_child(self, effect: st.SpawnChild, node: Node,
                      depth: int) -> Optional[st.Event]:
+        # SpawnChild is only emitted by the state machine from the AwaitingChild
+        # transition (state.py: AwaitingTurn + TurnCompleted(Call) -> AwaitingChild
+        # + [SpawnChild]), so the parent node is always AwaitingChild here and
+        # carries the child_id every returned event must echo back. Pin the
+        # invariant once instead of re-deriving it (with a dead else-branch)
+        # at each of the three return sites below.
+        assert isinstance(node.state, st.AwaitingChild), (
+            "SpawnChild dispatched against non-AwaitingChild parent"
+        )
+        child_id = node.state.child_id
+
         if depth + 1 > self.max_depth:
             return st.ChildFailed(
-                child_id=node.state.child_id if isinstance(node.state, st.AwaitingChild) else "",
+                child_id=child_id,
                 error=f"Max call depth ({self.max_depth}) exceeded",
             )
 
@@ -677,15 +688,9 @@ class Driver:
         self._drive(child, effect.parent_session_id, child_parent_file, depth + 1)
 
         if isinstance(child.state, st.Done):
-            return st.ChildDone(
-                child_id=node.state.child_id if isinstance(node.state, st.AwaitingChild) else "",
-                result=child.state.result,
-            )
+            return st.ChildDone(child_id=child_id, result=child.state.result)
         if isinstance(child.state, st.Failed):
-            return st.ChildFailed(
-                child_id=node.state.child_id if isinstance(node.state, st.AwaitingChild) else "",
-                error=child.state.error,
-            )
+            return st.ChildFailed(child_id=child_id, error=child.state.error)
         # Child suspended (yielded) — parent is now blocked downstream.
         return None
 
