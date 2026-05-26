@@ -132,6 +132,18 @@ def _result_from_node(node: Node):
         )
     if s.kind == "failed":
         return CallFailed(error=node.error or "unknown error", partial=node.result)
+    if s.kind in ("timeout", "abandoned"):
+        # Both are legitimate TERMINAL states a top-level node can carry by
+        # the time results are extracted, so neither is "unexpected":
+        #   - timeout:   report.seal() runs terminal_wait.expire_to_timeout
+        #                BEFORE Caller extracts results (__init__.py ~224/274),
+        #                stamping Timeout on any node still waiting for a late
+        #                terminal envelope.
+        #   - abandoned: orphan reconciliation (crashed writer pid) or shutdown
+        #                hardening (atexit/SIGTERM/SIGINT) seals in-flight nodes.
+        # Surface the state's own error so the caller sees WHY it ended, not a
+        # synthetic "unexpected state" string that drops the real message.
+        return CallFailed(error=node.error or s.error, partial=node.result)  # type: ignore[union-attr]
     if s.kind == "awaiting_user":
         # Wraps the leaf the user must answer.
         return CallYielded(
@@ -139,7 +151,8 @@ def _result_from_node(node: Node):
             token=YieldToken(session_id=node.session_id or "",
                              clone_path=node.clone_path or ""),
         )
-    # Should not happen — drive() returned with an in-flight node.
+    # Genuinely unreachable: TERMINAL == done/failed/timeout/abandoned (all
+    # handled above) plus awaiting_user; drive() never returns an in-flight node.
     return CallFailed(error=f"node ended in unexpected state: {s.kind}")
 
 
