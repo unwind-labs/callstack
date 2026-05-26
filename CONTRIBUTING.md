@@ -4,9 +4,12 @@
 
 ```bash
 pip install -e '.[dev]'
-pre-commit install
-pre-commit install --hook-type pre-push   # enables full pytest on push
+pre-commit install --hook-type pre-commit --hook-type pre-push
 ```
+
+A single command installs both gates. `pre-commit install` alone (without
+`--hook-type pre-push`) silently skips the pytest gate, which is why the
+two-stage install above is the canonical setup.
 
 Pre-commit hooks run `ruff check --fix` and `ruff format` on every commit
 (fast — typically <1s). The full `pytest` suite runs on `git push` so commits

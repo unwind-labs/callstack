@@ -23,10 +23,11 @@ where it runs. monkeypatch restores the real environment after each test.
 import os
 
 import pytest
+from agent_callstack.env import ENV_CLAUDE_SESSION
 
 
 @pytest.fixture(autouse=True)
 def _isolate_callstack_env(monkeypatch):
     for name in list(os.environ):
-        if name.startswith("CALLSTACK_") or name == "CLAUDE_CODE_SESSION_ID":
+        if name.startswith("CALLSTACK_") or name == ENV_CLAUDE_SESSION:
             monkeypatch.delenv(name, raising=False)

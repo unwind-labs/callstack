@@ -116,7 +116,7 @@ def new_invoke_id() -> str:
 # detect nested invocations. The `env` module itself stays internal; these
 # specific readers are the supported public surface (DRY-101 keeps the
 # parsing policy in env.py).
-from .env import (  # noqa: E402  # noqa: E402
+from .env import (  # noqa: E402
     ENV_CLAUDE_SESSION,
     ENV_DEPTH,
     ENV_FRAME_KEY,
