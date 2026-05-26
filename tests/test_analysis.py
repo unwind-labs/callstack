@@ -8,6 +8,7 @@ import pytest
 
 from agent_callstack.analysis import (
     SessionAnalyzer, format_duration, format_size, format_tree,
+    _content_preview, _parse_ts,
 )
 
 
@@ -108,12 +109,132 @@ class TestSessionStats:
         assert not called, (
             "session_stats must stream, not materialize via session_messages")
 
+    def test_duplicate_timestamps_do_not_widen_window(self, trace_dir):
+        """Duration is last-minus-first; messages sharing a timestamp must
+        leave the min/max window unchanged (neither earlier nor later), so a
+        burst of same-instant messages doesn't inflate the reported duration."""
+        _write_session(trace_dir, "s1",
+                       {"type": "user", "timestamp": "2026-04-16T10:00:00"},
+                       {"type": "assistant", "timestamp": "2026-04-16T10:00:00"},
+                       {"type": "assistant", "timestamp": "2026-04-16T10:00:00"})
+        stats = SessionAnalyzer().session_stats(trace_dir / "s1.jsonl")
+        assert stats.message_count == 3
+        assert stats.duration == 0.0
+
     def test_missing_file_yields_empty_stats(self, tmp_path):
         """R-M2: streaming reader on an absent file -> zeroed stats, not error."""
         stats = SessionAnalyzer().session_stats(tmp_path / "ghost.jsonl")
         assert stats.message_count == 0
         assert stats.by_type == {}
         assert stats.duration == 0.0
+
+    def test_untimestamped_and_blank_lines_are_tolerated(self, trace_dir):
+        """Live logs interleave blank lines and messages with no/invalid
+        timestamp. Blank lines are skipped by the reader; untimestamped
+        messages still count toward message_count but don't move the time
+        window. The duration here comes only from the two real timestamps."""
+        path = trace_dir / "s1.jsonl"
+        path.write_text(
+            '{"type": "system"}\n'                                   # no timestamp
+            "\n"                                                     # blank line
+            '{"type": "user", "timestamp": "2026-04-16T10:00:00"}\n'
+            '{"type": "assistant", "timestamp": "not-a-date"}\n'      # unparseable ts
+            '{"type": "assistant", "timestamp": "2026-04-16T10:00:03"}\n')
+        stats = SessionAnalyzer().session_stats(path)
+        assert stats.message_count == 4
+        assert stats.duration == 3.0
+
+
+class TestSessionMessages:
+    """session_messages() is the read path the inspect CLI renders rows from;
+    each message's flat text/tool preview is what an operator actually reads,
+    so a wrong preview = wrong displayed trace."""
+
+    def test_extracts_role_text_and_tool(self, trace_dir):
+        _write_session(trace_dir, "s1",
+                       {"type": "user", "timestamp": "2026-04-16T10:00:00",
+                        "message": {"role": "user", "content": "hello there"}},
+                       {"type": "assistant", "timestamp": "2026-04-16T10:00:01",
+                        "message": {"role": "assistant",
+                                    "content": [{"type": "tool_use", "name": "Bash"}]}})
+        msgs = SessionAnalyzer().session_messages(trace_dir / "s1.jsonl")
+        assert [m.role for m in msgs] == ["user", "assistant"]
+        assert msgs[0].text == "hello there"
+        assert msgs[0].tool_name is None
+        assert msgs[1].tool_name == "Bash"
+
+    def test_role_none_when_message_absent(self, trace_dir):
+        """System lines often carry no `message` field at all — role must fall
+        back to None (not raise) so those lines still render as rows."""
+        _write_session(trace_dir, "s1",
+                       {"type": "system", "timestamp": "2026-04-16T10:00:00"})
+        msgs = SessionAnalyzer().session_messages(trace_dir / "s1.jsonl")
+        assert len(msgs) == 1
+        assert msgs[0].role is None
+        assert msgs[0].text == ""
+
+
+class TestContentPreview:
+    """_content_preview turns a raw message into (text, tool_name). It's the
+    single point that decides what shows for every message shape Claude Code
+    emits; an unhandled shape would silently blank out trace rows."""
+
+    def test_plain_string_content(self):
+        assert _content_preview({"message": {"content": "hi"}}) == ("hi", None)
+
+    def test_text_block_in_list(self):
+        obj = {"message": {"content": [{"type": "text", "text": "block text"}]}}
+        assert _content_preview(obj) == ("block text", None)
+
+    def test_tool_use_block_returns_tool_name(self):
+        obj = {"message": {"content": [{"type": "tool_use", "name": "Read"}]}}
+        assert _content_preview(obj) == ("", "Read")
+
+    def test_tool_result_string_content(self):
+        obj = {"message": {"content": [{"type": "tool_result", "content": "output"}]}}
+        assert _content_preview(obj) == ("output", None)
+
+    def test_tool_result_non_string_content(self):
+        """tool_result content can be a list of blocks (not a str); preview
+        must degrade to empty text, never index into a non-str."""
+        obj = {"message": {"content": [
+            {"type": "tool_result", "content": [{"type": "text", "text": "x"}]}]}}
+        assert _content_preview(obj) == ("", None)
+
+    def test_non_dict_block_is_skipped(self):
+        """Mixed list with a stray non-dict entry before the real block must
+        skip the junk, not crash."""
+        obj = {"message": {"content": ["junk", {"type": "text", "text": "real"}]}}
+        assert _content_preview(obj) == ("real", None)
+
+    def test_unknown_block_type_falls_through(self):
+        obj = {"message": {"content": [{"type": "image", "source": "..."}]}}
+        assert _content_preview(obj) == ("", None)
+
+    def test_missing_message_returns_empty(self):
+        assert _content_preview({}) == ("", None)
+
+    def test_text_is_truncated_to_200_chars(self):
+        long = "x" * 500
+        text, _ = _content_preview({"message": {"content": long}})
+        assert len(text) == 200
+
+
+class TestParseTs:
+
+    def test_bad_timestamp_returns_none(self):
+        """_parse_ts must never raise on garbage — a malformed ts in one line
+        can't be allowed to abort reading the whole log."""
+        assert _parse_ts("not-a-date") is None
+
+    def test_empty_returns_none(self):
+        assert _parse_ts(None) is None
+        assert _parse_ts("") is None
+
+    def test_parses_z_suffix_as_utc(self):
+        ts = _parse_ts("2026-04-16T10:00:00Z")
+        assert ts is not None
+        assert ts.utcoffset().total_seconds() == 0
 
 
 class TestParentResolution:
@@ -125,6 +246,29 @@ class TestParentResolution:
     def test_returns_none_if_no_parent(self, trace_dir):
         _write_session(trace_dir, "root", {"type": "user"})
         assert SessionAnalyzer().parent_session_id(trace_dir / "root.jsonl") is None
+
+    def test_missing_file_returns_none(self, tmp_path):
+        assert SessionAnalyzer().parent_session_id(tmp_path / "ghost.jsonl") is None
+
+    def test_skips_blank_and_unparseable_lines(self, trace_dir):
+        """Live session logs may have blank/torn lines before the metadata
+        line — the parent scan must skip them, not give up at the first."""
+        path = trace_dir / "s1.jsonl"
+        path.write_text("\n"
+                        "not json\n"
+                        '{"type": "system"}\n'
+                        '{"parentSessionId": "p1"}\n')
+        assert SessionAnalyzer().parent_session_id(path) == "p1"
+
+    def test_stops_scanning_after_50_lines(self, trace_dir):
+        """The parent id is early metadata; the scan caps at ~50 lines so a
+        huge session log isn't walked end-to-end. A parent buried past the cap
+        is intentionally not found."""
+        path = trace_dir / "s1.jsonl"
+        lines = [json.dumps({"type": "user"}) for _ in range(60)]
+        lines.append(json.dumps({"parentSessionId": "late"}))
+        path.write_text("\n".join(lines) + "\n")
+        assert SessionAnalyzer().parent_session_id(path) is None
 
 
 class TestBuildTree:
@@ -148,6 +292,17 @@ class TestBuildTree:
         f = trace_dir / "call_trace.jsonl"
         f.write_text("")
         assert SessionAnalyzer().build_tree(f) is None
+
+    def test_no_root_when_every_session_has_in_tree_parent(self, trace_dir):
+        """If parent links form a cycle (every session's parent is itself in
+        the trace), there is no root to anchor on — build_tree must return None
+        rather than loop or pick arbitrarily."""
+        f = _write_trace(trace_dir,
+                         {"session_id": "a", "task": "A", "duration_seconds": 1.0},
+                         {"session_id": "b", "task": "B", "duration_seconds": 1.0})
+        _write_session(trace_dir, "a", parent="b")
+        _write_session(trace_dir, "b", parent="a")
+        assert SessionAnalyzer().build_tree(f, root_session=None) is None
 
 
 class TestFormatHelpers:
