@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import threading
 import uuid
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -23,6 +24,13 @@ class TraceWriter:
         self._dir = trace_dir
         self._dir.mkdir(parents=True, exist_ok=True)
         self._file = self._dir / "call_trace.jsonl"
+        # One TraceWriter is shared across the driver's worker threads, which
+        # append concurrently. A single `f.write()` is not guaranteed to be one
+        # syscall once the JSON line exceeds PIPE_BUF, so unsynchronized appends
+        # can interleave and corrupt a line. Serialize writes; the writer is
+        # single-process per invocation, so an in-process lock is sufficient
+        # (no need for the fcntl.lockf the cross-process report merge uses).
+        self._lock = threading.Lock()
 
     def write(
         self,
@@ -60,12 +68,14 @@ class TraceWriter:
             "seed": seed,
             "error": error,
         }
-        # Re-ensure the dir exists: external processes may prune sibling
-        # directories in the trace parent (we've seen this under
-        # ~/.claude/projects/<proj>/), so mkdir-at-init alone isn't enough.
-        self._dir.mkdir(parents=True, exist_ok=True)
-        with open(self._file, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+        line = json.dumps(entry) + "\n"
+        with self._lock:
+            # Re-ensure the dir exists: external processes may prune sibling
+            # directories in the trace parent (we've seen this under
+            # ~/.claude/projects/<proj>/), so mkdir-at-init alone isn't enough.
+            self._dir.mkdir(parents=True, exist_ok=True)
+            with open(self._file, "a") as f:
+                f.write(line)
 
 
 class TreeStore:
