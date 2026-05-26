@@ -110,7 +110,6 @@ from .env import (  # noqa: E402
     ENV_OWN_SESSION,
     ENV_CLAUDE_SESSION,
     ENV_MAX_DEPTH,
-    read_finalize_wait_seconds,
 )
 from .env import max_depth as _default_max_depth  # noqa: E402
 

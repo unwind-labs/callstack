@@ -23,8 +23,6 @@ from pathlib import Path
 from typing import Any, Callable, Literal, Optional, cast
 
 
-CALL_TREE_SCHEMA_VERSION = "2"
-
 from . import state as st
 from .channel import (
     Channel, TurnTimeout,
@@ -35,13 +33,15 @@ from .protocol import parse_envelope
 from .session import SessionRef, count_lines
 from .trace import TraceWriter, TreeStore
 
+CALL_TREE_SCHEMA_VERSION = "2"
+
 
 # PERF-J: single module-level pool sized to the channel's in-flight turn
 # cap. Drives multi-task call_many fan-out without paying the cold-pool
 # construction cost per call. atexit shuts it down politely so pending
 # futures aren't killed mid-write.
 _RUN_POOL: Optional[cf.ThreadPoolExecutor] = None
-_RUN_POOL_LOCK = __import__("threading").Lock()
+_RUN_POOL_LOCK = threading.Lock()
 
 
 def _get_run_pool() -> cf.ThreadPoolExecutor:
@@ -475,22 +475,6 @@ class Driver:
                 self._continue(parent, event, depth, parent_file)
                 node = parent
 
-    @staticmethod
-    def _find_parent(tree: Tree, target: Node) -> Optional[Node]:
-        def walk(n: Node) -> Optional[Node]:
-            for c in n.children:
-                if c is target:
-                    return n
-                hit = walk(c)
-                if hit is not None:
-                    return hit
-            return None
-        for root in tree.nodes:
-            hit = walk(root)
-            if hit is not None:
-                return hit
-        return None
-
     def _persist_if_yielded(self, tree: Tree) -> None:
         for leaf in tree.yielded_leaves():
             if leaf.clone_path:
@@ -712,8 +696,8 @@ class Driver:
 class _TreeIndex:
     """One-shot ancestor index for `_propagate_up`.
 
-    Built by a single DFS over `tree.nodes`; replaces three independent
-    O(N) walks (`_find_parent`, `_depth_of`, `_parent_file_for`) per loop
+    Built by a single DFS over `tree.nodes`; replaces independent
+    O(N) ancestor walks (`_depth_of`, `_parent_file_for`) per loop
     iteration with O(1) dict lookups. Keyed by `id(Node)` because Node
     is mutable and not hashable. Lifetime is the propagate call only;
     don't cache on Tree (children are appended during execution and

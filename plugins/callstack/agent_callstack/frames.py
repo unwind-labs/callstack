@@ -428,9 +428,6 @@ def _graft_node(node_dict: dict, input_text: str, *, depth: int,
     return out
 
 
-# Back-compat alias for the (kind → status) mapping; canonical source is
-# in state._STATUS_BY_KIND. Re-exported here so legacy imports still work.
-from .state import _STATUS_BY_KIND as _STATUS_FROM_STATE  # noqa: E402
 from .state import status_label as _status_label_from_state  # noqa: E402
 
 
