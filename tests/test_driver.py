@@ -524,6 +524,17 @@ class TestInstrumentation:
                 "base_depth": 0, "nodes": [],
             })
 
+    def test_node_from_dict_tolerates_missing_max_context_tokens(self):
+        # `max_context_tokens_seen` was added *within* schema v2, so the
+        # version gate doesn't protect against early-v2 snapshots that
+        # predate the field. resume() deserializes exactly these snapshots,
+        # so a missing key must default (to 0) rather than raise KeyError
+        # and abort the resume. Regression for /recheck H1.
+        d = Node(id="a" * 32, task="t", state=st.Done(result="ok")).to_dict()
+        del d["max_context_tokens_seen"]
+        node = Node.from_dict(d)
+        assert node.max_context_tokens_seen == 0
+
     def test_driver_seed_forwards_to_trace(self, tmp_path, parent_session):
         ch = ScriptedChannel().respond(_envelope("return", result="ok"), "f")
         driver = Driver(

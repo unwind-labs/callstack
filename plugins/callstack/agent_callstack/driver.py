@@ -150,7 +150,7 @@ class Node:
             state=_state_from_dict(d["state"]),
             parent_lines=d.get("parent_lines", 0),
             duration=d.get("duration", 0.0),
-            max_context_tokens_seen=d["max_context_tokens_seen"],
+            max_context_tokens_seen=d.get("max_context_tokens_seen", 0),
             call_type=d.get("call_type", "fork"),
             session_id=d.get("session_id"), clone_path=d.get("clone_path"),
             result=d.get("result"), summary=d.get("summary"),
