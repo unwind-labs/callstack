@@ -1,0 +1,26 @@
+# Pre-commit hooks for callstack.
+#
+# Install: `pip install -e '.[dev]'` then `pre-commit install`.
+# To also enable the push-time test hook: `pre-commit install --hook-type pre-push`.
+#
+# Hooks run on every commit are kept to lint + format (fast). The full pytest
+# suite runs on pre-push instead of pre-commit so per-file commits stay snappy
+# while still gating before publishing — CI is the final backstop.
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.0
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest (full suite, pre-push)
+        entry: pytest -x -q
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+        # Pre-commit stage is intentionally lint-only; tests run on push.

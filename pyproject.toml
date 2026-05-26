@@ -25,6 +25,7 @@ dev = [
     "pytest-asyncio",
     "pytest-cov",
     "hypothesis",
+    "pre-commit",
 ]
 
 [tool.pytest.ini_options]
