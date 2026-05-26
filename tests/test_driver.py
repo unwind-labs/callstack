@@ -237,7 +237,7 @@ class TestParallel:
         assert all(n.status == "complete" for n in tree.nodes)
 
     def test_propagate_up_serializes_concurrent_callers(
-            self, tmp_path, parent_session):
+            self, tmp_path, parent_session, monkeypatch):
         """CONC-3: ``_propagate_up`` is guarded by an RLock so concurrent
         producers of ChildDone/ChildFailed can't double-step the same
         ancestor. Verify the lock actually serializes — only one thread
@@ -269,22 +269,21 @@ class TestParallel:
                     concurrent -= 1
 
         import agent_callstack.driver as drv_mod
-        orig = drv_mod._TreeIndex.build
-        drv_mod._TreeIndex.build = staticmethod(slow_build)  # type: ignore[assignment]
-        try:
-            t1 = threading.Thread(
-                target=lambda: driver._propagate_up(tree, None),  # type: ignore[arg-type]
-            )
-            t2 = threading.Thread(
-                target=lambda: driver._propagate_up(tree, None),  # type: ignore[arg-type]
-            )
-            t1.start()
-            t2.start()
-            gate.set()
-            t1.join()
-            t2.join()
-        finally:
-            drv_mod._TreeIndex.build = orig  # type: ignore[assignment]
+        # monkeypatch restores _TreeIndex.build automatically at teardown,
+        # so a mid-test failure can't leak the slow stub into other tests.
+        monkeypatch.setattr(drv_mod._TreeIndex, "build",
+                            staticmethod(slow_build))
+        t1 = threading.Thread(
+            target=lambda: driver._propagate_up(tree, None),  # type: ignore[arg-type]
+        )
+        t2 = threading.Thread(
+            target=lambda: driver._propagate_up(tree, None),  # type: ignore[arg-type]
+        )
+        t1.start()
+        t2.start()
+        gate.set()
+        t1.join()
+        t2.join()
 
         assert peak == 1, (
             f"_propagate_up allowed {peak} concurrent threads inside; "
@@ -503,9 +502,6 @@ class TestInstrumentation:
     def test_tree_schema_version_in_snapshot(self, tmp_path, parent_session):
         ch = ScriptedChannel().respond(_envelope("yield", question="?"), "00000000-0000-0000-0000-0000000000d1")
         driver = _make_driver(tmp_path, ch)
-        project = tmp_path / "_no_real_projects" / "p"
-        project.mkdir(parents=True)
-        (project / "00000000-0000-0000-0000-0000000000d1.jsonl").write_text("")
         tree = driver.run(parent_session, ["t"])
         assert tree.to_dict()["schema_version"] == "2"
 

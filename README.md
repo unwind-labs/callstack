@@ -319,7 +319,7 @@ The parent asks the user, then calls `resume(resume_session="abc-123", user_repl
 
 The child runs, does its work, and emits exactly one JSON envelope wrapped in a fenced ` ```json ` code block as its final output. The `op` field selects one of three operations:
 
-- `{"op": "return", "result": ..., "summary": ..., "next": ...}` — done. The runtime captures the result, saves a trace to `call_traces/`, and hands the compact result back to the parent as JSON. `summary` and `next` are optional.
+- `{"op": "return", "result": ..., "summary": ..., "next": ...}` — done. The runtime captures the result, appends a trace line to the invocation's `call_trace.jsonl`, and hands the compact result back to the parent as JSON. `summary` and `next` are optional.
 - `{"op": "call", "task": "..."}` — the child wants to delegate further. The runtime adds a child node to the execution tree and forks again. Same mechanism, one level deeper (default depth 10, widenable via `CALLSTACK_MAX_DEPTH` up to a hard ceiling of 32).
 - `{"op": "yield", "question": "..."}` — needs user input. The tree is persisted to disk so the session can be resumed later.
 
@@ -372,7 +372,7 @@ Both `/call` and Anthropic's experimental `/fork` are built on the same underlyi
 
 **Headless.** `/fork` is explicitly disabled in non-interactive runs and the Agent SDK. `/call` uses the same `claude --resume … --fork-session` plumbing but drives it over stdin/stdout NDJSON, so it works headless via `claude -p`. Same primitive, no harness gate.
 
-**Observability.** `/fork` runs in a side panel with no external view. unwind-labs ships [unwind](https://pypi.org/project/unwind-labs/), a Python web UI that tails `~/.claude/projects/*.jsonl` and the runtime's `call_traces/` to render a live call tree across all sessions, with each frame's conversation expandable in a side pane.
+**Observability.** `/fork` runs in a side panel with no external view. unwind-labs ships [unwind](https://pypi.org/project/unwind-labs/), a Python web UI that tails `~/.claude/projects/*.jsonl` and the runtime's `call_trace.jsonl` files to render a live call tree across all sessions, with each frame's conversation expandable in a side pane.
 
 **Wide fan-out under control.** Each forked `claude` subprocess takes ~0.5–2 GB RSS. A logically wide tree can spawn thousands of pending turns; a module-level semaphore bounded by `CALLSTACK_MAX_CONCURRENT_FORKS` (default 8) keeps physical concurrency under the box's RAM. Excess calls queue instead of OOMing.
 

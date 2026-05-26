@@ -129,6 +129,36 @@ class TestRecoverReturnEnvelope:
         # regression back to measuring wait time.
         assert node.duration == pytest.approx(65.206, abs=0.01)
 
+    def test_clock_skew_clamps_recovered_duration_to_zero(self, tmp_path):
+        # If the envelope's timestamp PRECEDES the session-start header
+        # (clock skew between the writer and the fork-creation stamp), the
+        # raw `end - start` arithmetic goes negative. The recovery path
+        # guards with `max(0.0, ...)` (terminal_wait.py) precisely so a
+        # nonsensical negative duration never lands in the merged report.
+        # Pinning the clamp guards against someone dropping the max().
+        clone = tmp_path / "child.jsonl"
+        node = _make_node(clone_path=clone)
+        tree = _make_tree(node, tmp_path)
+
+        envelope_text = _fenced("return", result="ok", summary="s", next="n")
+        # session-start AFTER the envelope -> negative raw duration.
+        session_start = "2026-05-18T15:49:09.206Z"
+        envelope_ts = "2026-05-18T15:48:04.000Z"
+        clone.write_text(_session_header_line(session_start) + "\n")
+
+        def append_late():
+            time.sleep(0.15)
+            with clone.open("a") as fh:
+                fh.write(_assistant_envelope_line(
+                    envelope_text, timestamp=envelope_ts) + "\n")
+        threading.Thread(target=append_late, daemon=True).start()
+
+        wait_for_terminal_signals(tree, wait_budget_seconds=5.0)
+
+        assert isinstance(node.state, st.Done)
+        # Clamped, never negative.
+        assert node.duration == 0.0
+
 
 class TestRecoverYieldEnvelope:
     def test_late_yield_transitions_to_awaiting_user(self, tmp_path):

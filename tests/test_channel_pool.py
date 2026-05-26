@@ -292,7 +292,8 @@ class TestChannelPoolIntegration:
         assert fresh_module_pool.size() == 1
 
         # Second turn: resume on "00000000-0000-0000-0000-0000000000c6", but _run_one_turn raises TurnTimeout.
-        def boom(self_, entry, prompt, timeout, on_session_id, *, do_handshake):
+        def boom(self_, entry, prompt, timeout, on_session_id, *,
+                 do_handshake, preallocated_session_id=None):
             raise TurnTimeout("simulated", partial="")
         monkeypatch.setattr(ClaudeChannel, "_run_one_turn", boom)
 
