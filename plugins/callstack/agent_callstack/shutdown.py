@@ -48,7 +48,16 @@ class _ShutdownFlushable(Protocol):
 
 
 _ACTIVE_REPORTERS: "set[_ShutdownFlushable]" = set()
-_ACTIVE_REPORTERS_LOCK = threading.Lock()
+# RLock, not Lock (M-A1): the SIGTERM/SIGINT handler installed by
+# `_chain_signal_handler` calls `flush_active_reporters`, which acquires
+# this lock. Signals are delivered on the main thread between bytecodes,
+# so one can land while the main thread already holds the lock inside
+# `register_reporter` / `unregister_reporter` / `flush_active_reporters`.
+# With a plain Lock that re-entry self-deadlocks the process during
+# shutdown — exactly when finalization must succeed. RLock permits the
+# same-thread re-acquire; the critical sections are short and never block
+# on other locks, so recursive entry stays bounded.
+_ACTIVE_REPORTERS_LOCK = threading.RLock()
 _HOOKS_INSTALLED = False
 _INSTALL_LOCK = threading.Lock()
 
@@ -78,9 +87,10 @@ def flush_active_reporters() -> None:
     return promptly because the process is on its way down.
 
     Snapshot the set before iterating: ``_emergency_finalize_on_shutdown``
-    does NOT unregister (it can't acquire the registry lock from inside
-    a signal handler), so we must avoid mutating the live set while we
-    walk it."""
+    does NOT unregister, so we copy under the lock and then walk the copy.
+    Even though the registry lock is now an RLock (M-A1) and a re-entrant
+    call from the same thread *could* mutate the set, snapshotting keeps
+    the walk stable regardless of re-entry."""
     with _ACTIVE_REPORTERS_LOCK:
         snapshot = list(_ACTIVE_REPORTERS)
     for reporter in snapshot:

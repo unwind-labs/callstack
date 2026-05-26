@@ -650,6 +650,64 @@ class TestSignalHandlerChain:
         shutdown_mod._chain_signal_handler(signal.SIGTERM)
 
 
+class TestRegistryLockReentrancy:
+    """M-A1: the SIGTERM/SIGINT handler installed by
+    `_chain_signal_handler` calls `flush_active_reporters`, which acquires
+    `_ACTIVE_REPORTERS_LOCK`. Signals are delivered on the main thread
+    *between bytecodes*, so one can land while the main thread already
+    holds that lock inside `register_reporter` / `unregister_reporter` /
+    `flush_active_reporters`. With a non-reentrant `threading.Lock` that
+    re-entry self-deadlocks the process at the worst possible moment —
+    shutdown, when post-mortem finalization MUST succeed. The lock is an
+    `RLock` so the same-thread re-acquire is permitted."""
+
+    def test_registry_lock_permits_same_thread_reacquire(self):
+        # We assert the property via a NON-BLOCKING probe rather than
+        # actually re-entering flush_active_reporters() under the held
+        # lock: a faithful same-thread re-entry that regressed to a plain
+        # Lock would block forever on this very thread, hanging the whole
+        # suite with no way to time it out from inside the stuck thread.
+        # The non-blocking double-acquire captures the exact invariant
+        # (same-thread re-acquire succeeds) without that hang risk.
+        lock = shutdown_mod._ACTIVE_REPORTERS_LOCK
+        assert lock.acquire(blocking=False)
+        try:
+            assert lock.acquire(blocking=False), (
+                "the active-reporter registry lock must be re-entrant on "
+                "the same thread: a signal handler runs on the main thread "
+                "and calls flush_active_reporters(), which re-acquires this "
+                "lock — a plain Lock would deadlock if the signal landed "
+                "while the main thread already held it"
+            )
+            lock.release()
+        finally:
+            lock.release()
+
+    def test_flush_runs_when_main_thread_already_holds_lock(self, tmp_path):
+        """Functional companion to the probe above: holding the registry
+        lock and then driving the *handler's* flush path must complete and
+        actually finalize the registered reporter, not deadlock. Safe to
+        run directly because the lock is now reentrant; if it ever
+        regresses to a plain Lock this test (and the suite) would hang,
+        which is itself a loud signal."""
+        r = _make_reporter(tmp_path)
+        parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
+        node = _running_node("eeee5555")
+        tree = Tree(root_session=parent, nodes=[node], base_depth=0)
+        r(tree)  # one tick so the reporter has a tree to abandon
+
+        # Re-enter flush while already holding the lock — exactly the
+        # signal-arrives-mid-registry-op scenario, on the same thread.
+        with shutdown_mod._ACTIVE_REPORTERS_LOCK:
+            shutdown_mod.flush_active_reporters()
+
+        assert isinstance(node.state, st.Abandoned), (
+            "flush_active_reporters must finalize the reporter even when "
+            "the main thread already held the registry lock when the "
+            "shutdown path re-entered it"
+        )
+
+
 class TestShutdownInstallIsIdempotent:
     """REVIEW-202: shutdown hooks are installed exactly once per process
     by `install_shutdown_hooks()`, called at module-load time on the main
