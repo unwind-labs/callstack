@@ -62,7 +62,7 @@ import time
 import uuid
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Callable, Optional, Protocol
+from typing import Callable, Optional, Protocol, TextIO
 
 from . import env as _env
 
@@ -166,14 +166,21 @@ def allow_all(tool_name: str, input_data: dict) -> dict:
     return {"behavior": "allow", "updatedInput": input_data}
 
 
-def _fire_on_session_id(cb: Callable[[str], None], sid: str) -> None:
+def _fire_on_session_id(cb: Callable[[str], None], sid: str,
+                        log: Optional[TextIO] = None) -> None:
     """SEC-011: invoke an advisory on_session_id callback, surfacing any
-    exception to stderr instead of swallowing silently."""
+    exception to stderr (and the per-turn `log`, when given) instead of
+    swallowing it silently. The callback is an advisory observer, so a raise
+    is logged and never propagated into the turn."""
     try:
         cb(sid)
     except Exception as e:
-        print(f"[callstack] on_session_id callback raised: "
-              f"{type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
+        msg = (f"on_session_id callback raised: "
+               f"{type(e).__name__}: {str(e)[:200]}")
+        print(f"[callstack] {msg}", file=sys.stderr)
+        if log is not None:
+            log.write(msg + "\n")
+            log.flush()
 
 
 class Channel(Protocol):
@@ -251,12 +258,18 @@ class _PooledProcess:
 
 
 class ClaudePool:
-    """Thread-safe LRU pool of `_PooledProcess` keyed by session_id."""
+    """Thread-safe LRU pool of `_PooledProcess` keyed by session_id.
 
-    def __init__(self, max_size: int):
+    `clock` is the monotonic time source stamped onto `last_used` for LRU
+    ordering; injectable so tests can drive eviction order deterministically
+    instead of relying on real sub-millisecond sleeps to separate timestamps."""
+
+    def __init__(self, max_size: int,
+                 clock: Callable[[], float] = time.monotonic):
         self._max_size = max_size
         self._processes: dict[str, _PooledProcess] = {}
         self._lock = threading.Lock()
+        self._clock = clock
 
     @property
     def max_size(self) -> int:
@@ -275,7 +288,7 @@ class ClaudePool:
                 # Close outside the pool lock.
                 dead = entry
             else:
-                entry.last_used = time.monotonic()
+                entry.last_used = self._clock()
                 return entry
         dead.close()
         return None
@@ -289,7 +302,7 @@ class ClaudePool:
         to_close: list[_PooledProcess] = []
         with self._lock:
             entry.session_id = session_id
-            entry.last_used = time.monotonic()
+            entry.last_used = self._clock()
             old = self._processes.pop(session_id, None)
             if old is not None and old is not entry:
                 to_close.append(old)
@@ -846,23 +859,14 @@ class ClaudeChannel:
 
             # Fire early-session-id callback the moment we see one on any
             # message type (system init carries it first; assistant messages
-            # also include it in stream-json output).
+            # also include it in stream-json output). Passing `log` routes
+            # exceptions to both stderr and the per-turn log (SEC-011); the
+            # shared helper keeps this in lockstep with ScriptedChannel.
             if not early_id_fired and on_session_id is not None:
                 early_sid = msg.get("session_id")
                 if isinstance(early_sid, str) and early_sid:
                     early_id_fired = True
-                    try:
-                        on_session_id(early_sid)
-                    except Exception as e:
-                        # SEC-011: advisory observer — never abort the turn,
-                        # but surface what went wrong instead of swallowing
-                        # silently. exc class + short repr lands in stderr
-                        # and the per-turn log.
-                        _msg = (f"on_session_id callback raised: "
-                                f"{type(e).__name__}: {str(e)[:200]}")
-                        print(f"[callstack] {_msg}", file=sys.stderr)
-                        log.write(_msg + "\n")
-                        log.flush()
+                    _fire_on_session_id(on_session_id, early_sid, log)
 
             if mtype == "control_response":
                 continue

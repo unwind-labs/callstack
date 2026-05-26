@@ -2,9 +2,11 @@
 emitted for each turn mode (fork / fresh / resume)."""
 from __future__ import annotations
 
+import io
+
 import pytest
 
-from agent_callstack.channel import ClaudeChannel
+from agent_callstack.channel import ClaudeChannel, _fire_on_session_id
 
 
 @pytest.fixture
@@ -41,3 +43,39 @@ class TestBuildCmd:
     def test_no_model_means_no_model_flag(self):
         cmd = ClaudeChannel()._build_cmd("p", "fresh")
         assert "--model" not in cmd
+
+
+class TestFireOnSessionId:
+    """R-M1: ClaudeChannel and ScriptedChannel share one helper for invoking
+    the advisory on_session_id callback so the exception-handling can't drift.
+    The helper logs a raise to stderr, plus the per-turn log when given, and
+    never propagates into the turn (SEC-011)."""
+
+    def test_success_does_not_log(self, capsys):
+        log = io.StringIO()
+        seen: list[str] = []
+        _fire_on_session_id(seen.append, "sid-1", log)
+        assert seen == ["sid-1"]
+        assert log.getvalue() == ""
+        assert capsys.readouterr().err == ""
+
+    def test_raise_surfaces_to_both_stderr_and_log(self, capsys):
+        log = io.StringIO()
+
+        def boom(_sid: str) -> None:
+            raise ValueError("nope")
+
+        # Must not propagate — advisory observer.
+        _fire_on_session_id(boom, "sid-1", log)
+        logged = log.getvalue()
+        err = capsys.readouterr().err
+        assert "ValueError" in logged and "nope" in logged
+        assert "ValueError" in err and "nope" in err
+
+    def test_raise_without_log_still_hits_stderr(self, capsys):
+        def boom(_sid: str) -> None:
+            raise RuntimeError("kaboom")
+
+        # ScriptedChannel passes no log sink — stderr only, no crash.
+        _fire_on_session_id(boom, "sid-1")
+        assert "RuntimeError" in capsys.readouterr().err

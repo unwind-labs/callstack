@@ -32,6 +32,22 @@ from agent_callstack.channel import (
 # Helpers
 # --------------------------------------------------------------------------
 
+class _FakeClock:
+    """Deterministic monotonic clock: each read advances by a fixed tick, so
+    successive pool register/acquire calls get strictly increasing `last_used`
+    timestamps. T-M2: replaces real time.sleep() gaps, which on a loaded CI
+    host may not advance time.monotonic() enough to guarantee LRU ordering,
+    making which entry counts as 'least recently used' nondeterministic."""
+
+    def __init__(self, start: float = 0.0, tick: float = 1.0):
+        self._now = start
+        self._tick = tick
+
+    def __call__(self) -> float:
+        self._now += self._tick
+        return self._now
+
+
 def _mock_pooled_process() -> _PooledProcess:
     """Build a _PooledProcess wrapping mocks that look alive."""
     proc = MagicMock()
@@ -92,15 +108,14 @@ class TestClaudePool:
         p.proc.terminate.assert_called()
 
     def test_lru_eviction_when_over_cap(self):
-        pool = ClaudePool(max_size=2)
+        # _FakeClock gives each register a strictly increasing last_used, so
+        # s1 is unambiguously the LRU victim (T-M2: no real sleeps).
+        pool = ClaudePool(max_size=2, clock=_FakeClock())
         p1 = _mock_pooled_process()
         p2 = _mock_pooled_process()
         p3 = _mock_pooled_process()
         pool.register("s1", p1)
-        # Force monotonic gap so last_used differs.
-        time.sleep(0.005)
         pool.register("s2", p2)
-        time.sleep(0.005)
         pool.register("s3", p3)  # over cap → evict the LRU (s1)
         assert pool.size() == 2
         assert pool.acquire("s1") is None
@@ -112,13 +127,12 @@ class TestClaudePool:
     def test_lru_eviction_handles_multiple_excess_entries(self):
         """PERF-105: the loop sorts once and pops several entries in a row.
         Verify multi-entry eviction still picks the oldest first."""
-        pool = ClaudePool(max_size=2)
+        pool = ClaudePool(max_size=2, clock=_FakeClock())
         entries: list = []
         for i in range(6):
             p = _mock_pooled_process()
             entries.append(p)
             pool.register(f"s{i}", p)
-            time.sleep(0.001)
         # Only the last two registered (s4, s5) should survive.
         assert pool.size() == 2
         assert pool.acquire("s5") is entries[5]
@@ -250,16 +264,18 @@ class TestChannelPoolIntegration:
         assert set(fresh_module_pool.session_ids()) == {"00000000-0000-0000-0000-0000000000c3", "00000000-0000-0000-0000-0000000000c4"}
 
     def test_lru_eviction_at_pool_cap(self, monkeypatch, fresh_module_pool):
-        # Force a small cap by replacing the pool entirely.
-        small_pool = ClaudePool(max_size=2)
+        # Force a small cap by replacing the pool entirely. _FakeClock makes
+        # each turn's register() last_used strictly increasing (T-M2: no real
+        # sleeps), so sA is unambiguously the evicted LRU entry.
+        small_pool = ClaudePool(max_size=2, clock=_FakeClock())
         monkeypatch.setattr(ch_mod, "_pool", small_pool)
 
         rec = _SpawnAndTurnRecorder(session_ids=["00000000-0000-0000-0000-0000000000c3", "00000000-0000-0000-0000-0000000000c4", "00000000-0000-0000-0000-0000000000c5"])
         ch = ClaudeChannel()
         rec.patch(monkeypatch, ch)
 
-        ch.run_turn("00000000-0000-0000-0000-0000000000c1", "ta", mode="fork"); time.sleep(0.005)
-        ch.run_turn("00000000-0000-0000-0000-0000000000c1", "tb", mode="fork"); time.sleep(0.005)
+        ch.run_turn("00000000-0000-0000-0000-0000000000c1", "ta", mode="fork")
+        ch.run_turn("00000000-0000-0000-0000-0000000000c1", "tb", mode="fork")
         ch.run_turn("00000000-0000-0000-0000-0000000000c1", "tc", mode="fork")
 
         # sA (oldest) should have been evicted.
