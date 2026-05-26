@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
-from agent_callstack.trace import TraceWriter, TreeStore
+import pytest
+
+from agent_callstack.trace import TraceWriter, TreeStore, _json_default
 
 
 def _base_kwargs(**overrides):
@@ -161,3 +164,43 @@ class TestTreeStore:
         assert len(winners) == 1, f"expected one winner, got {len(winners)}"
         assert winners[0] == snapshot
         assert len(losers) == len(threads) - 1
+
+
+@dataclass
+class _Snap:
+    a: int
+    b: str
+
+
+class TestJsonDefault:
+    """_json_default is the json.dump fallback for TreeStore snapshots. It must
+    serialize the two non-JSON-native types the tree carries — dataclasses and
+    Paths — and raise TypeError for anything else so a silently-dropped field
+    can't corrupt a snapshot the resume path depends on."""
+
+    def test_dataclass_instance_becomes_dict(self):
+        assert _json_default(_Snap(a=1, b="x")) == {"a": 1, "b": "x"}
+
+    def test_path_becomes_string(self):
+        p = Path("/tmp/x")
+        assert _json_default(p) == str(p)
+
+    def test_dataclass_type_is_not_serialized(self):
+        # The class object (not an instance) must NOT be asdict'd — it falls
+        # through to the TypeError, guarding the `not isinstance(obj, type)`.
+        with pytest.raises(TypeError):
+            _json_default(_Snap)
+
+    def test_unsupported_type_raises_typeerror(self):
+        with pytest.raises(TypeError, match="not JSON serializable"):
+            _json_default(object())
+
+    def test_used_as_json_dump_default_for_snapshot(self, tmp_path):
+        """End-to-end: a snapshot containing a dataclass + Path round-trips
+        through TreeStore.save (which wires _json_default as the dump default)."""
+        clone = tmp_path / "clone.jsonl"
+        clone.write_text("")
+        store = TreeStore()
+        store.save(clone, {"snap": _Snap(a=2, b="y"), "where": tmp_path})
+        loaded = store.load(clone)
+        assert loaded == {"snap": {"a": 2, "b": "y"}, "where": str(tmp_path)}
