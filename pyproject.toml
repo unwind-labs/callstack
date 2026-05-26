@@ -4,6 +4,11 @@ version = "0.1.1"
 description = "A call stack for AI agents to run deeply nested workflows reliably."
 requires-python = ">=3.10"
 
+[project.optional-dependencies]
+dev = [
+    "hypothesis",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["plugins/callstack"]
