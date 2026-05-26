@@ -94,8 +94,13 @@ def _report_path(log_dir: Path, invoke_id: str) -> str:
     return str(log_dir / invoke_id / "report.yaml")
 
 
-def _invocation_identity(cwd: str) -> tuple[str, Path]:
-    """Return the (invoke_id, log_dir) this MCP call will actually write to.
+def _resolve_invocation_identity(cwd: str) -> tuple[str, Path]:
+    """Resolve the (invoke_id, log_dir) this MCP call will write to.
+
+    NOT a pure accessor: on stale-env rejection this MUTATES os.environ
+    (pops CALLSTACK_ROOT_*) as a normalization side effect — see DRY-102
+    below. Named `_resolve_*` (like `_resolve_cwd`) to signal that it
+    actively computes-and-normalizes rather than just reads.
 
     If the process env carries `CALLSTACK_ROOT_*` it means we're running
     inside an already-live invocation (nested MCP call) — reuse that root's
@@ -341,7 +346,7 @@ async def call(tasks: list[str], timeout: int = 300, session_id: str = "",
             }],
         }, indent=2)
 
-    invoke_id, log_dir = _invocation_identity(resolved_cwd)
+    invoke_id, log_dir = _resolve_invocation_identity(resolved_cwd)
     caller = _build_caller(session_id, model, resolved_cwd, timeout,
                            invoke_id, log_dir)
     report_path = _report_path(log_dir, invoke_id)
@@ -462,7 +467,7 @@ async def resume(resume_session: str, user_reply: str,
             "invoke_id": "", "report_path": "",
             "status": "error", "error": cwd_err,
         })
-    invoke_id, log_dir = _invocation_identity(resolved_cwd)
+    invoke_id, log_dir = _resolve_invocation_identity(resolved_cwd)
     caller = _build_caller("", "", resolved_cwd, timeout, invoke_id, log_dir)
     # Locate the clone path so we can construct a YieldToken. Pass None when
     # the caller gave no explicit cwd: SessionLocator.resolve only does the

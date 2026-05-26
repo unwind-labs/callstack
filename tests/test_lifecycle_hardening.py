@@ -245,7 +245,7 @@ class TestFix4ReportWarning:
         assert "does not exist" in envelope["report_warning"]
 
 
-# ---------- Fix #5 — _invocation_identity validates inherited env ----------
+# ---------- Fix #5 — _resolve_invocation_identity validates inherited env ----------
 
 class TestFix5EnvValidation:
 
@@ -259,7 +259,7 @@ class TestFix5EnvValidation:
         monkeypatch.setenv("CALLSTACK_ROOT_LOG_DIR",
                            str(tmp_path / "no-such-dir"))
 
-        invoke_id, log_dir = mcp_server._invocation_identity(str(tmp_path))
+        invoke_id, log_dir = mcp_server._resolve_invocation_identity(str(tmp_path))
 
         # We must have minted a fresh id, NOT reused the stale one.
         assert invoke_id != "20300101T000000-deadbeef"
@@ -279,13 +279,13 @@ class TestFix5EnvValidation:
         monkeypatch.setenv("CALLSTACK_ROOT_INVOKE_ID", live_invoke_id)
         monkeypatch.setenv("CALLSTACK_ROOT_LOG_DIR", str(live_root))
 
-        invoke_id, log_dir = mcp_server._invocation_identity(str(tmp_path))
+        invoke_id, log_dir = mcp_server._resolve_invocation_identity(str(tmp_path))
 
         assert invoke_id == live_invoke_id
         assert log_dir == live_root
 
     def test_stale_env_is_cleared_so_caller_agrees(self, tmp_path, monkeypatch):
-        """DRY-102: when _invocation_identity rejects stale env and mints a
+        """DRY-102: when _resolve_invocation_identity rejects stale env and mints a
         fresh id, it must also clear the stale env vars. Otherwise the
         downstream `Caller._resolve_invocation_context` (which reads env
         directly) would still treat the invocation as nested under the
@@ -296,7 +296,7 @@ class TestFix5EnvValidation:
         monkeypatch.setenv("CALLSTACK_ROOT_INVOKE_ID", "stale-id")
         monkeypatch.setenv("CALLSTACK_ROOT_LOG_DIR", str(tmp_path / "gone"))
 
-        mcp_server._invocation_identity(str(tmp_path))
+        mcp_server._resolve_invocation_identity(str(tmp_path))
 
         # After rejection, the env must be cleared so Caller agrees.
         import os
