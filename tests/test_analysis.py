@@ -84,6 +84,37 @@ class TestSessionStats:
         assert stats.by_type == {"user": 1, "assistant": 2}
         assert stats.duration == 2.0
 
+    def test_streams_without_materializing_messages(self, trace_dir, monkeypatch):
+        """R-M2: a session JSONL can be many MB. session_stats only needs
+        per-message type + timestamp, so it must stream the file and accumulate
+        in O(1) message memory — NOT route through session_messages(), which
+        builds the full SessionMessage list. Pin that it does not call it."""
+        _write_session(trace_dir, "s1",
+                       {"type": "user", "timestamp": "2026-04-16T10:00:00"},
+                       {"type": "assistant", "timestamp": "2026-04-16T10:00:05"})
+        analyzer = SessionAnalyzer()
+        called = False
+        orig = analyzer.session_messages
+
+        def spy(*a, **k):
+            nonlocal called
+            called = True
+            return orig(*a, **k)
+
+        monkeypatch.setattr(analyzer, "session_messages", spy)
+        stats = analyzer.session_stats(trace_dir / "s1.jsonl")
+        assert stats.message_count == 2
+        assert stats.duration == 5.0
+        assert not called, (
+            "session_stats must stream, not materialize via session_messages")
+
+    def test_missing_file_yields_empty_stats(self, tmp_path):
+        """R-M2: streaming reader on an absent file -> zeroed stats, not error."""
+        stats = SessionAnalyzer().session_stats(tmp_path / "ghost.jsonl")
+        assert stats.message_count == 0
+        assert stats.by_type == {}
+        assert stats.duration == 0.0
+
 
 class TestParentResolution:
 

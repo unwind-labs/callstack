@@ -18,7 +18,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 from .session import PROJECTS_DIR
 
@@ -82,18 +82,8 @@ class SessionAnalyzer:
     # ---- trace files (call_trace.jsonl) ----
 
     def trace_events(self, trace_file: Path) -> list[TraceEvent]:
-        if not trace_file.exists():
-            return []
-        events: list[TraceEvent] = []
-        for line in trace_file.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                d = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            events.append(TraceEvent(
+        return [
+            TraceEvent(
                 timestamp=_parse_ts(d.get("timestamp")),
                 depth=d.get("call_depth", 0),
                 session_id=d.get("session_id", ""),
@@ -101,23 +91,15 @@ class SessionAnalyzer:
                 duration=d.get("duration_seconds", 0.0),
                 result_length=d.get("result_length", 0),
                 error=d.get("error"),
-            ))
-        return events
+            )
+            for d in _iter_jsonl(trace_file)
+        ]
 
     # ---- session files (per-session JSONL) ----
 
     def session_messages(self, session_file: Path) -> list[SessionMessage]:
-        if not session_file.exists():
-            return []
         out: list[SessionMessage] = []
-        for line in session_file.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        for obj in _iter_jsonl(session_file):
             text, tool = _content_preview(obj)
             out.append(SessionMessage(
                 timestamp=_parse_ts(obj.get("timestamp")),
@@ -129,16 +111,26 @@ class SessionAnalyzer:
         return out
 
     def session_stats(self, session_file: Path) -> SessionStats:
-        msgs = self.session_messages(session_file)
+        # Streams the file rather than calling session_messages(): a session
+        # JSONL can be many MB, and stats only need per-message type + timestamp,
+        # so we accumulate counts/min/max in O(1) message memory instead of
+        # materializing the full SessionMessage list.
         by_type: dict[str, int] = defaultdict(int)
-        for m in msgs:
-            by_type[m.type] += 1
-        timestamps = [m.timestamp for m in msgs if m.timestamp]
-        first = min(timestamps) if timestamps else None
-        last = max(timestamps) if timestamps else None
+        count = 0
+        first: Optional[datetime] = None
+        last: Optional[datetime] = None
+        for obj in _iter_jsonl(session_file):
+            count += 1
+            by_type[obj.get("type", "")] += 1
+            ts = _parse_ts(obj.get("timestamp"))
+            if ts is not None:
+                if first is None or ts < first:
+                    first = ts
+                if last is None or ts > last:
+                    last = ts
         duration = (last - first).total_seconds() if first and last else 0.0
         return SessionStats(
-            message_count=len(msgs),
+            message_count=count,
             by_type=dict(by_type),
             duration=duration,
             first_timestamp=first,
@@ -253,6 +245,27 @@ def format_tree(root: CallNode, *, indent: int = 0) -> str:
 
 
 # ---------- internal helpers ----------
+
+def _iter_jsonl(path: Path) -> Iterator[dict]:
+    """Yield parsed JSON objects from a JSONL file, one line at a time.
+
+    Streams the file (open + iterate) rather than read_text().splitlines(),
+    so a multi-MB session/trace log is never held in memory as one big string
+    plus a list of every line. Missing file -> empty iterator; blank and
+    unparseable lines are skipped (these logs are appended to live and may
+    have a torn final line)."""
+    if not path.exists():
+        return
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
 
 def _parse_ts(ts: Optional[str]) -> Optional[datetime]:
     if not ts:
