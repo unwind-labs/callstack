@@ -288,6 +288,34 @@ class SessionLocator:
         return ref
 
 
+_SHARED_LOCATOR: Optional[SessionLocator] = None
+
+
+def most_recent_session(cwd: str) -> Optional[str]:
+    """Session-id stem of the most recently modified `.jsonl` in `cwd`'s
+    project dir, or None.
+
+    Used to identify the calling claude session when no session-id env var
+    (CALLSTACK_OWN_SESSION / CLAUDE_CODE_SESSION_ID) is exported. The active
+    fork is the one currently being appended to, so it wins by mtime.
+
+    Top-level use only: the mtime heuristic is unsafe under concurrent
+    sibling /calls (see `SessionLocator.locate`), which is why callers reach
+    for it only after the deterministic env signals are absent.
+
+    Reuses one module-level `SessionLocator` so its per-instance MRU cache
+    survives across calls and yields real benefit. The locator binds
+    `PROJECTS_DIR` at construction; if a test monkeypatches that global,
+    the shared locator is recreated to pick it up.
+    """
+    global _SHARED_LOCATOR
+    if (_SHARED_LOCATOR is None
+            or _SHARED_LOCATOR._projects_dir is not PROJECTS_DIR):
+        _SHARED_LOCATOR = SessionLocator()
+    ref = _SHARED_LOCATOR._most_recent(cwd)
+    return ref.session_id if ref else None
+
+
 def envelope_from_session_record(record: dict) -> Optional[Envelope]:
     """Extract a control envelope from one Claude Code session JSONL record.
 

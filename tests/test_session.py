@@ -265,3 +265,77 @@ class TestCountLines:
 
     def test_missing_file_returns_zero(self, tmp_path):
         assert count_lines(tmp_path / "ghost") == 0
+
+
+class TestMostRecentSession:
+    """Boundary tests for the public `most_recent_session` helper — the
+    mtime-based 'which session is the caller' lookup that used to live in
+    frames.py and is now owned by session.py. Callers reach for it only
+    after deterministic env signals are absent, so it answers a single
+    question: which `.jsonl` in cwd's project dir was touched last?"""
+
+    def test_returns_none_for_empty_project_dir(self, projects, monkeypatch):
+        import agent_callstack.session as session_mod
+        from agent_callstack.session import encode_project_dir
+        cwd = "/some/proj"
+        (projects / encode_project_dir(cwd)).mkdir(parents=True)
+        monkeypatch.setattr(session_mod, "PROJECTS_DIR", projects)
+        assert session_mod.most_recent_session(cwd) is None
+
+    def test_returns_none_when_no_project_dir(self, projects, monkeypatch):
+        import agent_callstack.session as session_mod
+        monkeypatch.setattr(session_mod, "PROJECTS_DIR", projects)
+        assert session_mod.most_recent_session("/never/created") is None
+
+    def test_picks_newest_by_mtime(self, projects, monkeypatch):
+        import agent_callstack.session as session_mod
+        from agent_callstack.session import encode_project_dir
+        cwd = "/some/proj"
+        proj = projects / encode_project_dir(cwd)
+        old = _make_session(proj, "old", cwd=cwd)
+        new = _make_session(proj, "new", cwd=cwd)
+        os.utime(old, (1000, 1000))
+        os.utime(new, (2000, 2000))
+        monkeypatch.setattr(session_mod, "PROJECTS_DIR", projects)
+        assert session_mod.most_recent_session(cwd) == _sid("new")
+
+    def test_recreates_shared_locator_when_projects_dir_swapped(
+        self, tmp_path, monkeypatch
+    ):
+        """The module-level shared locator binds PROJECTS_DIR at construction.
+        Swapping the global (as tests and a reloaded runtime do) must
+        transparently recreate it so the new tree is honored — otherwise a
+        stale locator would keep scanning the old directory."""
+        import agent_callstack.session as session_mod
+        from agent_callstack.session import encode_project_dir
+        cwd = "/swap/proj"
+        first = tmp_path / "first"
+        first.mkdir()
+        _make_session(first / encode_project_dir(cwd), "old", cwd=cwd)
+        monkeypatch.setattr(session_mod, "PROJECTS_DIR", first)
+        assert session_mod.most_recent_session(cwd) == _sid("old")
+        second = tmp_path / "second"
+        second.mkdir()
+        _make_session(second / encode_project_dir(cwd), "new", cwd=cwd)
+        monkeypatch.setattr(session_mod, "PROJECTS_DIR", second)
+        assert session_mod.most_recent_session(cwd) == _sid("new")
+
+    def test_reflects_newer_session_added_after_first_call(
+        self, projects, monkeypatch
+    ):
+        """The shared locator caches per-cwd results keyed on the project
+        dir's mtime; a newer session added later must invalidate that cache.
+        Encodes the no-stale-read guarantee, not the optimization itself."""
+        import agent_callstack.session as session_mod
+        from agent_callstack.session import encode_project_dir
+        cwd = "/grow/proj"
+        proj = projects / encode_project_dir(cwd)
+        old = _make_session(proj, "old", cwd=cwd)
+        os.utime(old, (1000, 1000))
+        os.utime(proj, (1000, 1000))
+        monkeypatch.setattr(session_mod, "PROJECTS_DIR", projects)
+        assert session_mod.most_recent_session(cwd) == _sid("old")
+        new = _make_session(proj, "new", cwd=cwd)
+        os.utime(new, (2000, 2000))
+        os.utime(proj, (2000, 2000))  # bump dir mtime → cache invalidates
+        assert session_mod.most_recent_session(cwd) == _sid("new")

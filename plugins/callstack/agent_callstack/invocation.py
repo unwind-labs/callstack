@@ -28,8 +28,9 @@ from typing import Optional
 
 from . import env
 from .env import ENV_DEPTH, ENV_MAX_DEPTH, ENV_ROOT_INVOKE_ID, ENV_ROOT_LOG_DIR
-from .frames import _ROOT_FRAME_KEY, _most_recent_session
+from .frames import _ROOT_FRAME_KEY
 from .invocation_ctx import _InvocationContext, _new_invoke_id
+from .session import most_recent_session
 
 
 @dataclass(frozen=True)
@@ -89,7 +90,7 @@ class InvocationFactory:
             key = (
                 env.frame_key()
                 or env.claude_code_session()
-                or _most_recent_session(effective_cwd)
+                or most_recent_session(effective_cwd)
                 or f"pid-{os.getpid()}"
             )
             return _InvocationContext(

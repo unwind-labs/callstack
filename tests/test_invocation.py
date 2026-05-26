@@ -142,7 +142,7 @@ class TestFrameKeyFallback:
                                                             monkeypatch):
         self._nested(monkeypatch, tmp_path)
         # No FRAME_KEY, no CLAUDE_CODE_SESSION_ID, and an empty projects dir so
-        # _most_recent_session finds nothing → deterministic pid-* fallback.
+        # session.most_recent_session finds nothing → deterministic pid-* fallback.
         empty_projects = tmp_path / "empty-projects"
         empty_projects.mkdir()
         monkeypatch.setattr(session, "PROJECTS_DIR", empty_projects)

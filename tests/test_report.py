@@ -391,7 +391,7 @@ def test_nested_detection_uses_mtime_fallback(tmp_path, monkeypatch):
     # Ensure newer has strictly greater mtime.
     _os.utime(newest, (newest.stat().st_atime, newest.stat().st_mtime + 1))
 
-    # `_most_recent_session` (now in agent_callstack.frames) reads from
+    # `session.most_recent_session` reads from
     # `agent_callstack.session.PROJECTS_DIR` dynamically — point both there
     # and at the legacy re-export so older monkeypatches keep working.
     monkeypatch.setattr("agent_callstack.session.PROJECTS_DIR", projects)

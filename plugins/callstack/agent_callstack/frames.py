@@ -10,8 +10,9 @@ cache (PERF-B: stat-keyed so re-parsing the same bytes on every reporter
 tick is skipped), the recursive grafting helpers, and the tree-walk +
 log-line formatters used by the live reporter.
 
-Nothing here performs I/O outside of `_load_frames` (read + stat) and
-`_most_recent_session` (project-dir scan). The reporter owns all writes.
+Nothing here performs I/O outside of `_load_frames` (read + stat). The
+reporter owns all writes; the mtime-based "which session is the caller"
+lookup lives in `session.most_recent_session`.
 """
 from __future__ import annotations
 
@@ -27,7 +28,6 @@ from typing import Optional
 
 import yaml
 
-from . import session
 from . import state as _state
 from .driver import Node, Tree
 from .env import read_orphan_ttl_seconds
@@ -531,29 +531,6 @@ def _chain_to_session(nodes: list, target: str) -> Optional[list[str]]:
                 return hit
         return None
     return walk(nodes, [])
-
-
-_SHARED_LOCATOR: Optional["session.SessionLocator"] = None
-
-
-def _most_recent_session(cwd: str) -> Optional[str]:
-    """Stem of the most recently modified `.jsonl` in the cwd's project dir.
-
-    Used to identify the calling claude session when CLAUDE_SESSION_ID is
-    not exported. The active fork is the one currently being appended to,
-    so it wins by mtime.
-
-    Delegates to ``SessionLocator._most_recent`` (consolidated in PERF-F).
-    Reuses one module-level locator so the per-instance MRU cache survives
-    across reporter ticks and yields real benefit. The locator reads
-    ``session.PROJECTS_DIR`` at construction; if a test monkeypatches
-    that, recreate the shared locator to pick it up."""
-    global _SHARED_LOCATOR
-    if (_SHARED_LOCATOR is None
-            or _SHARED_LOCATOR._projects_dir is not session.PROJECTS_DIR):
-        _SHARED_LOCATOR = session.SessionLocator()
-    ref = _SHARED_LOCATOR._most_recent(cwd)
-    return ref.session_id if ref else None
 
 
 def _one_line(s: str, limit: int) -> str:
