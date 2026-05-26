@@ -18,7 +18,9 @@ from agent_callstack.analysis import SessionAnalyzer, format_duration  # noqa: E
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("trace_file", nargs="?", default="call_traces/call_trace.jsonl")
+    p.add_argument("trace_file",
+                   help="Path to a call_trace.jsonl "
+                        "(<log_dir>/<invoke_id>/call_trace.jsonl)")
     args = p.parse_args()
 
     trace = Path(args.trace_file)

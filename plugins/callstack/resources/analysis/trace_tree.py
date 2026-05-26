@@ -17,8 +17,9 @@ from agent_callstack.analysis import SessionAnalyzer, format_tree  # noqa: E402
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("trace_file", nargs="?", default="call_traces/call_trace.jsonl",
-                   help="Path to call_trace.jsonl")
+    p.add_argument("trace_file",
+                   help="Path to a call_trace.jsonl "
+                        "(<log_dir>/<invoke_id>/call_trace.jsonl)")
     p.add_argument("--root", help="Root session id (or prefix) to render")
     args = p.parse_args()
 
