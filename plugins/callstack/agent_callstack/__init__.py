@@ -24,6 +24,15 @@ import uuid
 from pathlib import Path
 from typing import Optional, Sequence
 
+from .background import (
+    BackgroundRuns,
+    CapReached,
+    Crashed,
+    Done,
+    NotFound,
+    Pending,
+    Started,
+)
 from .channel import ClaudeChannel, PermissionHandler, allow_all, shutdown_pool
 from .driver import Driver, Node, Tree
 from .frames import (
@@ -73,7 +82,22 @@ __all__ = [
     "Caller", "Result", "YieldToken",
     "CallYielded", "CallFailed", "MultiResult",
     "InvocationReport", "ROOT_FRAME_KEY",
+    # Background-run lifecycle (used by async hosts like the MCP server).
+    "BackgroundRuns",
+    "Started", "CapReached", "Pending", "Done", "Crashed", "NotFound",
+    # Boundary helpers an MCP/host adapter legitimately needs.
+    "SessionLocator", "new_invoke_id",
+    "max_fanout", "max_background", "root_identity",
 ]
+
+
+def new_invoke_id() -> str:
+    """Mint a fresh, sortable invocation id (`YYYYMMDDTHHMMSS-<8 hex>`).
+
+    Public spelling of the internal `_new_invoke_id`. Async hosts (the MCP
+    server) need to mint an id before launching an invocation so they can
+    return `report_path` synchronously; this is the supported entry point."""
+    return _new_invoke_id()
 
 
 # ---------- Env constants (re-exported from env.py for compatibility) ----------
@@ -92,6 +116,16 @@ from .env import (  # noqa: E402
     read_finalize_wait_seconds,
 )
 from .env import max_depth as _default_max_depth  # noqa: E402
+
+# Boundary policy readers an MCP/host adapter needs to enforce limits and
+# detect nested invocations. The `env` module itself stays internal; these
+# specific readers are the supported public surface (DRY-101 keeps the
+# parsing policy in env.py).
+from .env import (  # noqa: E402
+    max_fanout,
+    max_background,
+    root_identity,
+)
 
 
 # ---------- Caller (power-user entry point) ----------

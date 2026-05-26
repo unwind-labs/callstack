@@ -24,22 +24,23 @@ from pathlib import Path
 from typing import Any, Optional
 
 from agent_callstack import (
-    Caller, CallFailed, CallYielded, InvocationReport, MultiResult,
-    Result, YieldToken, _new_invoke_id,
+    BackgroundRuns, Caller, CallFailed, CallYielded, CapReached, Crashed,
+    Done, ENV_ROOT_INVOKE_ID, ENV_ROOT_LOG_DIR, InvocationReport, MultiResult,
+    NotFound, Pending, Result, SessionLocator, Started, YieldToken,
+    max_fanout, new_invoke_id, root_identity,
 )
-from agent_callstack import env as _env
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("call")
 
 
 # Registry of in-flight `call` invocations launched with run_in_background=True.
-# Keyed by invoke_id; the `await_call` tool drains entries as the orchestrator
-# reconciles them. Lives at module scope because FastMCP runs every tool call
-# on the same event loop, so the background asyncio.Task started inside `call`
-# continues running while subsequent tool calls (including `await_call`) are
-# served from the same process.
-_background_tasks: dict[str, dict] = {}
+# `BackgroundRuns` owns the full lifecycle (scheduling, cap, reap, await,
+# crash-finalize). Lives at module scope because FastMCP runs every tool call
+# on the same event loop, so a task scheduled inside `call` keeps running while
+# subsequent tool calls (including `await_call`) are served from the same
+# process.
+_background = BackgroundRuns()
 
 
 def _result_to_dict(item: Any) -> dict:
@@ -57,8 +58,8 @@ def _result_to_dict(item: Any) -> dict:
 
 def _max_fanout() -> int:
     """Thin wrapper kept for backwards-compatible test access; the
-    parsing policy lives in `agent_callstack.env.max_fanout`."""
-    return _env.max_fanout()
+    parsing policy lives in `agent_callstack.max_fanout`."""
+    return max_fanout()
 
 
 def _validate_tasks(tasks: Any) -> Optional[str]:
@@ -106,7 +107,7 @@ def _invocation_identity(cwd: str) -> tuple[str, Path]:
     otherwise silently misroute the new top-level call into a nonexistent
     or unrelated dir. On validation failure we fall through to minting a
     fresh id and log a warning to stderr."""
-    root = _env.root_identity()
+    root = root_identity()
     if root is not None:
         root_id, root_dir = root
         root_dir_path = Path(root_dir)
@@ -118,8 +119,8 @@ def _invocation_identity(cwd: str) -> tuple[str, Path]:
             return root_id, root_dir_path
         print(
             f"[callstack] WARN: ignoring inherited "
-            f"{_env.ENV_ROOT_INVOKE_ID}={root_id!r} / "
-            f"{_env.ENV_ROOT_LOG_DIR}={root_dir!r} — invocation dir "
+            f"{ENV_ROOT_INVOKE_ID}={root_id!r} / "
+            f"{ENV_ROOT_LOG_DIR}={root_dir!r} — invocation dir "
             f"{invocation_dir!s} does not exist; minting a fresh invoke_id",
             file=sys.stderr,
         )
@@ -128,9 +129,9 @@ def _invocation_identity(cwd: str) -> tuple[str, Path]:
         # agrees with our decision. Otherwise Caller would treat the
         # invocation as nested under the dead root and try to write
         # frames into a nonexistent dir.
-        os.environ.pop(_env.ENV_ROOT_INVOKE_ID, None)
-        os.environ.pop(_env.ENV_ROOT_LOG_DIR, None)
-    return _new_invoke_id(), _log_dir(cwd)
+        os.environ.pop(ENV_ROOT_INVOKE_ID, None)
+        os.environ.pop(ENV_ROOT_LOG_DIR, None)
+    return new_invoke_id(), _log_dir(cwd)
 
 
 def _build_caller(session: str, model: str, cwd: str, timeout: int,
@@ -225,25 +226,6 @@ def _same_project(a: str, b: str) -> bool:
         return os.path.realpath(a) == os.path.realpath(b)
     except OSError:
         return False
-
-
-def _reap_finished_background_tasks() -> None:
-    """Drop registry entries whose underlying task has already completed
-    (success or exception) but were never reconciled via `await_call`.
-
-    Reconciliation normally pops the entry, so anything still here when
-    done() is True is leaked. We retire those silently — the task result
-    is unreachable without the original invoke_id, and a leaked entry
-    shouldn't burn a slot against `CALLSTACK_MAX_BACKGROUND`. Exceptions
-    are surfaced to the asyncio loop via task.result() so they're not
-    swallowed; we then discard them since no caller is listening."""
-    stale = [iid for iid, e in _background_tasks.items() if e["task"].done()]
-    for iid in stale:
-        task = _background_tasks.pop(iid)["task"]
-        # Consume any exception so asyncio doesn't log a
-        # "Task exception was never retrieved" warning at GC.
-        if not task.cancelled():
-            task.exception()
 
 
 def _finalize_at_boundary(log_dir, invoke_id: str, *, reason: str) -> None:
@@ -365,36 +347,30 @@ async def call(tasks: list[str], timeout: int = 300, session_id: str = "",
     report_path = _report_path(log_dir, invoke_id)
 
     if run_in_background:
-        cap = _env.max_background()
-        # Reap any already-finished tasks the orchestrator never reconciled;
-        # a slow operator shouldn't trip the cap just because they queued
-        # several quick background calls and only awaited some.
-        _reap_finished_background_tasks()
-        if len(_background_tasks) >= cap:
+        # `BackgroundRuns.start` reaps finished-unreconciled runs, enforces the
+        # cap, and schedules `caller.call_many` on a worker thread — returning
+        # a typed outcome we translate to the wire envelope here.
+        outcome = _background.start(
+            invoke_id=invoke_id, caller=caller, tasks=tasks, context=context,
+            report_path=report_path, log_dir=log_dir,
+        )
+        if isinstance(outcome, CapReached):
             return json.dumps({
                 "invoke_id": "", "report_path": "",
                 "results": [{
                     "status": "error",
                     "error": (
-                        f"background-call registry full: {len(_background_tasks)} "
-                        f"outstanding (cap={cap}). Reconcile pending invocations "
-                        f"with `await_call(invoke_id)` first, or widen with "
-                        f"CALLSTACK_MAX_BACKGROUND."
+                        f"background-call registry full: {outcome.outstanding} "
+                        f"outstanding (cap={outcome.cap}). Reconcile pending "
+                        f"invocations with `await_call(invoke_id)` first, or "
+                        f"widen with CALLSTACK_MAX_BACKGROUND."
                     ),
                 }],
             }, indent=2)
-        task = asyncio.create_task(
-            asyncio.to_thread(caller.call_many, tasks, context=context)
-        )
-        # Stash log_dir on the registry entry so `await_call` can run the
-        # atomic-emit guard against the right invocation directory
-        # without having to re-derive it from `report_path`.
-        _background_tasks[invoke_id] = {
-            "task": task, "report_path": report_path, "log_dir": log_dir,
-        }
+        assert isinstance(outcome, Started)
         return json.dumps({
-            "invoke_id": invoke_id,
-            "report_path": report_path,
+            "invoke_id": outcome.invoke_id,
+            "report_path": outcome.report_path,
             "status": "started",
         }, indent=2)
 
@@ -435,56 +411,33 @@ async def await_call(invoke_id: str, timeout: int = 60) -> str:
 
     A successful (or errored) reconciliation removes the entry from the
     registry; pending reconciliations leave it in place."""
-    entry = _background_tasks.get(invoke_id)
-    if entry is None:
+    # `BackgroundRuns.reconcile` owns the shield-on-await, the keep-on-pending
+    # semantics, and force-finalizing a crashed run's frames. We just map its
+    # typed outcome onto the wire envelope.
+    outcome = await _background.reconcile(invoke_id, timeout=timeout)
+    if isinstance(outcome, NotFound):
         return json.dumps({
             "invoke_id": invoke_id,
             "status": "error",
             "error": f"no background call with invoke_id={invoke_id!r}",
         }, indent=2)
-    task: asyncio.Task = entry["task"]
-    report_path: str = entry["report_path"]
-    # `log_dir` was stashed by `call(run_in_background=True)` so we can
-    # run the atomic-emit guard from this side too. Older entries (from
-    # before the field was added) fall back to None and skip the guard
-    # — the synchronous `call` path always finalizes, so the only
-    # entries missing this field were created by an older mcp_server.
-    log_dir = entry.get("log_dir")
-    try:
-        # `shield` so a timeout here cancels only our wait, not the
-        # underlying call_many — the orchestrator can poll again.
-        multi: MultiResult = await asyncio.wait_for(
-            asyncio.shield(task), timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        # Still running — leave the entry in place and do NOT force-
-        # finalize. The background task is healthy and will write its
-        # own terminal frame when it completes.
+    if isinstance(outcome, Pending):
         return json.dumps({
             "invoke_id": invoke_id,
-            "report_path": report_path,
+            "report_path": outcome.report_path,
             "status": "pending",
         }, indent=2)
-    except Exception as e:
-        _background_tasks.pop(invoke_id, None)
-        # The background call's reporter.finalize may or may not have
-        # run before the exception propagated; force-terminate any
-        # surviving non-terminal frames so the parent sees a clean
-        # error envelope rather than a stuck-running canvas row.
-        if log_dir is not None:
-            _finalize_at_boundary(
-                log_dir, invoke_id,
-                reason="background call_many raised before terminal frame state",
-            )
+    if isinstance(outcome, Crashed):
         return json.dumps({
             "invoke_id": invoke_id,
-            "report_path": report_path,
+            "report_path": outcome.report_path,
             "status": "error",
-            "error": f"background call raised: {type(e).__name__}: {e}",
+            "error": f"background call raised: {outcome.error}",
         }, indent=2)
-    _background_tasks.pop(invoke_id, None)
+    assert isinstance(outcome, Done)
     return json.dumps(
-        _envelope_from_multi(invoke_id, report_path, multi), indent=2,
+        _envelope_from_multi(invoke_id, outcome.report_path, outcome.result),
+        indent=2,
     )
 
 
@@ -498,7 +451,6 @@ async def resume(resume_session: str, user_reply: str,
     invoke_id, log_dir = _invocation_identity(cwd)
     caller = _build_caller("", "", cwd, timeout, invoke_id, log_dir)
     # Locate the clone path so we can construct a YieldToken.
-    from agent_callstack.session import SessionLocator
     clone = SessionLocator().resolve(resume_session, cwd=cwd or None)
     envelope = {"invoke_id": invoke_id, "report_path": _report_path(log_dir, invoke_id)}
     if clone is None:

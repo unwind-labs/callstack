@@ -257,11 +257,11 @@ class _StubCaller:
 
 @pytest.fixture(autouse=True)
 def _clear_background_registry():
-    """Tests share module-level `_background_tasks` — wipe it both sides
-    of every test so a leak in one doesn't cascade."""
-    mcp_server._background_tasks.clear()
+    """Tests share the module-level `_background` registry — wipe it both
+    sides of every test so a leak in one doesn't cascade."""
+    mcp_server._background.clear()
     yield
-    mcp_server._background_tasks.clear()
+    mcp_server._background.clear()
 
 
 class TestFinalizeAtBoundary:
@@ -367,7 +367,7 @@ class TestRunInBackground:
         assert env["invoke_id"]
         assert env["report_path"]
         # Task is parked in the registry waiting for the gate.
-        assert env["invoke_id"] in mcp_server._background_tasks
+        assert env["invoke_id"] in mcp_server._background
         # Release and drain so pytest doesn't leave a thread alive past
         # this test. (autouse fixture clears the registry; the task itself
         # needs to be unblocked.)
@@ -394,7 +394,7 @@ class TestRunInBackground:
         assert env["results"][0]["status"] == "complete"
         assert env["results"][0]["result"] == "done"
         # Reconciled tasks are popped so memory doesn't grow unbounded.
-        assert invoke_id not in mcp_server._background_tasks
+        assert invoke_id not in mcp_server._background
 
     @pytest.mark.asyncio
     async def test_await_call_timeout_returns_pending(
@@ -417,7 +417,7 @@ class TestRunInBackground:
         assert env["status"] == "pending"
         assert env["invoke_id"] == invoke_id
         # Pending reconciliations keep the entry so the caller can poll.
-        assert invoke_id in mcp_server._background_tasks
+        assert invoke_id in mcp_server._background
         # Drain.
         gate.set()
         await mcp_server.await_call(invoke_id, timeout=5)
@@ -448,7 +448,7 @@ class TestRunInBackground:
         env = json.loads(raw)
         assert env["results"][0]["status"] == "error"
         # Nothing should have been parked.
-        assert not mcp_server._background_tasks
+        assert len(mcp_server._background) == 0
 
     @pytest.mark.asyncio
     async def test_background_exception_surfaced_via_await(
@@ -476,7 +476,7 @@ class TestRunInBackground:
         assert "simulated internal failure" in env["error"]
         # Errored reconciliations also drop the entry — orchestrator has
         # the final word; a second await would only return a stale error.
-        assert invoke_id not in mcp_server._background_tasks
+        assert invoke_id not in mcp_server._background
 
 
 class TestBackgroundRegistryCap:
@@ -536,17 +536,18 @@ class TestBackgroundRegistryCap:
         # Wait for the underlying task to actually finish so the reaper
         # has something to reap. Using the task handle directly rather
         # than await_call lets us observe the pre-reap state too.
-        task = mcp_server._background_tasks[e1["invoke_id"]]["task"]
+        task = mcp_server._background.task_for(e1["invoke_id"])
+        assert task is not None
         await task
         # Slot is still nominally occupied — the reaper runs on the next
         # background call.
-        assert e1["invoke_id"] in mcp_server._background_tasks
+        assert e1["invoke_id"] in mcp_server._background
         # Second background call would otherwise hit cap=1, but the
         # reaper drops the done-but-unawaited entry first.
         e2 = json.loads(
             await mcp_server.call(tasks=["x"], run_in_background=True),
         )
         assert e2["status"] == "started"
-        assert e1["invoke_id"] not in mcp_server._background_tasks
+        assert e1["invoke_id"] not in mcp_server._background
         # Drain.
         await mcp_server.await_call(e2["invoke_id"], timeout=5)
