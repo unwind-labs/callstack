@@ -331,7 +331,10 @@ class TestReadUntilResult:
 
 
 class _FakeProc:
-    """Stand-in for subprocess.Popen: only the attributes _run_one_turn reads."""
+    """Base subprocess.Popen stand-in: reports `returncode` via poll() and
+    treats kill() as a no-op. The failure-mode doubles below subclass this and
+    override only the behavior they exercise, so the shared poll/returncode
+    contract lives in one place."""
 
     def __init__(self, returncode=None):
         self.returncode = returncode
@@ -473,19 +476,17 @@ class TestProcessLogPath:
             os.unlink(path)
 
 
-class _ClosableProc:
-    """Fake Popen exposing only what _PooledProcess.close drives, with knobs to
-    force the terminate-timeout → kill fallback and a kill that also fails."""
+class _ClosableProc(_FakeProc):
+    """Fake Popen exposing what _PooledProcess.close drives, with knobs to force
+    the terminate-timeout → kill fallback and a kill that also fails. kill()
+    records intent (vs the base no-op) so close-path tests can assert on it."""
 
     def __init__(self, *, terminate_times_out=False, kill_wait_raises=False):
-        self.returncode = 0
+        super().__init__(returncode=0)
         self._terminate_times_out = terminate_times_out
         self._kill_wait_raises = kill_wait_raises
         self.terminated = False
         self.killed = False
-
-    def poll(self):
-        return self.returncode
 
     def terminate(self):
         self.terminated = True
@@ -612,22 +613,17 @@ class _FakeStderr:
         return iter(self._lines)
 
 
-class _FakeSpawnPopen:
-    """Minimal Popen stand-in for exercising _spawn without a real `claude`."""
+class _FakeSpawnPopen(_FakeProc):
+    """Minimal Popen stand-in for exercising _spawn without a real `claude`;
+    adds the stdio streams _spawn wires up. poll()/kill() come from the base."""
 
     def __init__(self, *_a, stderr_lines=(), **_k):
+        super().__init__(returncode=None)
         self.stdin = io.StringIO()
         self.stdout = io.StringIO()
         self.stderr = _FakeStderr(list(stderr_lines))
-        self.returncode = None
-
-    def poll(self):
-        return self.returncode
 
     def terminate(self):
-        pass
-
-    def kill(self):
         pass
 
     def wait(self, timeout=None):
@@ -695,12 +691,9 @@ class _SlowStdout:
         return ""
 
 
-class _KillRaisesProc:
-    def __init__(self):
-        self.returncode = None
-
-    def poll(self):
-        return self.returncode
+class _KillRaisesProc(_FakeProc):
+    """A process whose kill() fails (child already dead) — the watchdog must
+    swallow it. poll()/returncode come from the base."""
 
     def kill(self):
         raise OSError("already gone")
