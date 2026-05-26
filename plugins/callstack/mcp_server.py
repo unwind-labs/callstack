@@ -24,11 +24,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 from agent_callstack import (
-    Caller, CallFailed, CallYielded, MultiResult, Result, YieldToken,
-    _new_invoke_id,
+    Caller, CallFailed, CallYielded, InvocationReport, MultiResult,
+    Result, YieldToken, _new_invoke_id,
 )
 from agent_callstack import env as _env
-from agent_callstack.reporter import _finalize_own_frames
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("call")
@@ -252,8 +251,8 @@ def _finalize_at_boundary(log_dir, invoke_id: str, *, reason: str) -> None:
 
     Force-terminates any non-terminal frames this process owns so the
     parent agent sees status='abandoned' rather than a stuck-running
-    spinner. Wraps `_finalize_own_frames` with the standard "never raise,
-    log to stderr on failure" contract.
+    spinner. Goes through `InvocationReport.finalize_own_frames` with the
+    standard "never raise, log to stderr on failure" contract.
 
     NOT run on the happy path: `caller.call_many` already runs
     `reporter.finalize` (which itself runs `wait_for_terminal_signals`)
@@ -261,9 +260,14 @@ def _finalize_at_boundary(log_dir, invoke_id: str, *, reason: str) -> None:
     exception aborts that chain — running it on success was measurable
     I/O (glob + fcntl lock + per-frame parse) for a guaranteed no-op."""
     try:
-        _finalize_own_frames(log_dir, invoke_id, reason=reason)
+        # cwd is irrelevant to finalize_own_frames (it only needs
+        # log_dir + invoke_id to locate this process's frames).
+        report = InvocationReport(
+            invoke_id=invoke_id, log_dir=log_dir, cwd="",
+        )
+        report.finalize_own_frames(reason=reason)
     except Exception as e:
-        print(f"[callstack] WARN _finalize_own_frames raised at MCP "
+        print(f"[callstack] WARN finalize_own_frames raised at MCP "
               f"boundary ({reason}): {type(e).__name__}: {e}",
               file=sys.stderr)
 

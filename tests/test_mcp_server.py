@@ -265,7 +265,7 @@ def _clear_background_registry():
 
 
 class TestFinalizeAtBoundary:
-    """REVIEW-203: `_finalize_own_frames` is the MCP boundary's escape
+    """REVIEW-203: `_finalize_at_boundary` is the MCP boundary's escape
     hatch for force-terminating non-terminal frames when something went
     wrong upstream. On the happy path it would be a guaranteed no-op
     (the call_many → driver → reporter.finalize chain already produces
@@ -280,7 +280,7 @@ class TestFinalizeAtBoundary:
         monkeypatch.chdir(tmp_path)
         calls = []
         monkeypatch.setattr(
-            mcp_server, "_finalize_own_frames",
+            mcp_server, "_finalize_at_boundary",
             lambda *a, **kw: calls.append((a, kw)),
         )
         monkeypatch.setattr(
@@ -290,7 +290,7 @@ class TestFinalizeAtBoundary:
         env = json.loads(await mcp_server.call(tasks=["x"]))
         assert env["results"][0]["status"] == "complete"
         assert calls == [], (
-            "happy path must not invoke _finalize_own_frames — the "
+            "happy path must not invoke the boundary guard — the "
             "upstream finalize chain is already responsible for terminal "
             "state and the guard was measurable I/O for a guaranteed no-op"
         )
@@ -304,7 +304,7 @@ class TestFinalizeAtBoundary:
         monkeypatch.chdir(tmp_path)
         calls = []
         monkeypatch.setattr(
-            mcp_server, "_finalize_own_frames",
+            mcp_server, "_finalize_at_boundary",
             lambda *a, **kw: calls.append((a, kw)),
         )
 
@@ -317,7 +317,7 @@ class TestFinalizeAtBoundary:
         with pytest.raises(RuntimeError, match="boom"):
             await mcp_server.call(tasks=["x"])
         assert len(calls) == 1, (
-            "exception path must invoke _finalize_own_frames exactly once"
+            "exception path must invoke the boundary guard exactly once"
         )
 
     @pytest.mark.asyncio
@@ -328,7 +328,7 @@ class TestFinalizeAtBoundary:
         monkeypatch.chdir(tmp_path)
         calls = []
         monkeypatch.setattr(
-            mcp_server, "_finalize_own_frames",
+            mcp_server, "_finalize_at_boundary",
             lambda *a, **kw: calls.append((a, kw)),
         )
         monkeypatch.setattr(

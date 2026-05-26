@@ -30,17 +30,21 @@ import pytest
 import yaml
 
 import agent_callstack as ac
-from agent_callstack import _InvocationContext, _ROOT_FRAME_KEY
+from agent_callstack import InvocationReport, ROOT_FRAME_KEY
 from agent_callstack import state as st
 from agent_callstack import reporter as reporter_mod
 from agent_callstack import shutdown as shutdown_mod
 from agent_callstack.driver import Node, Tree
+# White-box imports: the abandonment primitives and the shutdown-hook
+# internals below have no honest expression through the public
+# `InvocationReport` boundary — they operate on in-memory `Tree`/node-dict
+# payloads and on the process-wide active-reporter registry. Boundary-level
+# behavior (frame finalize, merged report) is exercised via `InvocationReport`;
+# these names are imported directly on purpose to test the machinery beneath it.
 from agent_callstack.reporter import (
     _LiveReporter,
     _abandon_frame_nodes_in_place,
     _abandon_tree_nodes_in_place,
-    _atomic_yaml_write,
-    _finalize_own_frames,
     _flush_active_reporters,
     _register_active_reporter,
     _unregister_active_reporter,
@@ -60,10 +64,11 @@ def _running_node(nid: str, task: str = "t", *,
     )
 
 
-def _ctx(tmp_path: Path, *, frame_key: str = _ROOT_FRAME_KEY,
-         is_nested: bool = False) -> _InvocationContext:
-    return _InvocationContext(
-        invoke_id="inv-shutdown-test",
+def _report(tmp_path: Path, *, invoke_id: str = "inv-shutdown-test",
+            frame_key: str = ROOT_FRAME_KEY,
+            is_nested: bool = False) -> InvocationReport:
+    return InvocationReport(
+        invoke_id=invoke_id,
         log_dir=tmp_path / "log",
         cwd=str(tmp_path),
         frame_key=frame_key,
@@ -71,32 +76,27 @@ def _ctx(tmp_path: Path, *, frame_key: str = _ROOT_FRAME_KEY,
     )
 
 
-def _make_reporter(tmp_path: Path, **ctx_kwargs) -> _LiveReporter:
-    ctx = _ctx(tmp_path, **ctx_kwargs)
-    ctx.invocation_dir.mkdir(parents=True, exist_ok=True)
-    ctx.frames_dir.mkdir(parents=True, exist_ok=True)
-    return _LiveReporter(ctx=ctx, kind="call", tasks=["t"], started_at="s")
+def _make_reporter(tmp_path: Path, **report_kwargs) -> _LiveReporter:
+    report = _report(tmp_path, **report_kwargs)
+    report.invocation_dir.mkdir(parents=True, exist_ok=True)
+    report.frames_dir.mkdir(parents=True, exist_ok=True)
+    return report.reporter(kind="call", tasks=["t"], started_at="s")
 
 
-def _write_frame_with(tmp_path: Path, *, frame_key: str, tree: Tree,
+def _write_frame_with(report: InvocationReport, *, frame_key: str, tree: Tree,
                       writer_pid: int) -> Path:
     """Write a frame YAML file in the shape the reporter would produce
-    and return its path so tests can probe / re-read it."""
-    log_dir = tmp_path / "log"
-    invocation_dir = log_dir / "inv-shutdown-test"
-    frames_dir = invocation_dir / "_frames"
-    frames_dir.mkdir(parents=True, exist_ok=True)
+    and return its path so tests can probe / re-read it. Goes through the
+    public boundary's `write_frame` so the on-disk shape stays canonical."""
     frame = {
         "frame_key": frame_key,
-        "is_nested": frame_key != _ROOT_FRAME_KEY,
-        "kind": "call", "tasks": ["t"], "cwd": str(tmp_path),
+        "is_nested": frame_key != ROOT_FRAME_KEY,
+        "kind": "call", "tasks": ["t"], "cwd": report.cwd,
         "writer_pid": writer_pid,
         "started_at": "s", "ended_at": "e",
         "tree": tree.to_dict(),
     }
-    path = frames_dir / f"{frame_key}.yaml"
-    _atomic_yaml_write(path, frame)
-    return path
+    return report.write_frame(frame, key=frame_key)
 
 
 def _drain_registered_reporters() -> None:
@@ -265,24 +265,21 @@ class TestFinalizeOwnFrames:
     def test_no_op_when_invocation_dir_missing(self, tmp_path):
         # No frames_dir exists yet — must return False cleanly so the
         # MCP boundary doesn't error on a never-started invocation.
-        rewrote = _finalize_own_frames(
-            tmp_path / "log", "missing-inv", reason="r",
-        )
+        report = _report(tmp_path, invoke_id="missing-inv")
+        rewrote = report.finalize_own_frames(reason="r")
         assert rewrote is False
 
     def test_rewrites_own_pid_frame_with_non_terminal_nodes(self, tmp_path):
+        report = _report(tmp_path)
         parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
         node = _running_node("aaaa1111")
         tree = Tree(root_session=parent, nodes=[node], base_depth=0)
         frame_path = _write_frame_with(
-            tmp_path, frame_key=_ROOT_FRAME_KEY, tree=tree,
+            report, frame_key=ROOT_FRAME_KEY, tree=tree,
             writer_pid=os.getpid(),
         )
 
-        rewrote = _finalize_own_frames(
-            tmp_path / "log", "inv-shutdown-test",
-            reason="boundary",
-        )
+        rewrote = report.finalize_own_frames(reason="boundary")
 
         assert rewrote is True
         reloaded = yaml.safe_load(frame_path.read_text())
@@ -295,6 +292,7 @@ class TestFinalizeOwnFrames:
         boundary must NOT finalize the parent's root frame, which lives
         in the same `_frames/` dir but is still being driven by the
         parent process."""
+        report = _report(tmp_path)
         parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
         node = _running_node("bbbb2222")
         tree = Tree(root_session=parent, nodes=[node], base_depth=0)
@@ -302,13 +300,11 @@ class TestFinalizeOwnFrames:
         # PID 1 (init) — it's always alive and never us.
         other_pid = 1 if os.getpid() != 1 else 2
         frame_path = _write_frame_with(
-            tmp_path, frame_key=_ROOT_FRAME_KEY, tree=tree,
+            report, frame_key=ROOT_FRAME_KEY, tree=tree,
             writer_pid=other_pid,
         )
 
-        rewrote = _finalize_own_frames(
-            tmp_path / "log", "inv-shutdown-test", reason="r",
-        )
+        rewrote = report.finalize_own_frames(reason="r")
 
         assert rewrote is False
         reloaded = yaml.safe_load(frame_path.read_text())
@@ -322,20 +318,17 @@ class TestFinalizeOwnFrames:
     def test_idempotent_on_already_terminal_frame(self, tmp_path):
         """Calling twice must produce the same result; second call must
         not double-rewrite (no on-disk churn) and must return False."""
+        report = _report(tmp_path)
         parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
         node = _running_node("cccc3333")
         tree = Tree(root_session=parent, nodes=[node], base_depth=0)
         _write_frame_with(
-            tmp_path, frame_key=_ROOT_FRAME_KEY, tree=tree,
+            report, frame_key=ROOT_FRAME_KEY, tree=tree,
             writer_pid=os.getpid(),
         )
 
-        first = _finalize_own_frames(
-            tmp_path / "log", "inv-shutdown-test", reason="r",
-        )
-        second = _finalize_own_frames(
-            tmp_path / "log", "inv-shutdown-test", reason="r",
-        )
+        first = report.finalize_own_frames(reason="r")
+        second = report.finalize_own_frames(reason="r")
 
         assert first is True
         assert second is False, (
@@ -344,6 +337,7 @@ class TestFinalizeOwnFrames:
         )
 
     def test_returns_false_when_only_terminal_nodes(self, tmp_path):
+        report = _report(tmp_path)
         parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
         done = Node(
             id="ffff4444", task="t",
@@ -352,13 +346,11 @@ class TestFinalizeOwnFrames:
         )
         tree = Tree(root_session=parent, nodes=[done], base_depth=0)
         _write_frame_with(
-            tmp_path, frame_key=_ROOT_FRAME_KEY, tree=tree,
+            report, frame_key=ROOT_FRAME_KEY, tree=tree,
             writer_pid=os.getpid(),
         )
 
-        rewrote = _finalize_own_frames(
-            tmp_path / "log", "inv-shutdown-test", reason="r",
-        )
+        rewrote = report.finalize_own_frames(reason="r")
         assert rewrote is False
 
 
@@ -373,6 +365,10 @@ class TestInvokeFallsBackToCurrentTree:
     def test_falls_back_when_driver_run_raises_after_tree_stamp(
         self, tmp_path, monkeypatch,
     ):
+        # White-box: this test patches `_LiveReporter.finalize` as a class
+        # attribute to assert the Caller's try/finally still drives a finalize
+        # pass when Driver.run raises. That hook lives below the public
+        # boundary, so the internal class is imported directly on purpose.
         from agent_callstack import _LiveReporter
         from agent_callstack.driver import Driver
         from agent_callstack.session import SessionLocator
@@ -803,22 +799,19 @@ import time
 sys.path.insert(0, {str(plugin_root)!r})
 from pathlib import Path
 import agent_callstack as ac
-from agent_callstack import _InvocationContext, _ROOT_FRAME_KEY
+from agent_callstack import InvocationReport, ROOT_FRAME_KEY
 from agent_callstack import state as st
 from agent_callstack.driver import Node, Tree
-from agent_callstack.reporter import _LiveReporter
 from agent_callstack.session import SessionRef
 
-ctx = _InvocationContext(
+report = InvocationReport(
     invoke_id='sigterm-test',
     log_dir=Path({str(tmp_path)!r}) / 'log',
     cwd={str(tmp_path)!r},
-    frame_key=_ROOT_FRAME_KEY,
-    is_nested=False,
 )
-ctx.invocation_dir.mkdir(parents=True, exist_ok=True)
-ctx.frames_dir.mkdir(parents=True, exist_ok=True)
-r = _LiveReporter(ctx=ctx, kind='call', tasks=['t'], started_at='s')
+report.invocation_dir.mkdir(parents=True, exist_ok=True)
+report.frames_dir.mkdir(parents=True, exist_ok=True)
+r = report.reporter(kind='call', tasks=['t'], started_at='s')
 
 parent = SessionRef(session_id='p', file=Path({str(tmp_path)!r}) / 'p.jsonl')
 node = Node(
@@ -862,7 +855,7 @@ while True:
 
         frame_path = (
             tmp_path / "log" / "sigterm-test" / "_frames"
-            / f"{_ROOT_FRAME_KEY}.yaml"
+            / f"{ROOT_FRAME_KEY}.yaml"
         )
         assert frame_path.exists(), (
             f"signal handler must have flushed a frame to disk before "

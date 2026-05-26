@@ -34,6 +34,7 @@ from .frames import (
     _most_recent_session,
 )
 from .invocation_ctx import _InvocationContext, _new_invoke_id, _utc_now_iso
+from .report import InvocationReport, ROOT_FRAME_KEY
 from .reporter import (
     _DEFAULT_REPORT_DEBOUNCE_SECS,
     _LiveReporter,
@@ -71,6 +72,7 @@ __all__ = [
     "call", "call_many", "resume",
     "Caller", "Result", "YieldToken",
     "CallYielded", "CallFailed", "MultiResult",
+    "InvocationReport", "ROOT_FRAME_KEY",
 ]
 
 
@@ -161,8 +163,9 @@ class Caller:
         ctx = self._resolve_invocation_context(parent)
         driver = self._driver_for(parent, ctx=ctx)
         started_at = _utc_now_iso()
-        reporter = _LiveReporter(
-            ctx=ctx, kind=ctx.prefix("call_resume"),
+        report = InvocationReport.from_context(ctx)
+        reporter = report.reporter(
+            kind=ctx.prefix("call_resume"),
             tasks=[n.task for n in tree.nodes], started_at=started_at,
         )
         driver.on_progress = reporter
@@ -172,16 +175,12 @@ class Caller:
         try:
             driver.resume(tree, token.session_id, reply)
         finally:
-            # Give late `op:return` / `op:yield` envelopes a chance to
-            # land on the child JSONL before sealing the report; nodes
-            # that miss the window become `Timeout` instead of being
-            # silently sealed as `running`. See PRD
+            # `report.seal` gives late `op:return`/`op:yield` envelopes a
+            # chance to land on the child JSONL before finalizing — a node
+            # that misses the window becomes `Timeout` rather than being
+            # sealed as still-running. See PRD
             # `prd-don-t-seal-report-yaml-virtual-harp.md`.
-            wait_for_terminal_signals(
-                tree,
-                wait_budget_seconds=read_finalize_wait_seconds(),
-            )
-            reporter.finalize(tree)
+            report.seal(reporter, tree)
         return _unwrap_single(_results_from_tree(tree)[0])
 
     # ---- internal ----
@@ -200,8 +199,9 @@ class Caller:
         driver = self._driver_for(parent, ctx=ctx, depth_base=depth)
         started_at = _utc_now_iso()
         kind = ctx.prefix("call")
-        reporter = _LiveReporter(ctx=ctx, kind=kind, tasks=list(tasks),
-                                 started_at=started_at)
+        report = InvocationReport.from_context(ctx)
+        reporter = report.reporter(kind=kind, tasks=list(tasks),
+                                   started_at=started_at)
         driver.on_progress = reporter
         # Try/finally ensures `report.yaml` is always finalized, even if
         # `driver.run` raises. Without this, a debounced merge could be
@@ -223,11 +223,8 @@ class Caller:
             if tree is None:
                 tree = driver.last_tree
             if tree is not None:
-                wait_for_terminal_signals(
-                    tree,
-                    wait_budget_seconds=read_finalize_wait_seconds(),
-                )
-                reporter.finalize(tree)
+                # `report.seal` = wait-for-terminal-signals + reporter.finalize.
+                report.seal(reporter, tree)
         # `tree is None` only reaches here when `driver.run` raised AND
         # never even stamped a partial tree onto itself — extremely rare
         # (would require failure inside `__init__`-level setup). The

@@ -9,6 +9,13 @@ The merge layer (`frames._reconcile_orphan_states`) detects this by
 checking the frame's recorded `writer_pid` against process-table
 liveness; when dead, non-terminal kinds are rewritten to the synthetic
 terminal kind ``"abandoned"`` so the merged report (and unwind) settle.
+
+Frame writing, loading, and merging here go through the public
+`InvocationReport` boundary (`write_frame` / `load_frames` /
+`merged_document`); the reconciliation that those operations trigger is
+the behavior under test. A couple of tests reach into `frames._pid_alive`
+directly — that liveness probe is the internal primitive being
+exercised, with no honest expression through the report boundary.
 """
 from __future__ import annotations
 
@@ -19,12 +26,10 @@ import sys
 import yaml
 
 import agent_callstack as ac
-from agent_callstack import _InvocationContext, _ROOT_FRAME_KEY
+from agent_callstack import InvocationReport, ROOT_FRAME_KEY
 from agent_callstack import frames as frames_mod
 from agent_callstack import state as st
 from agent_callstack.driver import Node, Tree
-from agent_callstack.frames import _build_merged_report, _load_frames
-from agent_callstack.reporter import _atomic_yaml_write
 from agent_callstack.session import SessionRef
 
 
@@ -39,17 +44,17 @@ def _running_node(nid: str, task: str, *, session_id: str | None = None) -> Node
     )
 
 
-def _write_frame(frames_dir, *, frame_key: str, tree: Tree,
+def _write_frame(report: InvocationReport, *, frame_key: str, tree: Tree,
                  writer_pid: int | None) -> None:
     frame: dict = {
-        "frame_key": frame_key, "is_nested": frame_key != _ROOT_FRAME_KEY,
+        "frame_key": frame_key, "is_nested": frame_key != ROOT_FRAME_KEY,
         "kind": "call", "tasks": ["t"], "cwd": "/cwd",
         "started_at": "s", "ended_at": "e",
         "tree": tree.to_dict(),
     }
     if writer_pid is not None:
         frame["writer_pid"] = writer_pid
-    _atomic_yaml_write(frames_dir / f"{frame_key}.yaml", frame)
+    report.write_frame(frame, key=frame_key)
 
 
 def _dead_pid() -> int:
@@ -90,17 +95,17 @@ def test_reconcile_orphan_promotes_non_terminal_to_abandoned(tmp_path):
     still in awaiting_* gets its node kinds rewritten to 'abandoned' so
     the merged report's status is no longer pinned at 'running'."""
     ac._frames_cache_clear()
-    frames_dir = tmp_path / "_frames"
-    frames_dir.mkdir()
+    report = InvocationReport(invoke_id="inv-promote",
+                              log_dir=tmp_path / "log", cwd="/cwd")
 
     parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
     stuck = _running_node("aaaaaaaa", "stuck task")
     tree = Tree(root_session=parent, nodes=[stuck], base_depth=0)
-    _write_frame(frames_dir, frame_key=_ROOT_FRAME_KEY, tree=tree,
+    _write_frame(report, frame_key=ROOT_FRAME_KEY, tree=tree,
                  writer_pid=_dead_pid())
 
-    frames = _load_frames(frames_dir)
-    root_frame = frames[_ROOT_FRAME_KEY][0]
+    frames = report.load_frames()
+    root_frame = frames[ROOT_FRAME_KEY][0]
     [node] = root_frame["tree"]["nodes"]
     assert node["state"]["kind"] == "abandoned", (
         "non-terminal node from a dead-writer frame should be promoted to "
@@ -118,17 +123,17 @@ def test_reconcile_does_not_touch_live_writer_frames(tmp_path):
     reconciled — otherwise every live invocation would have its own
     in-flight nodes marked abandoned on the next merge tick."""
     ac._frames_cache_clear()
-    frames_dir = tmp_path / "_frames"
-    frames_dir.mkdir()
+    report = InvocationReport(invoke_id="inv-live",
+                              log_dir=tmp_path / "log", cwd="/cwd")
 
     parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
     running = _running_node("bbbbbbbb", "in flight task")
     tree = Tree(root_session=parent, nodes=[running], base_depth=0)
-    _write_frame(frames_dir, frame_key=_ROOT_FRAME_KEY, tree=tree,
+    _write_frame(report, frame_key=ROOT_FRAME_KEY, tree=tree,
                  writer_pid=os.getpid())
 
-    frames = _load_frames(frames_dir)
-    [node] = frames[_ROOT_FRAME_KEY][0]["tree"]["nodes"]
+    frames = report.load_frames()
+    [node] = frames[ROOT_FRAME_KEY][0]["tree"]["nodes"]
     assert node["state"]["kind"] == "awaiting_turn", (
         "live-writer frames must stay untouched — otherwise the reporter "
         "would mark its own in-flight nodes as abandoned on the next tick"
@@ -141,17 +146,17 @@ def test_reconcile_skips_frames_without_writer_pid(tmp_path):
     — better to keep showing 'running' than to falsely abandon a
     live nested invocation."""
     ac._frames_cache_clear()
-    frames_dir = tmp_path / "_frames"
-    frames_dir.mkdir()
+    report = InvocationReport(invoke_id="inv-nopid",
+                              log_dir=tmp_path / "log", cwd="/cwd")
 
     parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
     running = _running_node("cccccccc", "legacy frame task")
     tree = Tree(root_session=parent, nodes=[running], base_depth=0)
-    _write_frame(frames_dir, frame_key=_ROOT_FRAME_KEY, tree=tree,
+    _write_frame(report, frame_key=ROOT_FRAME_KEY, tree=tree,
                  writer_pid=None)
 
-    frames = _load_frames(frames_dir)
-    [node] = frames[_ROOT_FRAME_KEY][0]["tree"]["nodes"]
+    frames = report.load_frames()
+    [node] = frames[ROOT_FRAME_KEY][0]["tree"]["nodes"]
     assert node["state"]["kind"] == "awaiting_turn"
 
 
@@ -161,8 +166,8 @@ def test_reconcile_leaves_terminal_nodes_alone(tmp_path):
     those nodes — they're already terminal — otherwise it would clobber
     real `Done`/`Failed` results with synthetic 'abandoned'."""
     ac._frames_cache_clear()
-    frames_dir = tmp_path / "_frames"
-    frames_dir.mkdir()
+    report = InvocationReport(invoke_id="inv-terminal",
+                              log_dir=tmp_path / "log", cwd="/cwd")
 
     parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
     done_node = Node(
@@ -171,11 +176,11 @@ def test_reconcile_leaves_terminal_nodes_alone(tmp_path):
         session_id="sess-done", result="ok",
     )
     tree = Tree(root_session=parent, nodes=[done_node], base_depth=0)
-    _write_frame(frames_dir, frame_key=_ROOT_FRAME_KEY, tree=tree,
+    _write_frame(report, frame_key=ROOT_FRAME_KEY, tree=tree,
                  writer_pid=_dead_pid())
 
-    frames = _load_frames(frames_dir)
-    [node] = frames[_ROOT_FRAME_KEY][0]["tree"]["nodes"]
+    frames = report.load_frames()
+    [node] = frames[ROOT_FRAME_KEY][0]["tree"]["nodes"]
     assert node["state"]["kind"] == "done"
     assert node["result"] == "ok"
 
@@ -184,8 +189,8 @@ def test_reconcile_recurses_into_children(tmp_path):
     """Stuck states can live arbitrarily deep in the tree — the
     reconciler walks the full subtree, not just root nodes."""
     ac._frames_cache_clear()
-    frames_dir = tmp_path / "_frames"
-    frames_dir.mkdir()
+    report = InvocationReport(invoke_id="inv-recurse",
+                              log_dir=tmp_path / "log", cwd="/cwd")
 
     parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
     stuck_grandchild = _running_node("gggggggg", "deep stuck")
@@ -194,11 +199,11 @@ def test_reconcile_recurses_into_children(tmp_path):
     root = _running_node("eeeeeeee", "top stuck")
     root.children = [stuck_child]
     tree = Tree(root_session=parent, nodes=[root], base_depth=0)
-    _write_frame(frames_dir, frame_key=_ROOT_FRAME_KEY, tree=tree,
+    _write_frame(report, frame_key=ROOT_FRAME_KEY, tree=tree,
                  writer_pid=_dead_pid())
 
-    frames = _load_frames(frames_dir)
-    [r] = frames[_ROOT_FRAME_KEY][0]["tree"]["nodes"]
+    frames = report.load_frames()
+    [r] = frames[ROOT_FRAME_KEY][0]["tree"]["nodes"]
     assert r["state"]["kind"] == "abandoned"
     [c] = r["children"]
     assert c["state"]["kind"] == "abandoned"
@@ -213,25 +218,16 @@ def test_merged_report_status_settles_to_abandoned(tmp_path):
     surfaces overall status='abandoned' (not 'running' or 'mixed'),
     which is what unwind needs to stop rendering the spinner."""
     ac._frames_cache_clear()
-    log_dir = tmp_path / "log"
-    ctx = _InvocationContext(
-        invoke_id="inv-orphan", log_dir=log_dir, cwd=str(tmp_path),
-        frame_key=_ROOT_FRAME_KEY, is_nested=False,
-    )
-    ctx.frames_dir.mkdir(parents=True)
+    report = InvocationReport(invoke_id="inv-orphan",
+                              log_dir=tmp_path / "log", cwd=str(tmp_path))
 
     parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
     stuck = _running_node("aaaa1111", "killed mid-turn")
     tree = Tree(root_session=parent, nodes=[stuck], base_depth=0)
-    _write_frame(ctx.frames_dir, frame_key=_ROOT_FRAME_KEY, tree=tree,
+    _write_frame(report, frame_key=ROOT_FRAME_KEY, tree=tree,
                  writer_pid=_dead_pid())
 
-    frames = _load_frames(ctx.frames_dir)
-    doc = _build_merged_report(
-        invoke_id="inv-orphan", frames=frames,
-        root_frame=frames[_ROOT_FRAME_KEY][0],
-        ended_at="2026-05-22T00:00:00+00:00",
-    )
+    doc = report.merged_document(ended_at="2026-05-22T00:00:00+00:00")
     assert doc["status"] == "abandoned"
     assert doc["tasks"][0]["status"] == "abandoned"
     assert doc["tasks"][0]["error"], (
@@ -248,8 +244,8 @@ def test_reconcile_preserves_awaiting_user_nodes(tmp_path, monkeypatch):
     SUSPENDED kinds — confirm an AwaitingUser frame whose writer is dead
     stays awaiting_user instead of getting demoted."""
     ac._frames_cache_clear()
-    frames_dir = tmp_path / "_frames"
-    frames_dir.mkdir()
+    report = InvocationReport(invoke_id="inv-awaiting-user",
+                              log_dir=tmp_path / "log", cwd="/cwd")
 
     parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
     yielded = Node(
@@ -259,12 +255,12 @@ def test_reconcile_preserves_awaiting_user_nodes(tmp_path, monkeypatch):
     )
     tree = Tree(root_session=parent, nodes=[yielded], base_depth=0)
 
-    _write_frame(frames_dir, frame_key=_ROOT_FRAME_KEY, tree=tree,
+    _write_frame(report, frame_key=ROOT_FRAME_KEY, tree=tree,
                  writer_pid=99999)  # nonexistent — guaranteed dead
     monkeypatch.setattr(frames_mod, "_pid_alive", lambda _pid: False)
 
-    loaded = _load_frames(frames_dir)
-    [node] = loaded[_ROOT_FRAME_KEY][0]["tree"]["nodes"]
+    loaded = report.load_frames()
+    [node] = loaded[ROOT_FRAME_KEY][0]["tree"]["nodes"]
     assert node["state"]["kind"] == "awaiting_user", (
         "AwaitingUser nodes are SUSPENDED (parked for a user reply), not "
         "non-terminal-and-stuck. The abandonment policy must skip them."
@@ -284,8 +280,8 @@ def test_reconcile_runs_on_dir_mtime_cache_hit(tmp_path, monkeypatch):
     on those cache hits — a writer can die between the cache prime and
     a subsequent read, and the report must converge on the next tick."""
     ac._frames_cache_clear()
-    frames_dir = tmp_path / "_frames"
-    frames_dir.mkdir()
+    report = InvocationReport(invoke_id="inv-cachehit",
+                              log_dir=tmp_path / "log", cwd="/cwd")
 
     parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
     running = _running_node("hhhhhhhh", "to be abandoned")
@@ -293,12 +289,11 @@ def test_reconcile_runs_on_dir_mtime_cache_hit(tmp_path, monkeypatch):
 
     # Stamp the frame with a pid that's still alive (this process) so the
     # first load primes the cache without reconciling.
-    live_pid_holder = {"pid": os.getpid()}
-    _write_frame(frames_dir, frame_key=_ROOT_FRAME_KEY, tree=tree,
-                 writer_pid=live_pid_holder["pid"])
+    _write_frame(report, frame_key=ROOT_FRAME_KEY, tree=tree,
+                 writer_pid=os.getpid())
 
-    first = _load_frames(frames_dir)
-    [node] = first[_ROOT_FRAME_KEY][0]["tree"]["nodes"]
+    first = report.load_frames()
+    [node] = first[ROOT_FRAME_KEY][0]["tree"]["nodes"]
     assert node["state"]["kind"] == "awaiting_turn", (
         "pre-condition: live-writer frame must NOT be reconciled"
     )
@@ -306,8 +301,8 @@ def test_reconcile_runs_on_dir_mtime_cache_hit(tmp_path, monkeypatch):
     # Now flip liveness without touching the file (so the dir-mtime cache
     # hit path is exercised) and verify the next load reconciles.
     monkeypatch.setattr(frames_mod, "_pid_alive", lambda _pid: False)
-    second = _load_frames(frames_dir)
-    [node2] = second[_ROOT_FRAME_KEY][0]["tree"]["nodes"]
+    second = report.load_frames()
+    [node2] = second[ROOT_FRAME_KEY][0]["tree"]["nodes"]
     assert node2["state"]["kind"] == "abandoned", (
         "dir-mtime cache hit must still run reconciliation — otherwise a "
         "writer that dies after the cache prime stays 'running' forever "
@@ -326,8 +321,8 @@ def test_ttl_fallback_treats_old_frame_as_abandoned(tmp_path, monkeypatch):
     set a tiny TTL so a freshly-written frame trips the wall-clock
     branch. Reconciliation must still fire."""
     ac._frames_cache_clear()
-    frames_dir = tmp_path / "_frames"
-    frames_dir.mkdir()
+    report = InvocationReport(invoke_id="inv-ttl",
+                              log_dir=tmp_path / "log", cwd="/cwd")
 
     parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
     tree = Tree(root_session=parent,
@@ -335,19 +330,19 @@ def test_ttl_fallback_treats_old_frame_as_abandoned(tmp_path, monkeypatch):
     # Frame from "an hour ago" — `started_at` is far older than the TTL
     # we'll configure below.
     frame = {
-        "frame_key": _ROOT_FRAME_KEY, "is_nested": False,
+        "frame_key": ROOT_FRAME_KEY, "is_nested": False,
         "kind": "call", "tasks": ["t"], "cwd": "/cwd",
         "started_at": "2020-01-01T00:00:00+00:00", "ended_at": "e",
         "tree": tree.to_dict(),
         "writer_pid": os.getpid(),
     }
-    (frames_dir / "root.yaml").write_text(yaml.safe_dump(frame))
+    report.write_frame(frame, key=ROOT_FRAME_KEY)
 
     monkeypatch.setattr(frames_mod, "_pid_alive", lambda _pid: True)
     monkeypatch.setenv("CALLSTACK_ORPHAN_TTL_SECONDS", "1")
 
-    loaded = _load_frames(frames_dir)
-    [node] = loaded[_ROOT_FRAME_KEY][0]["tree"]["nodes"]
+    loaded = report.load_frames()
+    [node] = loaded[ROOT_FRAME_KEY][0]["tree"]["nodes"]
     assert node["state"]["kind"] == "abandoned", (
         "TTL fallback should mark the frame abandoned even when pid is "
         "(falsely) reported alive — defense against PID reuse"
@@ -359,25 +354,25 @@ def test_ttl_fallback_disabled_with_zero(tmp_path, monkeypatch):
     entirely so old frames are kept "running" as long as `_pid_alive`
     says so. Regression guard that the opt-out actually works."""
     ac._frames_cache_clear()
-    frames_dir = tmp_path / "_frames"
-    frames_dir.mkdir()
+    report = InvocationReport(invoke_id="inv-ttl-zero",
+                              log_dir=tmp_path / "log", cwd="/cwd")
     parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
     tree = Tree(root_session=parent,
                 nodes=[_running_node("zzzzzzzz", "ancient")], base_depth=0)
     frame = {
-        "frame_key": _ROOT_FRAME_KEY, "is_nested": False,
+        "frame_key": ROOT_FRAME_KEY, "is_nested": False,
         "kind": "call", "tasks": ["t"], "cwd": "/cwd",
         "started_at": "2020-01-01T00:00:00+00:00", "ended_at": "e",
         "tree": tree.to_dict(),
         "writer_pid": os.getpid(),
     }
-    (frames_dir / "root.yaml").write_text(yaml.safe_dump(frame))
+    report.write_frame(frame, key=ROOT_FRAME_KEY)
 
     monkeypatch.setattr(frames_mod, "_pid_alive", lambda _pid: True)
     monkeypatch.setenv("CALLSTACK_ORPHAN_TTL_SECONDS", "0")
 
-    loaded = _load_frames(frames_dir)
-    [node] = loaded[_ROOT_FRAME_KEY][0]["tree"]["nodes"]
+    loaded = report.load_frames()
+    [node] = loaded[ROOT_FRAME_KEY][0]["tree"]["nodes"]
     assert node["state"]["kind"] == "awaiting_turn", (
         "TTL=0 must restore pre-fix behavior: live pid keeps the frame "
         "running regardless of age"
@@ -385,55 +380,49 @@ def test_ttl_fallback_disabled_with_zero(tmp_path, monkeypatch):
 
 
 def test_cache_returns_independent_copies(tmp_path):
-    """`_load_frames` promises callers can mutate the returned dict and
+    """`load_frames` promises callers can mutate the returned dict and
     nested frame contents freely. The internal dir-mtime + parsed-frame
     caches must deep-copy on retrieval so a caller-side mutation cannot
     poison subsequent loads. Regression for REVIEW-205: the in-flight
     diff shared frame-dict references between the cache and callers."""
     ac._frames_cache_clear()
-    frames_dir = tmp_path / "_frames"
-    frames_dir.mkdir()
+    report = InvocationReport(invoke_id="inv-indep",
+                              log_dir=tmp_path / "log", cwd="/cwd")
     parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
     tree = Tree(root_session=parent,
                 nodes=[_running_node("nnnnnnnn", "t")], base_depth=0)
     # Stamp with this process's pid so reconciliation is a no-op and
     # any visible mutation must have come from the caller side.
-    _write_frame(frames_dir, frame_key=_ROOT_FRAME_KEY, tree=tree,
+    _write_frame(report, frame_key=ROOT_FRAME_KEY, tree=tree,
                  writer_pid=os.getpid())
 
-    first = _load_frames(frames_dir)
+    first = report.load_frames()
     # Aggressive caller mutation: rewrite the inner frame dict.
-    first[_ROOT_FRAME_KEY][0]["tree"]["nodes"][0]["task"] = "POISONED"
-    first[_ROOT_FRAME_KEY][0]["frame_key"] = "POISONED_KEY"
+    first[ROOT_FRAME_KEY][0]["tree"]["nodes"][0]["task"] = "POISONED"
+    first[ROOT_FRAME_KEY][0]["frame_key"] = "POISONED_KEY"
     first["INJECTED_KEY"] = []
 
     # Second load must NOT see any of the caller-side mutations — both
     # the dir-mtime cache hit and the per-file parsed cache hit are on
     # the hot path here (mtime hasn't changed).
-    second = _load_frames(frames_dir)
+    second = report.load_frames()
     assert "INJECTED_KEY" not in second
-    assert second[_ROOT_FRAME_KEY][0]["frame_key"] == _ROOT_FRAME_KEY
-    assert second[_ROOT_FRAME_KEY][0]["tree"]["nodes"][0]["task"] == "t"
+    assert second[ROOT_FRAME_KEY][0]["frame_key"] == ROOT_FRAME_KEY
+    assert second[ROOT_FRAME_KEY][0]["tree"]["nodes"][0]["task"] == "t"
 
 
 def test_writer_pid_is_stamped_on_live_frame_writes(tmp_path):
-    """Sanity-check the producer side: `_LiveReporter._write_frame` must
+    """Sanity-check the producer side: the live reporter's frame write must
     record the current pid so the reconciler has something to probe."""
-    from agent_callstack.reporter import _LiveReporter
-
-    ctx = _InvocationContext(
-        invoke_id="inv-pid-stamp", log_dir=tmp_path / "log",
-        cwd=str(tmp_path), frame_key=_ROOT_FRAME_KEY, is_nested=False,
-    )
-    ctx.invocation_dir.mkdir(parents=True)
-    ctx.frames_dir.mkdir(parents=True)
-    reporter = _LiveReporter(
-        ctx=ctx, kind="call", tasks=["t"], started_at="s",
-    )
+    report = InvocationReport(invoke_id="inv-pid-stamp",
+                              log_dir=tmp_path / "log", cwd=str(tmp_path))
+    report.invocation_dir.mkdir(parents=True, exist_ok=True)
+    report.frames_dir.mkdir(parents=True, exist_ok=True)
+    reporter = report.reporter(kind="call", tasks=["t"], started_at="s")
     parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
     node = _running_node("iiiiiiii", "t")
     tree = Tree(root_session=parent, nodes=[node], base_depth=0)
     reporter._write_frame(tree, ended_at="e")
 
-    written = yaml.safe_load(ctx.frame_path().read_text())
+    written = yaml.safe_load(report.frame_path().read_text())
     assert written.get("writer_pid") == os.getpid()
