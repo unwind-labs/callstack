@@ -213,7 +213,8 @@ class TestFix4ReportWarning:
     must include a `report_warning` so the calling agent knows the
     `report_path` it received is unreliable."""
 
-    def test_envelope_includes_warning_when_report_missing(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_envelope_includes_warning_when_report_missing(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
 
         import mcp_server  # type: ignore
@@ -234,10 +235,7 @@ class TestFix4ReportWarning:
         monkeypatch.setattr(mcp_server.asyncio, "to_thread", _to_thread)
         monkeypatch.setattr(mcp_server.Caller, "call_many", _fake_call_many)
 
-        import asyncio
-        result_str = asyncio.get_event_loop().run_until_complete(
-            mcp_server.call(["t"], cwd=str(tmp_path))
-        )
+        result_str = await mcp_server.call(["t"], cwd=str(tmp_path))
         envelope = json.loads(result_str)
         # The fake call_many never wrote a report — verification kicks in.
         assert "report_warning" in envelope, (
@@ -380,7 +378,10 @@ class TestFix7NestedPartialReport:
             "started_at": "2030-01-01T00:00:00Z",
             "ended_at": "2030-01-01T00:00:01Z",
             "tree": {
-                "schema_version": 1,
+                # Canonical on-disk shape stamps "2" (string); Tree.from_dict
+                # rejects 1/missing (pinned in test_driver.py). Keep this in
+                # sync so the planted fixture matches production frames.
+                "schema_version": "2",
                 "root_session_id": "00000000-0000-0000-0000-000000000099",
                 "root_session_file": str(tmp_path / "fake.jsonl"),
                 "base_depth": 0,

@@ -109,9 +109,13 @@ class TestTreeStore:
                 errors.append(e)
 
         threads = [threading.Thread(target=race) for _ in range(8)]
+        # Spawn all 8 threads BEFORE releasing the barrier. Setting start
+        # inside the spawn loop (the prior bug) let the first thread run to
+        # completion before the rest existed, so the SEC-007 race this test
+        # claims to exercise never actually happened.
         for t in threads:
             t.start()
-            start.set()
+        start.set()
         for t in threads:
             t.join()
 
