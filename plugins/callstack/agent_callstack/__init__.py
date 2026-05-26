@@ -20,7 +20,6 @@ For power users (custom session, model, permission handler, etc.):
 from __future__ import annotations
 
 import os
-import uuid
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -36,12 +35,11 @@ from .background import (
 from .channel import ClaudeChannel, PermissionHandler, allow_all, shutdown_pool
 from .driver import Driver, Node, Tree
 from .frames import (
-    _ROOT_FRAME_KEY,
     _build_merged_report,
     _frames_cache_clear,
     _load_frames,
-    _most_recent_session,
 )
+from .invocation import InvocationFactory
 from .invocation_ctx import _InvocationContext, _new_invoke_id, _utc_now_iso
 from .report import InvocationReport, ROOT_FRAME_KEY
 from .reporter import (
@@ -162,6 +160,15 @@ class Caller:
         self._log_dir = log_dir
         self._invoke_id = invoke_id
         self._seed = seed
+        # Owns the nested-vs-root identity decision and child-env propagation.
+        # Reads process env lazily (per call), so it stays correct even if a
+        # host pops stale CALLSTACK_ROOT_* between Caller construction and use.
+        self._inv = InvocationFactory(
+            explicit_cwd=cwd,
+            explicit_log_dir=log_dir,
+            explicit_invoke_id=invoke_id,
+            max_depth=self._max_depth,
+        )
 
     def call(self, task: str, *, context: str = "fork") -> Result:
         results = self._invoke([task], context=context)
@@ -268,110 +275,33 @@ class Caller:
         return _results_from_tree(tree)
 
     def _parent_project_cwd(self) -> Optional[str]:
-        """Project folder of the caller's session — needed for cross-project
-        fresh calls where `self._cwd` is the child's target, not the parent's
-        project. Falls back through env, explicit cwd, then os.getcwd()."""
-        # We're inside a nested invocation iff the parent stamped its root
-        # identity into our env. ENV_ROOT_INVOKE_ID is the canonical
-        # "we're nested" signal; the legacy ENV_PARENT_SESSION env var
-        # was removed (its inherited value caused the regression where
-        # grandchildren forked from root instead of their immediate parent).
-        if os.environ.get(ENV_ROOT_INVOKE_ID):
-            try:
-                # MCP server's os.getcwd() is reliably the caller's project
-                # folder; trust it over self._cwd (which may be a redirected
-                # child target in cross-project fresh calls).
-                return os.getcwd()
-            except OSError:
-                pass
-        return self._cwd or os.getcwd()
-
-    def _effective_cwd(self, parent: SessionRef) -> str:
-        return self._cwd or parent.cwd or os.getcwd()
-
-    def _effective_log_dir(self, cwd: str) -> Path:
-        return self._log_dir or (Path(cwd) / ".claude" / "callstack" / "log")
+        """Project folder of the caller's session (delegated to the factory) —
+        needed for cross-project fresh calls where `self._cwd` is the child's
+        target, not the parent's project."""
+        return self._inv.parent_project_cwd()
 
     def _resolve_invocation_context(self, parent: SessionRef) -> _InvocationContext:
-        """Decide whether this call is a top-level (root) invocation or nested
-        inside an already-running one. Nested calls inherit the root's
-        `invoke_id` + `log_dir` from env so their tree can be merged under
-        the caller's node in the root's report."""
-        effective_cwd = self._effective_cwd(parent)
-        root_id_env = os.environ.get(ENV_ROOT_INVOKE_ID)
-        root_log_env = os.environ.get(ENV_ROOT_LOG_DIR)
-        if root_id_env and root_log_env:
-            # Deterministic: the parent Driver stamped this subprocess with
-            # the caller node's id via CALLSTACK_FRAME_KEY. Fall back to
-            # session heuristics only if the env didn't survive (shouldn't
-            # happen with a current agent-callstack parent, but keeps us
-            # robust when nested under an older runtime).
-            frame_key = (
-                os.environ.get(ENV_FRAME_KEY)
-                or os.environ.get(ENV_CLAUDE_SESSION)
-                or _most_recent_session(effective_cwd)
-                or f"pid-{os.getpid()}"
-            )
-            return _InvocationContext(
-                invoke_id=root_id_env,
-                log_dir=Path(root_log_env),
-                cwd=effective_cwd,
-                frame_key=frame_key,
-                is_nested=True,
-                # Unique per nested invocation so multiple sibling invokes
-                # from the same caller (e.g. a deep-rewrite fork running
-                # specialists, then meta-assessors, then re-author) don't
-                # share — and overwrite — one frame file.
-                instance_id=uuid.uuid4().hex[:12],
-            )
-        return _InvocationContext(
-            invoke_id=self._invoke_id or _new_invoke_id(),
-            log_dir=self._effective_log_dir(effective_cwd),
-            cwd=effective_cwd,
-            frame_key=_ROOT_FRAME_KEY,
-            is_nested=False,
-        )
+        """Decide whether this call is root or nested (delegated to the
+        factory). Nested calls inherit the root's `invoke_id` + `log_dir` so
+        their tree merges under the caller's node in the root's report."""
+        return self._inv.context(parent.cwd)
 
     def _driver_for(self, parent: SessionRef, *, ctx: _InvocationContext,
                     depth_base: int = 0) -> Driver:
-        cwd = self._effective_cwd(parent)
-        # Children inherit the depth via env so nested CALLs respect max_depth.
-        # Root identity propagates so nested MCP invokes can find and merge
-        # into this same invocation's report.
-        #
-        # We deliberately do NOT propagate CALLSTACK_PARENT_SESSION (legacy
-        # env removed) — its inherited value caused grandchildren to
-        # resolve the *root* as their parent. The child's own session
-        # UUID is instead stamped by `ClaudeChannel._spawn()` as
-        # CALLSTACK_OWN_SESSION, paired with `--session-id <uuid>` on
-        # the spawned claude's argv, so it's deterministic and immune
-        # to env inheritance across spawn depth.
-        env = {
-            ENV_DEPTH: str(depth_base + 1),
-            ENV_ROOT_INVOKE_ID: ctx.invoke_id,
-            ENV_ROOT_LOG_DIR: str(ctx.log_dir),
-            # CORR-101: stamp the effective max_depth onto every spawned
-            # child so a grandchild doesn't silently revert to the default
-            # cap when the root explicitly chose a smaller one. Without
-            # this, ENV_MAX_DEPTH is only honored if the caller (or a
-            # human's shell) happened to export it — a per-Caller
-            # max_depth=3 would be ignored by claude subprocesses that
-            # inherit only the unset env, and ENV_DEPTH alone would
-            # compare against the child's default 10.
-            ENV_MAX_DEPTH: str(self._max_depth),
-        }
+        # Identity + child-env propagation live in the factory; the channel /
+        # trace / store wiring is this Caller's runtime config.
         channel = ClaudeChannel(
             model=self._model,
             permission_mode=self._permission_mode,
             permission_handler=self._on_permission,
-            env=env,
+            env=self._inv.child_env(ctx, depth_base=depth_base),
         )
         return Driver(
             channel=channel,
             resolve_session=SessionLocator().resolve,
             trace=TraceWriter(ctx.invocation_dir),
             store=TreeStore(),
-            cwd=cwd,
+            cwd=self._inv.effective_cwd(parent.cwd),
             timeout=self._timeout,
             max_depth=self._max_depth,
             seed=self._seed,
