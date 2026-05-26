@@ -7,7 +7,18 @@ from pathlib import Path
 
 import pytest
 
-from agent_callstack.session import SessionLocator, count_lines
+import agent_callstack.session as session_mod
+from agent_callstack.session import (
+    SessionLocator,
+    _extract_cwd,
+    _load_session_index,
+    _save_session_index,
+    _SESSION_INDEX_FILENAME,
+    count_lines,
+    encode_project_dir,
+    envelope_from_session_record,
+    session_record_epoch,
+)
 
 
 # Tests use stable UUID-shaped ids — SessionLocator validates session_id
@@ -203,6 +214,19 @@ class TestLocate:
         with pytest.raises(RuntimeError, match="Could not discover"):
             loc.locate()
 
+    def test_nested_invocation_refuses_mtime_fallback(self, projects, monkeypatch):
+        """The /call cross-fork guard: inside a nested invocation
+        (CALLSTACK_ROOT_INVOKE_ID set) with neither session env var present,
+        locate() must REFUSE the mtime heuristic and fail loud — under
+        concurrent sibling /calls the most-recently-touched .jsonl races, so
+        guessing would resolve a sibling as the parent and corrupt the tree."""
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        monkeypatch.delenv("CALLSTACK_OWN_SESSION", raising=False)
+        monkeypatch.setenv("CALLSTACK_ROOT_INVOKE_ID", "20260526T000000-deadbeef")
+        loc = SessionLocator(projects_dir=projects)
+        with pytest.raises(RuntimeError, match="nested invocation"):
+            loc.locate()
+
 
 class TestSessionRefCwd:
 
@@ -339,3 +363,193 @@ class TestMostRecentSession:
         os.utime(new, (2000, 2000))
         os.utime(proj, (2000, 2000))  # bump dir mtime → cache invalidates
         assert session_mod.most_recent_session(cwd) == _sid("new")
+
+
+class TestLocateEnvFallthrough:
+    """locate() walks the env-var priority chain; a var that is set but whose
+    value doesn't resolve to a real session must be skipped, not treated as the
+    answer — otherwise a stale id would shadow a later, valid one."""
+
+    def test_unresolvable_env_var_is_skipped_for_next(self, projects, monkeypatch):
+        # CALLSTACK_OWN_SESSION points at a UUID with no file on disk; the
+        # locator must fall through to the resolvable CLAUDE_CODE_SESSION_ID.
+        _make_session(projects / "p", "uuid-env")
+        monkeypatch.setenv("CALLSTACK_OWN_SESSION", _sid("ghost"))  # no file
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", _sid("uuid-env"))
+        monkeypatch.delenv("CALLSTACK_ROOT_INVOKE_ID", raising=False)
+        loc = SessionLocator(projects_dir=projects)
+        assert loc.locate().session_id == _sid("uuid-env")
+
+
+class TestResolveIndexAndScan:
+    """resolve() tries cwd-match → persisted index → full scan. The index hit
+    and the scan's skip branches (non-dir entries, non-jsonl files, unrelated
+    sessions) are the paths the cwd-match happy case never exercises."""
+
+    def test_index_hit_returns_without_scan(self, projects):
+        f = _make_session(projects / "proj-a", "abc123")
+        # Pre-seed the index so resolve() returns via the index, not a scan.
+        _save_session_index(projects, {_sid("abc123"): "proj-a"})
+        loc = SessionLocator(projects_dir=projects)
+        assert loc.resolve(_sid("abc123")) == f
+
+    def test_scan_skips_nondir_and_nonjsonl_and_unrelated(self, projects):
+        # A stray file at the projects root (not a dir) must be skipped.
+        (projects / "loose.txt").write_text("x")
+        # A project dir containing a non-jsonl file and an unrelated session.
+        proj = projects / "proj-a"
+        proj.mkdir()
+        (proj / "notes.md").write_text("ignore me")
+        _make_session(proj, "elsewhere")  # unrelated sid, found stays None
+        target = _make_session(proj, "abc123")
+        loc = SessionLocator(projects_dir=projects)
+        assert loc.resolve(_sid("abc123")) == target
+        # The scan populated the index with everything it saw.
+        idx = _load_session_index(projects)
+        assert idx.get(_sid("abc123")) == "proj-a"
+        assert idx.get(_sid("elsewhere")) == "proj-a"
+
+    def test_scan_tolerates_unreadable_project_dir(self, projects, monkeypatch):
+        """A project dir that raises on scandir (perm denied, vanished mid-scan)
+        must be skipped so one bad dir can't abort discovery of others."""
+        proj = projects / "proj-a"
+        target = _make_session(proj, "abc123")
+        bad = projects / "locked"
+        bad.mkdir()
+        real_scandir = os.scandir
+
+        def flaky_scandir(path):
+            if Path(path) == bad:
+                raise OSError("permission denied")
+            return real_scandir(path)
+
+        monkeypatch.setattr(session_mod.os, "scandir", flaky_scandir)
+        loc = SessionLocator(projects_dir=projects)
+        assert loc.resolve(_sid("abc123")) == target
+
+
+class TestMostRecentBranches:
+    """_most_recent caches per-cwd keyed on the project dir mtime and skips
+    non-jsonl files. The cache-hit short-circuit and the file-type skip are
+    branches the freshness tests above don't pin directly."""
+
+    def test_cache_hit_returns_same_ref_without_rescan(self, projects, monkeypatch):
+        cwd = "/cache/proj"
+        proj = projects / encode_project_dir(cwd)
+        _make_session(proj, "old", cwd=cwd)
+        loc = SessionLocator(projects_dir=projects)
+        first = loc._most_recent(cwd)
+        # Second call with the dir mtime unchanged must return the cached ref
+        # without a rescan — make a rescan fail loudly to prove it isn't run.
+        monkeypatch.setattr(session_mod.os, "scandir",
+                            lambda *_a: pytest.fail("rescanned despite cache hit"))
+        assert loc._most_recent(cwd) is first
+
+    def test_skips_non_jsonl_files(self, projects):
+        cwd = "/mixed/proj"
+        proj = projects / encode_project_dir(cwd)
+        sess = _make_session(proj, "new", cwd=cwd)
+        (proj / "README.txt").write_text("not a session")
+        loc = SessionLocator(projects_dir=projects)
+        ref = loc._most_recent(cwd)
+        assert ref is not None and ref.file == sess
+
+
+class TestEnvelopeFromSessionRecord:
+    """envelope_from_session_record owns the session-record *shape*: only an
+    assistant row whose content list holds a text block with a parseable
+    envelope yields one. Every other shape must return None so a quoted or
+    malformed envelope is never mistaken for the agent's terminal signal."""
+
+    def _assistant(self, content):
+        return {"message": {"role": "assistant", "content": content}}
+
+    def test_returns_envelope_from_text_block(self):
+        from agent_callstack.protocol import Return
+        rec = self._assistant([
+            {"type": "text",
+             "text": "```json\n{\"op\": \"return\", \"result\": \"ok\"}\n```"},
+        ])
+        env = envelope_from_session_record(rec)
+        assert isinstance(env, Return) and env.result == "ok"
+
+    def test_non_assistant_row_ignored(self):
+        assert envelope_from_session_record(
+            {"message": {"role": "user", "content": []}}) is None
+
+    def test_content_not_a_list_returns_none(self):
+        assert envelope_from_session_record(
+            {"message": {"role": "assistant", "content": "oops"}}) is None
+
+    def test_non_text_blocks_and_no_envelope_returns_none(self):
+        rec = self._assistant([
+            {"type": "tool_use", "name": "Bash"},        # non-text block skipped
+            {"type": "text", "text": 123},                 # text not a str skipped
+            {"type": "text", "text": "just prose, no fence"},  # parses to None
+        ])
+        assert envelope_from_session_record(rec) is None
+
+
+class TestSessionRecordEpoch:
+    """session_record_epoch converts a record's ISO-8601 timestamp to epoch
+    seconds; an absent or unparseable timestamp yields None rather than raising,
+    so a malformed row can't crash report assembly."""
+
+    def test_parses_iso_timestamp(self):
+        epoch = session_record_epoch({"timestamp": "2026-05-18T15:49:09.206Z"})
+        assert epoch is not None and epoch > 0
+
+    def test_missing_timestamp_returns_none(self):
+        assert session_record_epoch({}) is None
+
+    def test_unparseable_timestamp_returns_none(self):
+        assert session_record_epoch({"timestamp": "not-a-date"}) is None
+
+
+class TestExtractCwd:
+    """_extract_cwd returns the first recorded cwd that still exists on disk,
+    skipping blank lines and unparseable rows so a noisy JSONL prefix doesn't
+    hide a valid cwd later in the file."""
+
+    def test_skips_blank_lines_then_finds_cwd(self, tmp_path):
+        f = tmp_path / "s.jsonl"
+        f.write_text("\n   \n" + json.dumps({"cwd": str(tmp_path)}) + "\n")
+        assert _extract_cwd(f) == str(tmp_path)
+
+    def test_missing_file_returns_none(self, tmp_path):
+        assert _extract_cwd(tmp_path / "ghost.jsonl") is None
+
+    def test_skips_unparseable_line_then_finds_cwd(self, tmp_path):
+        f = tmp_path / "s.jsonl"
+        f.write_text("{not valid json\n" + json.dumps({"cwd": str(tmp_path)}) + "\n")
+        assert _extract_cwd(f) == str(tmp_path)
+
+
+class TestSessionIndexPersistence:
+    """The lazy session index is best-effort: a corrupt or non-dict file loads
+    as empty, a round-trip survives, and write failures (bad dir, unserializable
+    payload) never silently corrupt the on-disk index."""
+
+    def test_load_missing_returns_empty(self, projects):
+        assert _load_session_index(projects) == {}
+
+    def test_roundtrip_filters_non_string_entries(self, projects):
+        _save_session_index(projects, {"a": "dir-a"})
+        assert _load_session_index(projects) == {"a": "dir-a"}
+
+    def test_non_dict_index_file_loads_as_empty(self, projects):
+        (projects / _SESSION_INDEX_FILENAME).write_text(json.dumps(["not", "a", "dict"]))
+        assert _load_session_index(projects) == {}
+
+    def test_save_to_missing_dir_is_silent(self, tmp_path):
+        # mkstemp on a nonexistent dir raises OSError; save must swallow it.
+        _save_session_index(tmp_path / "does-not-exist", {"a": "b"})  # no raise
+
+    def test_save_unserializable_payload_cleans_up_and_raises(self, projects):
+        # json.dump fails on a non-serializable value after the temp file is
+        # opened; the temp file must be unlinked and the error re-raised (not
+        # left as a dangling .tmp).
+        with pytest.raises(TypeError):
+            _save_session_index(projects, {"a": object()})  # type: ignore[dict-item]
+        leftovers = list(projects.glob(_SESSION_INDEX_FILENAME + ".*"))
+        assert leftovers == [], f"temp index file left behind: {leftovers}"
