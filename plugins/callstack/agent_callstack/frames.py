@@ -362,18 +362,19 @@ def _grafted_children(node_dict: dict,
 def _build_merged_report(*, invoke_id: str, frames: dict[str, list[dict]],
                          root_frame: dict, ended_at: str) -> dict:
     """Produce the report.yaml document by grafting each non-root frame's
-    tree under the node (anywhere in the root's tree) whose session_id
-    matches the frame key. Multiple frames may share a key (one per
-    sibling nested invocation); their nodes are concatenated under the
-    matching caller node, in started_at order."""
+    tree under the node (anywhere in the root's tree) whose id matches the
+    frame key — the caller node id (set via CALLSTACK_FRAME_KEY) preferred,
+    session_id as fallback (see `_grafted_children`). Multiple frames may
+    share a key (one per sibling nested invocation); their nodes are
+    concatenated under the matching caller node, in started_at order."""
     root_tree = root_frame.get("tree", {})
     root_nodes = root_tree.get("nodes", []) or []
-    nested_by_session = {k: v for k, v in frames.items() if k != _ROOT_FRAME_KEY}
+    nested_by_key = {k: v for k, v in frames.items() if k != _ROOT_FRAME_KEY}
     tasks = root_frame.get("tasks") or []
     merged_nodes = [
         _graft_node(n, tasks[i] if i < len(tasks) else n.get("task", ""),
                     depth=root_tree.get("base_depth", 0) + 1,
-                    nested_by_session=nested_by_session)
+                    nested_by_key=nested_by_key)
         for i, n in enumerate(root_nodes)
     ]
     overall = _status_of_nodes(merged_nodes)
@@ -389,13 +390,13 @@ def _build_merged_report(*, invoke_id: str, frames: dict[str, list[dict]],
             sum(float(n.get("duration_seconds", 0.0)) for n in merged_nodes), 2,
         ),
         "status": overall,
-        "nested_frames": sorted(nested_by_session.keys()),
+        "nested_frames": sorted(nested_by_key.keys()),
         "tasks": merged_nodes,
     }
 
 
 def _graft_node(node_dict: dict, input_text: str, *, depth: int,
-                nested_by_session: dict[str, list[dict]]) -> dict:
+                nested_by_key: dict[str, list[dict]]) -> dict:
     """Render one Node.to_dict() into report shape, attaching nested-frame
     children whose frame key matches this node's id (preferred, set by the
     parent Driver via CALLSTACK_FRAME_KEY) or session_id (fallback). When
@@ -404,8 +405,8 @@ def _graft_node(node_dict: dict, input_text: str, *, depth: int,
     ``started_at`` so order is stable."""
     children = [
         _graft_node(c, c.get("task", ""), depth=depth + 1,
-                    nested_by_session=nested_by_session)
-        for c in _grafted_children(node_dict, nested_by_session)
+                    nested_by_key=nested_by_key)
+        for c in _grafted_children(node_dict, nested_by_key)
     ]
     out: dict = {
         "id": str(node_dict.get("id", ""))[:8],

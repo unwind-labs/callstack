@@ -11,6 +11,7 @@ single node.
 """
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from typing import Any, Literal, Optional, Union
 
@@ -313,5 +314,4 @@ def step(state: State, event: Event) -> tuple[State, list[Effect]]:
 
 
 def _fresh_child_id() -> str:
-    import uuid
     return uuid.uuid4().hex

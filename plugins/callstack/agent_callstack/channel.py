@@ -395,8 +395,8 @@ def _get_pool() -> ClaudePool:
 
 def shutdown_pool() -> None:
     """Tear down every pooled `claude` subprocess. Called by `Caller.close()`
-    and at interpreter exit. Subsequent run_turn calls will rebuild the pool
-    lazily."""
+    and at interpreter exit. `_pool` is not nulled, so subsequent run_turn
+    calls reuse the same (now-empty) pool object, repopulating it on demand."""
     global _pool
     if _pool is not None:
         _pool.shutdown()

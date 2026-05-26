@@ -209,8 +209,18 @@ class BackgroundRuns:
                  if r.task.done() and not r.polled]
         for iid in stale:
             run = self._runs.pop(iid)
-            if not run.task.cancelled():
-                run.task.exception()  # consume so asyncio stays quiet
+            if run.task.cancelled():
+                continue
+            exc = run.task.exception()  # consume so asyncio stays quiet
+            if exc is not None:
+                # Symmetry with reconcile()'s crash path: a fire-and-forget
+                # run that crashed and was never polled can leave non-terminal
+                # frames on disk no caller will ever finalize. Force-terminate
+                # them so an abandoned crash doesn't leave a stuck-running row.
+                self._finalize_crashed(
+                    run,
+                    reason="abandoned background call_many crashed (never polled)",
+                )
 
     def _inflight(self) -> int:
         """Count of runs whose task has not yet finished. This is what the

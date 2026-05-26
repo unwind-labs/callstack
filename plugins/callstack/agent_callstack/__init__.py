@@ -35,7 +35,6 @@ from .background import (
 from .channel import ClaudeChannel, PermissionHandler, allow_all, shutdown_pool
 from .driver import Driver, Node, Tree
 from .frames import (
-    _build_merged_report,
     _frames_cache_clear,
     _load_frames,
 )
@@ -43,12 +42,8 @@ from .invocation import InvocationFactory
 from .invocation_ctx import _InvocationContext, _new_invoke_id, _utc_now_iso
 from .report import InvocationReport, ROOT_FRAME_KEY
 from .reporter import (
-    _DEFAULT_REPORT_DEBOUNCE_SECS,
     _LiveReporter,
-    _atomic_write_bytes,
     _atomic_yaml_write,
-    _interprocess_lock,
-    _report_debounce_secs,
 )
 from .results import (
     CallFailed,

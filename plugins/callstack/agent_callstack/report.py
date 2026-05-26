@@ -62,14 +62,19 @@ class InvocationReport:
     def __init__(
         self,
         *,
-        invoke_id: str,
-        log_dir: Path,
-        cwd: str,
+        invoke_id: str = "",
+        log_dir: Path = Path("."),
+        cwd: str = "",
         frame_key: str = ROOT_FRAME_KEY,
         is_nested: bool = False,
         instance_id: str = "",
+        ctx: Optional[_InvocationContext] = None,
     ):
-        self._ctx = _InvocationContext(
+        # Single construction path so any future init state runs for both
+        # the component form and the `from_context` form (which would
+        # silently skip __init__ under the old __new__ idiom). When `ctx`
+        # is supplied it is authoritative; otherwise build one from parts.
+        self._ctx = ctx if ctx is not None else _InvocationContext(
             invoke_id=invoke_id,
             log_dir=Path(log_dir),
             cwd=cwd,
@@ -83,9 +88,7 @@ class InvocationReport:
         """Wrap an already-resolved `_InvocationContext`. Used by callers that
         resolve nested-vs-root identity separately (e.g. the Caller's
         invocation-context resolution) and then want the report boundary."""
-        obj = cls.__new__(cls)
-        obj._ctx = ctx
-        return obj
+        return cls(ctx=ctx)
 
     # ---- identity / paths ----
 

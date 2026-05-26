@@ -271,7 +271,11 @@ def _parse_ts(ts: Optional[str]) -> Optional[datetime]:
     if not ts:
         return None
     try:
-        return datetime.fromisoformat(ts.rstrip("Z"))
+        # `Z` (UTC) isn't parsed by fromisoformat before 3.11 and the repo
+        # targets >=3.10; map it to an explicit offset. `replace` (not
+        # `rstrip`) so only the zone suffix is touched, never a stray
+        # trailing 'Z' inside the timestamp.
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
 

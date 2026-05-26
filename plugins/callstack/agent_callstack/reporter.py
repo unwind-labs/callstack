@@ -8,7 +8,7 @@ the heavy merged-report rewrite behind a debounce timer (PERF-A) plus a
 content-hash skip (don't rewrite if the rebuilt document is identical
 to what's already on disk).
 
-A cross-process `fcntl.flock` serializes the merge so parent and nested
+A cross-process `fcntl.lockf` serializes the merge so parent and nested
 writers can't corrupt each other; an in-process lock serializes parallel
 roots in the same `call_many`.
 """
@@ -61,7 +61,7 @@ class _LiveReporter:
     behind a ~0.25 s timer; finalize() forces a synchronous flush so the
     on-disk report is fully up to date when the run ends.
 
-    A cross-process `fcntl.flock` serializes the merge so parent and
+    A cross-process `fcntl.lockf` serializes the merge so parent and
     nested writers can't corrupt each other's updates; an in-process lock
     serializes parallel roots in the same `call_many`."""
 

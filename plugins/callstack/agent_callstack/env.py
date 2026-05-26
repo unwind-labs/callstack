@@ -152,7 +152,9 @@ def max_background() -> int:
 
 
 def max_concurrent_forks() -> int:
-    raw = os.environ.get(ENV_MAX_CONCURRENT_FORKS, str(_DEFAULT_MAX_CONCURRENT_FORKS))
+    raw = os.environ.get(ENV_MAX_CONCURRENT_FORKS)
+    if raw is None:
+        return _DEFAULT_MAX_CONCURRENT_FORKS
     try:
         v = int(raw)
         return v if v > 0 else _DEFAULT_MAX_CONCURRENT_FORKS
@@ -161,13 +163,15 @@ def max_concurrent_forks() -> int:
 
 
 def max_in_flight_turns() -> int:
-    raw = os.environ.get(ENV_MAX_IN_FLIGHT_TURNS,
-                         str(max_concurrent_forks() * 2))
+    default = max_concurrent_forks() * 2
+    raw = os.environ.get(ENV_MAX_IN_FLIGHT_TURNS)
+    if raw is None:
+        return default
     try:
         v = int(raw)
-        return v if v > 0 else max_concurrent_forks() * 2
+        return v if v > 0 else default
     except ValueError:
-        return max_concurrent_forks() * 2
+        return default
 
 
 def report_debounce_secs() -> float:
