@@ -111,7 +111,7 @@ class SessionAnalyzer:
                 SessionMessage(
                     timestamp=_parse_ts(obj.get("timestamp")),
                     type=obj.get("type", ""),
-                    role=obj.get("message", {}).get("role") if isinstance(obj.get("message"), dict) else None,
+                    role=_message_dict(obj).get("role"),
                     text=text,
                     tool_name=tool,
                 )
@@ -291,14 +291,15 @@ def _parse_ts(ts: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def _message_dict(obj: dict) -> dict:
+    """obj's `message` as a dict; absent or non-dict (malformed) collapses to {} (soft-skip)."""
+    msg = obj.get("message")
+    return msg if isinstance(msg, dict) else {}
+
+
 def _content_preview(obj: dict) -> tuple[str, Optional[str]]:
     """Extract a flat text preview and a tool name (if any) from a message."""
-    # Guard non-dict `message` (e.g. a JSON string) the same way
-    # session_messages() does: `or {}` only catches falsy values, so a
-    # truthy non-dict would reach msg.get(...) and raise AttributeError.
-    msg = obj.get("message")
-    if not isinstance(msg, dict):
-        return "", None
+    msg = _message_dict(obj)
     if isinstance(msg.get("content"), str):
         return msg["content"][:200], None
     if isinstance(msg.get("content"), list):
