@@ -12,12 +12,16 @@ dependencies = [
     "mcp",
 ]
 
-# The runtime package lives under plugins/callstack and is consumed via
-# pytest's pythonpath, not by being installed. Declare no importable modules
-# so `pip install -e '.[dev]'` resolves the dev extras without setuptools
-# attempting (and failing) package auto-discovery.
-[tool.setuptools]
-py-modules = []
+# The importable runtime package `agent_callstack` lives under
+# plugins/callstack/ (that directory is the plugin's CLAUDE_PLUGIN_ROOT — see
+# .claude-plugin/plugin.json — so it cannot be relocated). Point setuptools at
+# the real location instead of pretending there are no modules. `mcp_server.py`
+# is a loose script the plugin loader runs by path (not imported), and
+# resources/analysis/*.py are standalone subprocess scripts (no __init__.py),
+# so neither is a package — `include` scopes discovery to agent_callstack only.
+[tool.setuptools.packages.find]
+where = ["plugins/callstack"]
+include = ["agent_callstack*"]
 
 [project.optional-dependencies]
 dev = [
@@ -36,6 +40,11 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Lets `pytest` run from a bare checkout without first installing the package.
+# Equivalent to what `pip install -e .` writes to its .pth (plugins/callstack
+# on sys.path), but available with zero install — which is the dominant
+# workflow for this Claude Code plugin. Kept deliberately; see M1 in the
+# run-tasks log for the editable-install alternative.
 pythonpath = ["plugins/callstack"]
 
 [tool.coverage.run]
