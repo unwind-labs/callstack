@@ -706,6 +706,110 @@ class TestSignalHandlerChain:
         # Must complete without propagating.
         shutdown_mod._chain_signal_handler(signal.SIGTERM)
 
+    def test_chain_signal_handler_returns_false_when_getsignal_raises(
+        self,
+        monkeypatch,
+    ):
+        # If we can't even read the prior disposition (some platforms raise
+        # on `getsignal` for certain signals), we must bail out returning
+        # False and leave whatever handler was already installed in place —
+        # never install a half-wired chain we couldn't anchor.
+        def boom(sig):
+            raise OSError("cannot inspect this signal")
+
+        monkeypatch.setattr(signal, "getsignal", boom)
+        assert shutdown_mod._chain_signal_handler(signal.SIGTERM) is False
+
+    def test_handler_restores_default_disposition_when_prev_was_sig_dfl(
+        self,
+        monkeypatch,
+    ):
+        """When the prior disposition was SIG_DFL, the chained handler must,
+        after flushing, restore SIG_DFL and re-raise the signal to itself so
+        the process terminates with the OS default semantics. Swallowing the
+        signal would leave a SIGTERM'd process alive after finalization."""
+        monkeypatch.setattr(signal, "getsignal", lambda sig: signal.SIG_DFL)
+
+        signal_calls: list = []
+        captured: dict = {}
+
+        def fake_signal(sig, handler):
+            # The install call passes our callable chained handler; the
+            # in-handler restore call passes the SIG_DFL sentinel.
+            if callable(handler):
+                captured["handler"] = handler
+            signal_calls.append((sig, handler))
+
+        monkeypatch.setattr(signal, "signal", fake_signal)
+
+        kills: list = []
+        monkeypatch.setattr(shutdown_mod.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+        # Don't depend on real reporters; the SIG_DFL branch is what's
+        # under test, not the flush itself.
+        monkeypatch.setattr(shutdown_mod, "flush_active_reporters", lambda: None)
+
+        assert shutdown_mod._chain_signal_handler(signal.SIGINT) is True
+        handler = captured["handler"]
+        handler(signal.SIGINT, None)
+
+        assert (signal.SIGINT, signal.SIG_DFL) in signal_calls, (
+            "the handler must reinstall SIG_DFL for the signal before re-raising"
+        )
+        assert kills == [(os.getpid(), signal.SIGINT)], (
+            "after restoring the default disposition the handler must re-raise "
+            "the signal to this process so termination proceeds normally"
+        )
+
+    def test_handler_leaves_signal_ignored_when_prev_was_sig_ign(
+        self,
+        monkeypatch,
+    ):
+        """When the prior disposition was SIG_IGN, the chained handler must
+        flush and then do nothing further — neither chain to a callable nor
+        restore+re-raise. Re-raising an ignored signal would change the
+        operator's chosen semantics."""
+        monkeypatch.setattr(signal, "getsignal", lambda sig: signal.SIG_IGN)
+
+        captured: dict = {}
+
+        def fake_signal(sig, handler):
+            if callable(handler):
+                captured["handler"] = handler
+
+        monkeypatch.setattr(signal, "signal", fake_signal)
+
+        kills: list = []
+        monkeypatch.setattr(shutdown_mod.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+        flushed: list = []
+        monkeypatch.setattr(shutdown_mod, "flush_active_reporters", lambda: flushed.append(True))
+
+        assert shutdown_mod._chain_signal_handler(signal.SIGTERM) is True
+        captured["handler"](signal.SIGTERM, None)
+
+        assert flushed == [True], "the handler must still flush reporters before deferring to SIG_IGN"
+        assert kills == [], "an ignored signal must stay ignored — no re-raise"
+
+
+class TestInstallShutdownHooksSignalWiring:
+    def test_install_returns_false_when_no_signal_handlers_wired(
+        self,
+        monkeypatch,
+    ):
+        """On the main thread but with every per-signal install refused,
+        `install_shutdown_hooks` must still register atexit and return False
+        (it wired zero signal handlers). Exercises the install loop's
+        'handler install failed for this signal' path for both signals."""
+        monkeypatch.setattr(shutdown_mod.atexit, "register", lambda fn: None)
+        monkeypatch.setattr(shutdown_mod, "_chain_signal_handler", lambda sig: False)
+        shutdown_mod._reset_for_tests()
+        try:
+            assert shutdown_mod.install_shutdown_hooks() is False
+        finally:
+            # Restore live state so later tests don't see a "never
+            # installed" flag (mirrors the idempotent-install test).
+            shutdown_mod._reset_for_tests()
+            shutdown_mod.install_shutdown_hooks()
+
 
 class TestRegistryLockReentrancy:
     """M-A1: the SIGTERM/SIGINT handler installed by
