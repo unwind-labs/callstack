@@ -386,6 +386,39 @@ class TestFinalizeOwnFrames:
         rewrote = report.finalize_own_frames(reason="r")
         assert rewrote is False
 
+    def test_unparseable_and_non_dict_frames_skipped_before_ownership_gate(self, tmp_path):
+        """A frame file that won't parse, or parses to a non-mapping, must
+        be skipped before the writer-pid gate even looks at it — these are
+        the truncated-mid-write / hand-edited cases. finalize_own_frames
+        runs on the MCP boundary and must never crash the tool-result path."""
+        report = _report(tmp_path, invoke_id="inv-malformed")
+        report.frames_dir.mkdir(parents=True, exist_ok=True)
+        (report.frames_dir / "a.yaml").write_text("{[ this is not valid yaml")
+        (report.frames_dir / "b.yaml").write_text("- just\n- a\n- list")
+
+        assert report.finalize_own_frames(reason="r") is False
+
+    @pytest.mark.parametrize(
+        "tree_value",
+        ["not-a-dict", {"nodes": "not-a-list"}],
+        ids=["non_dict_tree", "non_list_nodes"],
+    )
+    def test_own_frame_with_malformed_tree_is_skipped(self, tmp_path, tree_value):
+        """A frame *this process owns* (writer_pid matches) but whose `tree`
+        or `tree.nodes` is the wrong shape must be skipped defensively, not
+        crash the boundary. Exercises the shape guards that sit *after* the
+        ownership gate."""
+        report = _report(tmp_path, invoke_id="inv-own-malformed")
+        report.frames_dir.mkdir(parents=True, exist_ok=True)
+        frame = {
+            "frame_key": ROOT_FRAME_KEY,
+            "writer_pid": os.getpid(),  # ours, so we pass the ownership gate
+            "tree": tree_value,
+        }
+        (report.frames_dir / "root.yaml").write_text(yaml.safe_dump(frame))
+
+        assert report.finalize_own_frames(reason="r") is False
+
 
 class TestInvokeFallsBackToCurrentTree:
     """If `Driver.run` raises before returning, `_invoke`'s try/finally
@@ -572,6 +605,31 @@ class TestEmergencyFinalizeOnShutdown:
         r._emergency_finalize_on_shutdown()
         # And no frame should have been written.
         assert not r._ctx.frame_path().exists()
+
+    def test_skips_when_thread_lock_is_held(self, tmp_path):
+        """If the normal finalize() is mid-flight (holding `_thread_lock`),
+        the shutdown emergency path must give up after a short acquire
+        timeout rather than racing it — the in-progress finalize will
+        produce the authoritative write."""
+        r = _make_reporter(tmp_path)
+        parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
+        node = _running_node("dddd6666")
+        tree = Tree(root_session=parent, nodes=[node], base_depth=0)
+        r(tree)  # one tick so there's a tree to (not) abandon
+
+        # Hold the lock so the emergency path's acquire(timeout=0.5) fails.
+        assert r._thread_lock.acquire()
+        try:
+            r._emergency_finalize_on_shutdown()
+        finally:
+            r._thread_lock.release()
+
+        # Lock was busy → emergency path bailed → node left untouched.
+        assert isinstance(node.state, st.AwaitingTurn), (
+            "emergency finalize must not mutate the tree when it couldn't "
+            "acquire the lock — the live finalize that holds the lock owns "
+            "the authoritative write"
+        )
 
     def test_never_raises_on_write_failure(self, tmp_path, monkeypatch):
         """Shutdown is the worst time to surface an exception — every

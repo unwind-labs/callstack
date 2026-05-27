@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 import yaml
 from agent_callstack import ROOT_FRAME_KEY, InvocationReport, state as st
 from agent_callstack.channel import ScriptedChannel
@@ -968,3 +969,159 @@ def test_parsed_frame_cache_lru_eviction(tmp_path):
     finally:
         frames_mod._FRAMES_PARSED_CACHE_MAX = original
         ac._frames_cache_clear()
+
+
+# ---------- reporter lifecycle edge cases ----------
+#
+# White-box: these drive `_LiveReporter`'s internal guards directly —
+# the late-notify ignore, the debounced-merge bail-outs, and the
+# defensive paths in `_atomic_write_bytes` / `_interprocess_lock`. None
+# has an honest expression through the public boundary (they're about
+# what does NOT happen on a degenerate call), so the internals are built
+# directly on purpose.
+
+
+def _solo_reporter(tmp_path, invoke_id="inv-edge", **ctx_kwargs):
+    ctx = _InvocationContext(
+        invoke_id=invoke_id,
+        log_dir=tmp_path / "log",
+        cwd="/cwd",
+        frame_key=ctx_kwargs.pop("frame_key", ROOT_FRAME_KEY),
+        is_nested=ctx_kwargs.pop("is_nested", False),
+    )
+    ctx.invocation_dir.mkdir(parents=True, exist_ok=True)
+    ctx.frames_dir.mkdir(parents=True, exist_ok=True)
+    return _LiveReporter(ctx=ctx, kind="call", tasks=["t"], started_at="s")
+
+
+def test_notify_after_finalize_is_ignored(tmp_path, monkeypatch):
+    """The driver may emit one last on_progress tick while finalize() is
+    cancelling the debounce timer. That late notify must be a no-op — the
+    finalized frame is authoritative and must not be reopened."""
+    monkeypatch.setenv("CALLSTACK_REPORT_DEBOUNCE_SECS", "0")
+    monkeypatch.setenv("CALLSTACK_FINALIZE_WAIT_SECONDS", "0")
+    reporter = _solo_reporter(tmp_path)
+    parent = SessionRef(session_id="p", file=tmp_path / "p.jsonl")
+    done = _done_node("a0000000", "t", "r")
+    tree = Tree(root_session=parent, nodes=[done], base_depth=0)
+    reporter.finalize(tree)
+
+    # A post-finalize notify must not write or mutate anything.
+    from agent_callstack import reporter as rep_mod
+
+    writes = {"n": 0}
+    monkeypatch.setattr(rep_mod, "_atomic_write_bytes", lambda *a, **k: writes.__setitem__("n", writes["n"] + 1))
+    reporter(tree)
+    assert writes["n"] == 0, "a notify after finalize must be ignored, not re-merged"
+
+
+def test_debounced_merge_bails_when_already_finalized(tmp_path, monkeypatch):
+    """If finalize() ran while the Timer thread was waiting on the lock,
+    the debounced merge must null its timer pointer and return without a
+    second (stale) merge."""
+    monkeypatch.setenv("CALLSTACK_REPORT_DEBOUNCE_SECS", "5")
+    reporter = _solo_reporter(tmp_path)
+    reporter._finalized = True
+    reporter._latest_ended_at = "2026-05-13T00:00:00+00:00"
+    # Must return cleanly without attempting a merge.
+    reporter._debounced_merge()
+    assert reporter._merge_timer is None
+
+
+def test_debounced_merge_bails_when_no_tick_observed(tmp_path, monkeypatch):
+    """A timer that fires before any notify recorded an ended_at must not
+    merge (there's no tree state to serialize yet)."""
+    monkeypatch.setenv("CALLSTACK_REPORT_DEBOUNCE_SECS", "5")
+    reporter = _solo_reporter(tmp_path)
+    assert reporter._latest_ended_at is None
+    reporter._debounced_merge()  # no-op, must not raise
+    assert not reporter._ctx.report_path.exists()
+
+
+def test_write_partial_noops_when_root_frame_present(tmp_path, monkeypatch):
+    """A nested reporter's partial-report fallback must bail at the
+    post-lock re-check when a root frame landed between the file check and
+    the lock acquisition — report.yaml is the root reporter's job, and a
+    stale partial would mask the real merge."""
+    monkeypatch.setenv("CALLSTACK_REPORT_DEBOUNCE_SECS", "0")
+    reporter = _solo_reporter(tmp_path, invoke_id="inv-partial", frame_key="sess-C", is_nested=True)
+    # Seed a root frame so the post-lock re-check sees it.
+    ac = __import__("agent_callstack")
+    ac._atomic_yaml_write(
+        reporter._ctx.frames_dir / "root.yaml",
+        {
+            "frame_key": ROOT_FRAME_KEY,
+            "is_nested": False,
+            "kind": "call",
+            "tasks": ["t"],
+            "cwd": "/cwd",
+            "started_at": "s",
+            "ended_at": "e",
+            "tree": {
+                "schema_version": "2",
+                "root_session_id": "r",
+                "root_session_file": "/r.jsonl",
+                "base_depth": 0,
+                "nodes": [],
+            },
+        },
+    )
+    parent = SessionRef(session_id="sess-C", file=tmp_path / "c.jsonl")
+    tree = Tree(root_session=parent, nodes=[_done_node("e0000000", "t", "r")], base_depth=1)
+    reporter._write_partial_if_no_root(tree, ended_at="e")
+    # Root frame present → no partial sidecar written.
+    assert not (reporter._ctx.invocation_dir / "report.partial.yaml").exists()
+
+
+def test_atomic_write_bytes_cleans_up_tmp_on_failure(tmp_path, monkeypatch):
+    """If the rename fails mid-write, `_atomic_write_bytes` must unlink the
+    orphan tmp file and re-raise — never leave a half-written `.tmp` behind
+    and never swallow the error."""
+    from agent_callstack import reporter as rep_mod
+
+    target = tmp_path / "out.bin"
+
+    def boom(src, dst):
+        raise OSError("rename across devices")
+
+    monkeypatch.setattr(rep_mod.os, "replace", boom)
+    with pytest.raises(OSError, match="rename across devices"):
+        rep_mod._atomic_write_bytes(target, b"payload")
+    # No orphan tmp left in the dir.
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith("out.bin.")]
+    assert leftovers == [], f"tmp file not cleaned up: {leftovers}"
+
+
+def test_interprocess_lock_proceeds_without_lock_after_timeout(tmp_path, monkeypatch, capsys):
+    """SEC-009: a wedged sibling holding the merge lock must not deadlock
+    the tree. After the timeout budget the lock context proceeds anyway,
+    warning on stderr."""
+    from agent_callstack import reporter as rep_mod
+
+    monkeypatch.setattr(rep_mod.fcntl, "lockf", lambda *a, **k: (_ for _ in ()).throw(BlockingIOError()))
+    # monotonic: deadline calc, then one "not yet" check (sleeps), then "past".
+    times = iter([0.0, 5.0, 1000.0])
+    monkeypatch.setattr(rep_mod.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(rep_mod.time, "sleep", lambda _s: None)
+
+    entered = {"n": 0}
+    with rep_mod._interprocess_lock(tmp_path / "x.lock"):
+        entered["n"] += 1
+    assert entered["n"] == 1, "the context must still run its body after giving up on the lock"
+    assert "proceeding without lock" in capsys.readouterr().err
+
+
+def test_interprocess_lock_tolerates_unlock_failure(tmp_path, monkeypatch):
+    """Releasing the byte-range lock can fail if the fd state changed; the
+    context must swallow the unlock OSError rather than propagating it out
+    of a `with` block that otherwise succeeded."""
+    from agent_callstack import reporter as rep_mod
+
+    def fake_lockf(fd, op):
+        if op & rep_mod.fcntl.LOCK_UN:
+            raise OSError("unlock failed")
+        # LOCK_EX|LOCK_NB acquire succeeds.
+
+    monkeypatch.setattr(rep_mod.fcntl, "lockf", fake_lockf)
+    with rep_mod._interprocess_lock(tmp_path / "y.lock"):
+        pass  # must exit cleanly despite the unlock raising
