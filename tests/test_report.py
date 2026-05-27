@@ -1092,6 +1092,33 @@ def test_atomic_write_bytes_cleans_up_tmp_on_failure(tmp_path, monkeypatch):
     assert leftovers == [], f"tmp file not cleaned up: {leftovers}"
 
 
+def test_atomic_write_bytes_closes_fd_when_fdopen_fails(tmp_path, monkeypatch):
+    """If os.fdopen raises before adopting the mkstemp fd, the raw descriptor
+    must be closed explicitly — the `with` never ran, so nothing else can
+    close it. Guards against an fd leak on the rare EMFILE/MemoryError path."""
+    from agent_callstack import reporter as rep_mod
+
+    target = tmp_path / "out.bin"
+    seen = {}
+    closed = []
+
+    def failing_fdopen(fd, *a, **k):
+        seen["fd"] = fd
+        raise OSError("fdopen boom")
+
+    real_close = rep_mod.os.close
+    monkeypatch.setattr(rep_mod.os, "fdopen", failing_fdopen)
+    monkeypatch.setattr(rep_mod.os, "close", lambda fd: (closed.append(fd), real_close(fd)))
+
+    with pytest.raises(OSError, match="fdopen boom"):
+        rep_mod._atomic_write_bytes(target, b"payload")
+
+    assert seen["fd"] in closed, "mkstemp fd must be closed when fdopen fails"
+    # The outer handler still unlinks the orphan tmp.
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith("out.bin.")]
+    assert leftovers == [], f"tmp file not cleaned up: {leftovers}"
+
+
 def test_interprocess_lock_proceeds_without_lock_after_timeout(tmp_path, monkeypatch, capsys):
     """SEC-009: a wedged sibling holding the merge lock must not deadlock
     the tree. After the timeout budget the lock context proceeds anyway,

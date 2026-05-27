@@ -463,7 +463,15 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
         dir=str(path.parent),
     )
     try:
-        with os.fdopen(fd, "wb") as f:
+        # If os.fdopen itself raises (rare: EMFILE, MemoryError), the raw fd
+        # is never adopted by the file object, so the `with` can't close it —
+        # close it explicitly to avoid leaking the descriptor.
+        try:
+            f = os.fdopen(fd, "wb")
+        except Exception:
+            os.close(fd)
+            raise
+        with f:
             f.write(payload)
             f.flush()
             os.fsync(f.fileno())
