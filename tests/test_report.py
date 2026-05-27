@@ -47,6 +47,55 @@ def _done_node(
     )
 
 
+# ---------- facade accessors & empty-frame paths ----------
+
+
+class TestInvocationReportAccessors:
+    """The `InvocationReport` facade exposes the underlying
+    `_InvocationContext`'s identity through named properties so callers
+    never reach into `.context` directly. Pin the pass-throughs and the
+    two read paths that return None when no root frame has landed yet."""
+
+    def test_identity_properties_passthrough_to_context(self, tmp_path):
+        report = InvocationReport(
+            invoke_id="inv-acc",
+            log_dir=tmp_path / "log",
+            cwd="/some/cwd",
+            frame_key="node-xyz",
+            is_nested=True,
+        )
+        # The named accessors must mirror the wrapped context exactly —
+        # callers rely on these instead of poking at `.context`.
+        assert report.invoke_id == "inv-acc"
+        assert report.cwd == "/some/cwd"
+        assert report.frame_key == "node-xyz"
+        assert report.is_nested is True
+        assert report.context is report._ctx
+
+    def test_prefix_delegates_to_context(self, tmp_path):
+        # `prefix(kind)` is the human-readable log prefix builder; the
+        # facade forwards to the context so callers don't duplicate the
+        # formatting rule.
+        report = InvocationReport(invoke_id="inv-p", log_dir=tmp_path / "log", cwd="/c")
+        assert report.prefix("call") == report._ctx.prefix("call")
+
+    def test_merged_document_is_none_when_no_root_frame(self, tmp_path):
+        # A nested writer can race ahead of the root; until the root frame
+        # exists there's no document to build, and the read path must
+        # return None rather than synthesizing a rootless tree.
+        report = InvocationReport(invoke_id="inv-empty", log_dir=tmp_path / "log", cwd="/c")
+        report.frames_dir.mkdir(parents=True, exist_ok=True)
+        assert report.merged_document() is None
+
+    def test_write_report_is_none_when_no_root_frame(self, tmp_path):
+        # write_report builds-then-writes; with no root frame the build
+        # yields None and nothing should be written to disk.
+        report = InvocationReport(invoke_id="inv-empty2", log_dir=tmp_path / "log", cwd="/c")
+        report.frames_dir.mkdir(parents=True, exist_ok=True)
+        assert report.write_report() is None
+        assert not report.report_path.exists()
+
+
 # ---------- one-shot writer ----------
 
 

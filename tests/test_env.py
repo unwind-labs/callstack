@@ -63,6 +63,116 @@ class TestReportDebounceSecs:
         assert env.report_debounce_secs() == pytest.approx(0.25)
 
 
+class TestMaxBackground:
+    def test_unset_returns_default(self, monkeypatch):
+        monkeypatch.delenv(env.ENV_MAX_BACKGROUND, raising=False)
+        assert env.max_background() == 64
+
+    def test_explicit_value(self, monkeypatch):
+        monkeypatch.setenv(env.ENV_MAX_BACKGROUND, "8")
+        assert env.max_background() == 8
+
+    @pytest.mark.parametrize("bad", ["0", "-1", "abc"])
+    def test_invalid_returns_default(self, bad, monkeypatch):
+        # A non-positive or non-integer cap must fall back to the default
+        # rather than disabling the registry guard (SEC: an unbounded
+        # background registry is a slow memory leak).
+        monkeypatch.setenv(env.ENV_MAX_BACKGROUND, bad)
+        assert env.max_background() == 64
+
+
+class TestMaxConcurrentForks:
+    def test_unset_returns_default(self, monkeypatch):
+        monkeypatch.delenv(env.ENV_MAX_CONCURRENT_FORKS, raising=False)
+        assert env.max_concurrent_forks() == 8
+
+    def test_explicit_value(self, monkeypatch):
+        monkeypatch.setenv(env.ENV_MAX_CONCURRENT_FORKS, "4")
+        assert env.max_concurrent_forks() == 4
+
+    @pytest.mark.parametrize("bad", ["0", "-1", "abc"])
+    def test_invalid_returns_default(self, bad, monkeypatch):
+        monkeypatch.setenv(env.ENV_MAX_CONCURRENT_FORKS, bad)
+        assert env.max_concurrent_forks() == 8
+
+
+class TestMaxInFlightTurns:
+    def test_unset_defaults_to_double_the_fork_pool(self, monkeypatch):
+        # The default is intentionally derived from max_concurrent_forks
+        # (2×) so the in-flight turn budget scales with the pool size — pin
+        # that coupling so a future edit can't silently decouple them.
+        monkeypatch.delenv(env.ENV_MAX_IN_FLIGHT_TURNS, raising=False)
+        monkeypatch.setenv(env.ENV_MAX_CONCURRENT_FORKS, "4")
+        assert env.max_in_flight_turns() == 8
+
+    def test_explicit_value(self, monkeypatch):
+        monkeypatch.setenv(env.ENV_MAX_IN_FLIGHT_TURNS, "20")
+        assert env.max_in_flight_turns() == 20
+
+    @pytest.mark.parametrize("bad", ["0", "-1", "abc"])
+    def test_invalid_falls_back_to_derived_default(self, bad, monkeypatch):
+        monkeypatch.setenv(env.ENV_MAX_CONCURRENT_FORKS, "4")
+        monkeypatch.setenv(env.ENV_MAX_IN_FLIGHT_TURNS, bad)
+        assert env.max_in_flight_turns() == 8
+
+
+class TestReportDebounceInvalid:
+    def test_explicit_positive_value(self, monkeypatch):
+        monkeypatch.setenv(env.ENV_REPORT_DEBOUNCE_SECS, "1.5")
+        assert env.report_debounce_secs() == pytest.approx(1.5)
+
+    def test_non_numeric_falls_back_to_default(self, monkeypatch):
+        # The ValueError path: a garbage value must not crash the reporter,
+        # it must use the default debounce window.
+        monkeypatch.setenv(env.ENV_REPORT_DEBOUNCE_SECS, "abc")
+        assert env.report_debounce_secs() == pytest.approx(0.25)
+
+
+class TestCurrentDepth:
+    def test_unset_is_root_depth_zero(self, monkeypatch):
+        monkeypatch.delenv(env.ENV_DEPTH, raising=False)
+        assert env.current_depth() == 0
+
+    def test_explicit_value(self, monkeypatch):
+        monkeypatch.setenv(env.ENV_DEPTH, "3")
+        assert env.current_depth() == 3
+
+    def test_garbage_reads_as_root(self, monkeypatch):
+        # A corrupt depth counter must read as 0 rather than crashing the
+        # whole invocation — depth gating then behaves as if at root.
+        monkeypatch.setenv(env.ENV_DEPTH, "notanint")
+        assert env.current_depth() == 0
+
+
+class TestSessionReaders:
+    def test_own_session_unset_is_none(self, monkeypatch):
+        monkeypatch.delenv(env.ENV_OWN_SESSION, raising=False)
+        assert env.own_session() is None
+
+    def test_own_session_returns_value(self, monkeypatch):
+        # own_session is the authoritative self-id a spawned child reads
+        # back from the env its parent stamped (bypasses Claude Code's
+        # opaque fork-session propagation).
+        monkeypatch.setenv(env.ENV_OWN_SESSION, "uuid-1234")
+        assert env.own_session() == "uuid-1234"
+
+    def test_frame_key_unset_is_none(self, monkeypatch):
+        monkeypatch.delenv(env.ENV_FRAME_KEY, raising=False)
+        assert env.frame_key() is None
+
+    def test_frame_key_returns_value(self, monkeypatch):
+        monkeypatch.setenv(env.ENV_FRAME_KEY, "node-abc")
+        assert env.frame_key() == "node-abc"
+
+    def test_claude_code_session_unset_is_none(self, monkeypatch):
+        monkeypatch.delenv(env.ENV_CLAUDE_SESSION, raising=False)
+        assert env.claude_code_session() is None
+
+    def test_claude_code_session_returns_value(self, monkeypatch):
+        monkeypatch.setenv(env.ENV_CLAUDE_SESSION, "cc-sess-9")
+        assert env.claude_code_session() == "cc-sess-9"
+
+
 class TestRootIdentity:
     def test_unset_returns_none(self, monkeypatch):
         monkeypatch.delenv(env.ENV_ROOT_INVOKE_ID, raising=False)
