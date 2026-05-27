@@ -1099,10 +1099,24 @@ def test_interprocess_lock_proceeds_without_lock_after_timeout(tmp_path, monkeyp
     from agent_callstack import reporter as rep_mod
 
     monkeypatch.setattr(rep_mod.fcntl, "lockf", lambda *a, **k: (_ for _ in ()).throw(BlockingIOError()))
-    # monotonic: deadline calc, then one "not yet" check (sleeps), then "past".
-    times = iter([0.0, 5.0, 1000.0])
-    monkeypatch.setattr(rep_mod.time, "monotonic", lambda: next(times))
-    monkeypatch.setattr(rep_mod.time, "sleep", lambda _s: None)
+
+    # Drive a fake clock instead of asserting an exact count of monotonic()
+    # reads: each retry sleep jumps the clock past the whole timeout budget,
+    # so the next deadline check trips. This stays correct no matter how many
+    # times the loop reads monotonic() per iteration — only a real behavior
+    # change (e.g. dropping the deadline check) breaks it. monotonic() also
+    # nudges forward on every call so a missing sleep can't hang the test.
+    clock = {"now": 1000.0}
+
+    def _monotonic():
+        clock["now"] += 0.001
+        return clock["now"]
+
+    def _sleep(_seconds):
+        clock["now"] += rep_mod._LOCK_TIMEOUT_SECONDS + 1.0
+
+    monkeypatch.setattr(rep_mod.time, "monotonic", _monotonic)
+    monkeypatch.setattr(rep_mod.time, "sleep", _sleep)
 
     entered = {"n": 0}
     with rep_mod._interprocess_lock(tmp_path / "x.lock"):
