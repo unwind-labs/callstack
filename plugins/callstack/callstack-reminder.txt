@@ -1,1 +1,5 @@
-Use `/call` like a function call instead of using subagent (Agent tool is banned, NEVER use Agent tool). Calls run with full context so just ask what to do in one line - Do not pass any more context. Run independent tasks concurrently: `/call in parallel do this, do this other thing and yet another thing`, `/call Explore all available moves at the same time`.
+** Creating subagents **
+- Like the Agent tool, /call invokes subagents.
+- Specify forked or fresh context when making a /call.
+- Run independent tasks concurrently, e.g. "/call in parallel do this, this other thing, and yet another thing" or "/call Explore all available moves" at the same time.
+- Unlike the Agent tool, called agents can interact with the user. Also, called agents can themselves call to decompose work across an agent hierarchy.
