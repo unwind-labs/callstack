@@ -14,18 +14,14 @@ turns. The pool itself (registry, LRU eviction, lifecycle) lives in
 turns always spawn (they create a new session id); resume turns reuse
 on a pool hit and spawn on a miss.
 
-Concurrency is two-level (PERF-H):
-  * `_SPAWN_SEMAPHORE`     — bounded by `CALLSTACK_MAX_CONCURRENT_FORKS`,
-                              held only when spawning a new claude
-                              process. The real memory ceiling.
-  * `_IN_FLIGHT_SEMAPHORE` — bounded by `CALLSTACK_MAX_IN_FLIGHT_TURNS`
-                              (default 2× the spawn cap), held for every
-                              turn. Pool-hit (reuse) turns acquire ONLY
-                              this one, so resume-mode parallelism
-                              isn't gated on cold-start capacity.
-
-In-use pooled processes (per-process lock held) are skipped during
-eviction — the pool may exceed cap briefly until a turn finishes.
+Concurrency is unbounded at this layer — there is no spawn or in-flight
+cap. Fan-out is bounded at the MCP boundary (`CALLSTACK_MAX_FANOUT`,
+default 64) per `/call`; if the operator wants a stricter ceiling they
+set that. A previous design enforced a tree-wide process cap via a
+filesystem token directory plus an in-flight semaphore; both were
+removed because they made sync-blocked parents hold slots forever
+(harvest-on-demand was the proposed fix; deferred — see
+`dev/RFC-harvest-on-demand.md`).
 
 The pool is torn down at interpreter exit via `atexit`, or explicitly
 via `Caller.close()` / `shutdown_pool()`.
@@ -59,7 +55,6 @@ from . import env as _env
 # (`from agent_callstack.channel import shutdown_pool`, etc.) keeps working
 # and ClaudeChannel can drive the pool without an extra import hop.
 from .channel_pool import (  # noqa: F401
-    _MAX_CONCURRENT_FORKS,
     ClaudePool,
     _get_pool,
     _PooledProcess,
@@ -94,32 +89,6 @@ def _process_log_path(stem: str) -> str:
     tmp.close()
     return path
 
-
-# Two-level concurrency cap (PERF-H):
-#
-#   _SPAWN_SEMAPHORE      — bounds COLD STARTS. Held only when actually
-#                           spawning a new `claude` subprocess. Each spawn
-#                           costs ~0.5–2 GB RSS, so this is the real
-#                           memory-ceiling knob.
-#                           Env: CALLSTACK_MAX_CONCURRENT_FORKS (default 8).
-#
-#   _IN_FLIGHT_SEMAPHORE  — bounds CONCURRENT TURNS (spawn + pool-hit).
-#                           Held for the full turn duration. Pool-hit turns
-#                           reuse an existing process so they don't pay the
-#                           RSS cost again; they only need a CPU/network
-#                           slot. Default is 2× the spawn cap.
-#                           Env: CALLSTACK_MAX_IN_FLIGHT_TURNS (default
-#                           2 × CALLSTACK_MAX_CONCURRENT_FORKS).
-#
-# Before PERF-H a single semaphore double-capped on the same number, so a
-# pool-hit (no spawn) still had to wait for a "spawn slot" even though no
-# spawn was happening. Splitting raises usable parallelism for resume-mode
-# turns without raising peak RSS.
-# `_MAX_CONCURRENT_FORKS` is imported from channel_pool (it sizes both the
-# pool and this spawn semaphore off the same env knob).
-_MAX_IN_FLIGHT_TURNS = _env.max_in_flight_turns()
-_SPAWN_SEMAPHORE = threading.BoundedSemaphore(value=_MAX_CONCURRENT_FORKS)
-_IN_FLIGHT_SEMAPHORE = threading.BoundedSemaphore(value=_MAX_IN_FLIGHT_TURNS)
 
 # SEC-005: bound the worst-case NDJSON line and per-turn stderr drain.
 # `claude` lines are normally <100 KB; the cap exists so a malicious or
@@ -269,39 +238,24 @@ class ClaudeChannel:
         if mode == "resume" and source_session_id:
             pooled = pool.acquire(source_session_id)
 
-        # Two-level concurrency cap (PERF-H):
-        #   _IN_FLIGHT_SEMAPHORE caps total concurrent turns (spawn + reuse).
-        #   _SPAWN_SEMAPHORE caps cold starts only — acquired below inside
-        #   _fresh_spawn_turn / _spawn when actually spawning. A pool-hit
-        #   does NOT acquire the spawn semaphore, freeing parallelism for
-        #   resume-mode turns without raising peak RSS.
-        sem_wait_start = time.time()
-        _IN_FLIGHT_SEMAPHORE.acquire()
-        sem_wait = time.time() - sem_wait_start
-
-        try:
-            if pooled is not None:
-                return self._reuse_turn(
-                    pooled,
-                    source_session_id,
-                    prompt,
-                    timeout,
-                    on_session_id,
-                    sem_wait,
-                )
-            return self._fresh_spawn_turn(
+        if pooled is not None:
+            return self._reuse_turn(
+                pooled,
                 source_session_id,
                 prompt,
-                mode,
-                effective_cwd,
-                extra_env,
                 timeout,
                 on_session_id,
-                sem_wait,
-                preallocated_session_id=preallocated_session_id,
             )
-        finally:
-            _IN_FLIGHT_SEMAPHORE.release()
+        return self._fresh_spawn_turn(
+            source_session_id,
+            prompt,
+            mode,
+            effective_cwd,
+            extra_env,
+            timeout,
+            on_session_id,
+            preallocated_session_id=preallocated_session_id,
+        )
 
     # ---- private: top-level turn paths ----
 
@@ -312,10 +266,8 @@ class ClaudeChannel:
         prompt: str,
         timeout: int,
         on_session_id: Optional[Callable[[str], None]],
-        sem_wait: float,
     ) -> TurnResult:
         """Run one turn on an existing pooled process. Evicts on failure."""
-        self._log_sem_wait(pooled.log, sem_wait)
         try:
             print(
                 f"[callstack] reuse (session={source_session_id[:8]}..., cwd={pooled.cwd}, log={pooled.log_path})",
@@ -343,63 +295,39 @@ class ClaudeChannel:
         extra_env: Optional[dict],
         timeout: int,
         on_session_id: Optional[Callable[[str], None]],
-        sem_wait: float,
         *,
         preallocated_session_id: Optional[str] = None,
     ) -> TurnResult:
-        """Spawn a new claude subprocess, run one turn, and pool it on success.
-
-        Holds `_SPAWN_SEMAPHORE` for the full first turn — that's the phase
-        where the child is bootstrapping and accumulating its ~0.5–2 GB RSS,
-        which the spawn cap is designed to bound. The semaphore is released
-        before the call returns; subsequent reuse turns on the pooled
-        process never reacquire it (PERF-H)."""
-        spawn_wait_start = time.time()
-        _SPAWN_SEMAPHORE.acquire()
-        sem_wait += time.time() - spawn_wait_start
+        """Spawn a new claude subprocess, run one turn, and pool it on success."""
         try:
-            try:
-                pooled = self._spawn(
-                    source_session_id,
-                    mode,
-                    effective_cwd,
-                    extra_env,
+            pooled = self._spawn(
+                source_session_id,
+                mode,
+                effective_cwd,
+                extra_env,
+                preallocated_session_id=preallocated_session_id,
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to start claude CLI: {e}") from e
+
+        try:
+            with pooled.lock:
+                result = self._run_one_turn(
+                    pooled,
+                    prompt,
+                    timeout,
+                    on_session_id,
+                    do_handshake=True,
                     preallocated_session_id=preallocated_session_id,
                 )
-            except Exception as e:
-                raise RuntimeError(f"Failed to start claude CLI: {e}") from e
+        except Exception:
+            pooled.close()
+            raise
 
-            self._log_sem_wait(pooled.log, sem_wait)
-            try:
-                with pooled.lock:
-                    result = self._run_one_turn(
-                        pooled,
-                        prompt,
-                        timeout,
-                        on_session_id,
-                        do_handshake=True,
-                        preallocated_session_id=preallocated_session_id,
-                    )
-            except Exception:
-                pooled.close()
-                raise
-
-            # Pool keyed by the session id the CLI reported. For resume mode
-            # that equals source_session_id; for fork/fresh it's a brand-new id.
-            _get_pool().register(result.session_id, pooled)
-            return result
-        finally:
-            _SPAWN_SEMAPHORE.release()
-
-    @staticmethod
-    def _log_sem_wait(log, sem_wait: float) -> None:
-        if sem_wait <= 0.5:
-            return
-        try:
-            log.write(f"semaphore-wait: {sem_wait:.2f}s (cap={_MAX_CONCURRENT_FORKS})\n")
-            log.flush()
-        except (OSError, ValueError):
-            pass
+        # Pool keyed by the session id the CLI reported. For resume mode
+        # that equals source_session_id; for fork/fresh it's a brand-new id.
+        _get_pool().register(result.session_id, pooled)
+        return result
 
     # ---- private: spawn ----
 

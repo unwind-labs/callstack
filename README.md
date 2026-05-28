@@ -263,9 +263,9 @@ Orchestrator (root)
 Orchestrator validates all 6 expected values across the three returned summaries: PASS
 ```
 
-Every `op: call tasks=[…]` with multiple entries is a **parallel fan-out** — the runtime spawns one forked subprocess per sibling and runs them concurrently under the `CALLSTACK_MAX_CONCURRENT_FORKS` semaphore. Each sibling independently supports the full `call`/`yield`/`return` protocol, so a parallel branch can itself fan out (depth 2 inside `task-c`), pause for user input, or return — without blocking its siblings. The 3-level deep nesting under `task-c` (orchestrator → c → e → {g, h}) shows that parallel batches compose: a sibling at any depth can become the parent of its own parallel batch.
+Every `op: call tasks=[…]` with multiple entries is a **parallel fan-out** — the runtime spawns one forked subprocess per sibling and runs them concurrently, bounded only by `CALLSTACK_MAX_FANOUT` (default 64) at the MCP boundary. Each sibling independently supports the full `call`/`yield`/`return` protocol, so a parallel branch can itself fan out (depth 2 inside `task-c`), pause for user input, or return — without blocking its siblings. The 3-level deep nesting under `task-c` (orchestrator → c → e → {g, h}) shows that parallel batches compose: a sibling at any depth can become the parent of its own parallel batch.
 
-> **Concurrency is capped per level, not globally.** Each forked child runs its own `agent_callstack` runtime, so `CALLSTACK_MAX_CONCURRENT_FORKS` bounds fan-out independently at every depth rather than across the whole tree. There is no cross-process deadlock — a parent never holds a concurrency slot while its children run — but a tree that is both **wide and deep** can hold many `claude` subprocesses live at once, each with its own memory footprint. Tune `CALLSTACK_MAX_CONCURRENT_FORKS` and `CALLSTACK_MAX_DEPTH` (see [Configuration](#configuration)) if you fan out aggressively.
+> **No global cap on live `claude` processes.** Each forked child runs its own `agent_callstack` runtime; `CALLSTACK_MAX_FANOUT` bounds per-call fan-out but does not cap total live processes across a deep tree. A tree that is both **wide and deep** can hold many `claude` subprocesses live at once, each ~0.5–2 GB RSS. Use `CALLSTACK_MAX_DEPTH` to bound depth (see [Configuration](#configuration)); a tree-wide live-process cap is a deferred design (`dev/RFC-harvest-on-demand.md`).
 
 Each `task-*` node is a Claude Code Skill at `examples/parallel_calls/.claude/skills/task-*/SKILL.md`. `/call` invokes them by name, and any Skill is free to itself `/call` other Skills — Skills become the "functions" in the call stack: small, named, composable units the orchestrator wires together.
 
@@ -364,7 +364,7 @@ Both `/call` and Anthropic's experimental `/fork` are built on the same underlyi
 | Interactivity| Background only; result returns as a message               | Interactive at every level; user can drop into any frame               |
 | Runtime mode | Interactive sessions only; disabled in non-interactive use | Works headless via `claude -p`                                         |
 | Observability| None — fork runs in a side panel                           | [unwind](https://pypi.org/project/unwind-labs/): live web UI of the call tree across all sessions |
-| Concurrency  | Implicit                                                   | `CALLSTACK_MAX_CONCURRENT_FORKS` semaphore for wide fan-out            |
+| Concurrency  | Implicit                                                   | Fan-out bounded by `CALLSTACK_MAX_FANOUT` at the MCP boundary           |
 
 **Depth.** `/fork` is one level deep — a fork cannot itself fork. Real workflows nest: "implement app" calls "implement auth module" calls "write JWT middleware". `/call` is recursive (default cap 10 levels, widenable via `CALLSTACK_MAX_DEPTH` up to a hard ceiling of 32), so the whole tree runs as a proper call stack instead of being flattened into the parent.
 
@@ -374,27 +374,11 @@ Both `/call` and Anthropic's experimental `/fork` are built on the same underlyi
 
 **Observability.** `/fork` runs in a side panel with no external view. unwind-labs ships [unwind](https://pypi.org/project/unwind-labs/), a Python web UI that tails `~/.claude/projects/*.jsonl` and the runtime's `call_trace.jsonl` files to render a live call tree across all sessions, with each frame's conversation expandable in a side pane.
 
-**Wide fan-out under control.** Each forked `claude` subprocess takes ~0.5–2 GB RSS. A logically wide tree can spawn thousands of pending turns; a module-level semaphore bounded by `CALLSTACK_MAX_CONCURRENT_FORKS` (default 8) keeps physical concurrency under the box's RAM. Excess calls queue instead of OOMing.
+**Fan-out, not bounded concurrency.** Each forked `claude` subprocess takes ~0.5–2 GB RSS. There is **no global cap on live `claude` processes** — a previous design (filesystem-token semaphore) was removed because sync-blocked parents held slots forever, which caused tree-wide deadlocks under depth. The only bound is per-`/call` fan-out via `CALLSTACK_MAX_FANOUT` (default 64). A future "harvest-on-demand" design (see `dev/RFC-harvest-on-demand.md`) may reintroduce a tree-wide live-process bound; for now, size your trees against your RAM budget.
 
 `/fork` validated the primitive. `/call` ships the call stack.
 
 ## Configuration
-
-### Bounding concurrent `claude` processes
-
-Each forked call spawns a `claude` subprocess (~0.5–2 GB RSS per process). A deep/wide callstack can logically have thousands of pending turns; a module-level semaphore in [plugins/callstack/agent_callstack/channel.py](plugins/callstack/agent_callstack/channel.py) bounds how many run physically at once so the machine doesn't OOM.
-
-Set the cap via the `CALLSTACK_MAX_CONCURRENT_FORKS` environment variable (default `8`):
-
-```bash
-# Tight memory (e.g. 16 GB laptop)
-export CALLSTACK_MAX_CONCURRENT_FORKS=4
-
-# Larger machine (e.g. 64+ GB)
-export CALLSTACK_MAX_CONCURRENT_FORKS=24
-```
-
-Rule of thumb: keep `N × 2 GB` comfortably below total RAM. Excess logical calls queue on the semaphore instead of spawning, so correctness is unaffected — only wall-clock latency.
 
 ### All environment knobs
 
@@ -404,8 +388,6 @@ Every knob is read through a typed, clamped reader in [plugins/callstack/agent_c
 |---------|---------|-----------------|---------|
 | `CALLSTACK_MAX_DEPTH` | `10` | hard ceiling `32` | Max recursion depth of the call tree. Stamped onto every child so the budget is inherited. |
 | `CALLSTACK_MAX_FANOUT` | `64` | must be `> 0` | Max `len(tasks)` accepted in one `call` at the MCP boundary (DoS guard — each task forks a `claude` process). |
-| `CALLSTACK_MAX_CONCURRENT_FORKS` | `8` | must be `> 0` | Semaphore bounding how many forked `claude` subprocesses run physically at once. |
-| `CALLSTACK_MAX_IN_FLIGHT_TURNS` | `2 × MAX_CONCURRENT_FORKS` (16) | must be `> 0` | Cap on simultaneously in-flight subprocess turns. |
 | `CALLSTACK_MAX_BACKGROUND` | `64` | must be `> 0` | Max `run_in_background=True` invocations parked awaiting `await_call`. Hitting it is a loud error, not a silent eviction. |
 | `CALLSTACK_REPORT_DEBOUNCE_SECS` | `0.25` | `>= 0` | Debounce window before the live reporter flushes a merged `report.yaml`. `0` = synchronous merge. |
 | `CALLSTACK_FINALIZE_WAIT_SECONDS` | `120` | `[0, 600]` | How long the runtime blocks waiting for late `return`/`yield` envelopes before sealing the report. `0` = seal immediately. |

@@ -81,41 +81,6 @@ class TestMaxBackground:
         assert env.max_background() == 64
 
 
-class TestMaxConcurrentForks:
-    def test_unset_returns_default(self, monkeypatch):
-        monkeypatch.delenv(env.ENV_MAX_CONCURRENT_FORKS, raising=False)
-        assert env.max_concurrent_forks() == 8
-
-    def test_explicit_value(self, monkeypatch):
-        monkeypatch.setenv(env.ENV_MAX_CONCURRENT_FORKS, "4")
-        assert env.max_concurrent_forks() == 4
-
-    @pytest.mark.parametrize("bad", ["0", "-1", "abc"])
-    def test_invalid_returns_default(self, bad, monkeypatch):
-        monkeypatch.setenv(env.ENV_MAX_CONCURRENT_FORKS, bad)
-        assert env.max_concurrent_forks() == 8
-
-
-class TestMaxInFlightTurns:
-    def test_unset_defaults_to_double_the_fork_pool(self, monkeypatch):
-        # The default is intentionally derived from max_concurrent_forks
-        # (2×) so the in-flight turn budget scales with the pool size — pin
-        # that coupling so a future edit can't silently decouple them.
-        monkeypatch.delenv(env.ENV_MAX_IN_FLIGHT_TURNS, raising=False)
-        monkeypatch.setenv(env.ENV_MAX_CONCURRENT_FORKS, "4")
-        assert env.max_in_flight_turns() == 8
-
-    def test_explicit_value(self, monkeypatch):
-        monkeypatch.setenv(env.ENV_MAX_IN_FLIGHT_TURNS, "20")
-        assert env.max_in_flight_turns() == 20
-
-    @pytest.mark.parametrize("bad", ["0", "-1", "abc"])
-    def test_invalid_falls_back_to_derived_default(self, bad, monkeypatch):
-        monkeypatch.setenv(env.ENV_MAX_CONCURRENT_FORKS, "4")
-        monkeypatch.setenv(env.ENV_MAX_IN_FLIGHT_TURNS, bad)
-        assert env.max_in_flight_turns() == 8
-
-
 class TestReportDebounceInvalid:
     def test_explicit_positive_value(self, monkeypatch):
         monkeypatch.setenv(env.ENV_REPORT_DEBOUNCE_SECS, "1.5")
@@ -254,8 +219,6 @@ def test_env_constants_match_string_literals():
     assert env.ENV_CLAUDE_SESSION == "CLAUDE_CODE_SESSION_ID"
     assert env.ENV_MAX_DEPTH == "CALLSTACK_MAX_DEPTH"
     assert env.ENV_MAX_FANOUT == "CALLSTACK_MAX_FANOUT"
-    assert env.ENV_MAX_CONCURRENT_FORKS == "CALLSTACK_MAX_CONCURRENT_FORKS"
-    assert env.ENV_MAX_IN_FLIGHT_TURNS == "CALLSTACK_MAX_IN_FLIGHT_TURNS"
     assert env.ENV_REPORT_DEBOUNCE_SECS == "CALLSTACK_REPORT_DEBOUNCE_SECS"
     assert env.ENV_FINALIZE_WAIT_SECS == "CALLSTACK_FINALIZE_WAIT_SECONDS"
     assert env.ENV_ORPHAN_TTL_SECS == "CALLSTACK_ORPHAN_TTL_SECONDS"

@@ -586,25 +586,6 @@ class TestRunTurnArgValidation:
             ClaudeChannel().run_turn("", "p", mode="fresh", preallocated_session_id="not-a-uuid")
 
 
-class TestLogSemWait:
-    """_log_sem_wait records contention only when a turn actually waited on the
-    concurrency semaphore (>0.5s), and must never let a logging failure escape
-    into the turn."""
-
-    def test_short_wait_not_logged(self):
-        log = io.StringIO()
-        ClaudeChannel._log_sem_wait(log, 0.1)
-        assert log.getvalue() == ""
-
-    def test_long_wait_logged(self):
-        log = io.StringIO()
-        ClaudeChannel._log_sem_wait(log, 1.5)
-        assert "semaphore-wait: 1.50s" in log.getvalue()
-
-    def test_log_failure_swallowed(self):
-        ClaudeChannel._log_sem_wait(_RaisingLog(), 2.0)  # OSError must not escape
-
-
 class _FakeStderr:
     def __init__(self, lines):
         self._lines = lines

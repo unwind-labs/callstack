@@ -68,7 +68,7 @@ def pool() -> ClaudePool:
 def fresh_module_pool():
     """Swap out the module-level pool so tests can't leak into each other."""
     saved = pool_mod._pool
-    pool_mod._pool = ClaudePool(max_size=pool_mod._MAX_CONCURRENT_FORKS)
+    pool_mod._pool = ClaudePool(max_size=pool_mod._DEFAULT_POOL_SIZE)
     try:
         yield pool_mod._pool
     finally:

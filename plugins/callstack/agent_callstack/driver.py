@@ -25,7 +25,6 @@ from typing import Any, Callable, Literal, Optional, cast
 
 from . import state as st
 from .channel import (
-    _MAX_IN_FLIGHT_TURNS as _CHANNEL_MAX_IN_FLIGHT,
     Channel,
     TurnTimeout,
 )
@@ -35,6 +34,11 @@ from .session import SessionRef, count_lines
 from .trace import TraceWriter, TreeStore
 
 CALL_TREE_SCHEMA_VERSION = "2"
+
+# Worker pool size for `call_many` fan-out and nested driving. Matches
+# the prior `2 × CALLSTACK_MAX_CONCURRENT_FORKS` derivation (16) so the
+# concurrent-driving capacity is unchanged from before the cap removal.
+_RUN_POOL_MAX_WORKERS = 16
 
 
 # PERF-J: single module-level pool sized to the channel's in-flight turn
@@ -51,7 +55,7 @@ def _get_run_pool() -> cf.ThreadPoolExecutor:
         with _RUN_POOL_LOCK:
             if _RUN_POOL is None:
                 _RUN_POOL = cf.ThreadPoolExecutor(
-                    max_workers=max(2, _CHANNEL_MAX_IN_FLIGHT),
+                    max_workers=_RUN_POOL_MAX_WORKERS,
                     thread_name_prefix="callstack-driver",
                 )
                 atexit.register(_shutdown_run_pool)

@@ -68,10 +68,6 @@ ENV_MAX_FANOUT = "CALLSTACK_MAX_FANOUT"
 # the leak.
 ENV_MAX_BACKGROUND = "CALLSTACK_MAX_BACKGROUND"
 
-# Process-pool sizing (channel.py).
-ENV_MAX_CONCURRENT_FORKS = "CALLSTACK_MAX_CONCURRENT_FORKS"
-ENV_MAX_IN_FLIGHT_TURNS = "CALLSTACK_MAX_IN_FLIGHT_TURNS"
-
 # Debounce window for LiveReporter merge ticks (reporter.py).
 ENV_REPORT_DEBOUNCE_SECS = "CALLSTACK_REPORT_DEBOUNCE_SECS"
 
@@ -94,7 +90,6 @@ ENV_ORPHAN_TTL_SECS = "CALLSTACK_ORPHAN_TTL_SECONDS"
 _DEFAULT_MAX_DEPTH = 10
 _DEFAULT_MAX_FANOUT = 64
 _DEFAULT_MAX_BACKGROUND = 64
-_DEFAULT_MAX_CONCURRENT_FORKS = 8
 _DEFAULT_REPORT_DEBOUNCE_SECS = 0.25
 _DEFAULT_FINALIZE_WAIT_SECS = 120.0
 _MAX_FINALIZE_WAIT_SECS = 600.0
@@ -150,29 +145,6 @@ def max_background() -> int:
         return v if v > 0 else _DEFAULT_MAX_BACKGROUND
     except ValueError:
         return _DEFAULT_MAX_BACKGROUND
-
-
-def max_concurrent_forks() -> int:
-    raw = os.environ.get(ENV_MAX_CONCURRENT_FORKS)
-    if raw is None:
-        return _DEFAULT_MAX_CONCURRENT_FORKS
-    try:
-        v = int(raw)
-        return v if v > 0 else _DEFAULT_MAX_CONCURRENT_FORKS
-    except ValueError:
-        return _DEFAULT_MAX_CONCURRENT_FORKS
-
-
-def max_in_flight_turns() -> int:
-    default = max_concurrent_forks() * 2
-    raw = os.environ.get(ENV_MAX_IN_FLIGHT_TURNS)
-    if raw is None:
-        return default
-    try:
-        v = int(raw)
-        return v if v > 0 else default
-    except ValueError:
-        return default
 
 
 def report_debounce_secs() -> float:

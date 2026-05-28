@@ -18,14 +18,12 @@ The CLI's stream-json input mode strips slash commands (verified
 session ids via `/resume`. The pool is therefore strictly
 process-PER-session, not a shared multiplex.
 
-Eviction: LRU when pool size exceeds CALLSTACK_MAX_CONCURRENT_FORKS.
-In-use pooled processes (per-process lock held) are skipped during
-eviction — the pool may exceed cap briefly until a turn finishes.
+Eviction: LRU when pool size exceeds `_DEFAULT_POOL_SIZE`. In-use
+pooled processes (per-process lock held) are skipped during eviction —
+the pool may exceed its size briefly until a turn finishes.
 
 The pool is torn down at interpreter exit via `atexit`, or explicitly
-via `Caller.close()` / `shutdown_pool()`. `channel.py` owns the spawn /
-in-flight semaphores that bound concurrency; this module owns the
-process registry and its lifecycle.
+via `Caller.close()` / `shutdown_pool()`.
 """
 
 from __future__ import annotations
@@ -36,12 +34,13 @@ import threading
 import time
 from typing import Callable, Optional
 
-from . import env as _env
-
-# Default pool size: the cold-start concurrency cap. `channel.py` imports
-# this to size `_SPAWN_SEMAPHORE` so the pool and the spawn cap stay in
-# lockstep on the same env knob (CALLSTACK_MAX_CONCURRENT_FORKS).
-_MAX_CONCURRENT_FORKS = _env.max_concurrent_forks()
+# Pool size — bounds the number of warm `claude` processes this MCP
+# server holds between turns to amortize cold-start cost. NOT a
+# concurrency cap on total spawned `claude` subprocesses (that
+# responsibility was removed; see `dev/RFC-harvest-on-demand.md` for
+# the deferred design). Matches the prior cap's default of 8 so
+# behavior on the warm-pool side is unchanged.
+_DEFAULT_POOL_SIZE = 8
 
 
 class _PooledProcess:
@@ -230,7 +229,7 @@ def _get_pool() -> ClaudePool:
     if _pool is None:
         with _pool_init_lock:
             if _pool is None:
-                _pool = ClaudePool(_MAX_CONCURRENT_FORKS)
+                _pool = ClaudePool(_DEFAULT_POOL_SIZE)
                 atexit.register(_pool.shutdown)
     return _pool
 
