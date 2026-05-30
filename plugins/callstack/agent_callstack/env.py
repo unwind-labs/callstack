@@ -17,7 +17,8 @@ not five.
 from __future__ import annotations
 
 import os
-from typing import Optional
+from dataclasses import dataclass
+from typing import Callable, Literal, Optional
 
 # ---------- Variable names ----------
 
@@ -127,59 +128,72 @@ _MAX_SYNC_BUDGET_SECS = 24 * 60 * 60.0
 _MAX_DEPTH_CEILING = 32
 
 
-# ---------- Typed readers ----------
+# ---------- Numeric readers (single clamp/default policy) ----------
+#
+# Every numeric knob shares one shape: read env → unset?default → parse
+# (ValueError?default) → reject out-of-range?default → clamp to ceiling.
+# Declaring each as data and running it through `_read_numeric` keeps that
+# policy single-sourced (a bug fixed once is fixed for every knob) and makes
+# adding a knob a one-line table entry. The public reader names + int/float
+# return types and each knob's exact default/ceiling/reject-policy are
+# unchanged; the rich rationale for each lives on its constants above.
+
+
+@dataclass(frozen=True)
+class _NumericKnob:
+    name: str
+    parse: Callable[[str], float]  # `int` or `float`
+    default: float
+    # max_depth/fanout/background reject `<= 0` (a count must be positive);
+    # the duration knobs reject only `< 0` (0 is a meaningful "disable").
+    reject: Literal["<=0", "<0"]
+    ceiling: float | None = None  # `None` = no upper clamp
+
+
+def _read_numeric(k: _NumericKnob) -> float:
+    raw = os.environ.get(k.name)
+    if raw is None:
+        return k.default
+    try:
+        v = k.parse(raw)
+    except ValueError:
+        return k.default
+    if (k.reject == "<=0" and v <= 0) or (k.reject == "<0" and v < 0):
+        return k.default
+    return min(v, k.ceiling) if k.ceiling is not None else v
+
+
+_MAX_DEPTH_KNOB = _NumericKnob(ENV_MAX_DEPTH, int, _DEFAULT_MAX_DEPTH, "<=0", _MAX_DEPTH_CEILING)
+_MAX_FANOUT_KNOB = _NumericKnob(ENV_MAX_FANOUT, int, _DEFAULT_MAX_FANOUT, "<=0")
+_MAX_BACKGROUND_KNOB = _NumericKnob(ENV_MAX_BACKGROUND, int, _DEFAULT_MAX_BACKGROUND, "<=0")
+_REPORT_DEBOUNCE_KNOB = _NumericKnob(ENV_REPORT_DEBOUNCE_SECS, float, _DEFAULT_REPORT_DEBOUNCE_SECS, "<0")
+_FINALIZE_WAIT_KNOB = _NumericKnob(
+    ENV_FINALIZE_WAIT_SECS, float, _DEFAULT_FINALIZE_WAIT_SECS, "<0", _MAX_FINALIZE_WAIT_SECS
+)
+_ORPHAN_TTL_KNOB = _NumericKnob(ENV_ORPHAN_TTL_SECS, float, _DEFAULT_ORPHAN_TTL_SECS, "<0", _MAX_ORPHAN_TTL_SECS)
+_SYNC_BUDGET_KNOB = _NumericKnob(ENV_SYNC_BUDGET_SECS, float, _DEFAULT_SYNC_BUDGET_SECS, "<0", _MAX_SYNC_BUDGET_SECS)
 
 
 def max_depth() -> int:
     """Effective max recursion depth, clamped to `_MAX_DEPTH_CEILING`."""
-    raw = os.environ.get(ENV_MAX_DEPTH)
-    if raw is None:
-        return _DEFAULT_MAX_DEPTH
-    try:
-        v = int(raw)
-        if v <= 0:
-            return _DEFAULT_MAX_DEPTH
-        return min(v, _MAX_DEPTH_CEILING)
-    except ValueError:
-        return _DEFAULT_MAX_DEPTH
+    return int(_read_numeric(_MAX_DEPTH_KNOB))
 
 
 def max_fanout() -> int:
     """Max `len(tasks)` accepted at the MCP boundary."""
-    raw = os.environ.get(ENV_MAX_FANOUT)
-    if raw is None:
-        return _DEFAULT_MAX_FANOUT
-    try:
-        v = int(raw)
-        return v if v > 0 else _DEFAULT_MAX_FANOUT
-    except ValueError:
-        return _DEFAULT_MAX_FANOUT
+    return int(_read_numeric(_MAX_FANOUT_KNOB))
 
 
 def max_background() -> int:
     """Max number of `run_in_background=True` invocations the MCP server
     will keep parked in its registry at once."""
-    raw = os.environ.get(ENV_MAX_BACKGROUND)
-    if raw is None:
-        return _DEFAULT_MAX_BACKGROUND
-    try:
-        v = int(raw)
-        return v if v > 0 else _DEFAULT_MAX_BACKGROUND
-    except ValueError:
-        return _DEFAULT_MAX_BACKGROUND
+    return int(_read_numeric(_MAX_BACKGROUND_KNOB))
 
 
 def report_debounce_secs() -> float:
     """How long _LiveReporter waits before flushing a merged report.
     Tests override via env to 0 for synchronous merge."""
-    raw = os.environ.get(ENV_REPORT_DEBOUNCE_SECS)
-    if raw is None:
-        return _DEFAULT_REPORT_DEBOUNCE_SECS
-    try:
-        v = float(raw)
-        return v if v >= 0 else _DEFAULT_REPORT_DEBOUNCE_SECS
-    except ValueError:
-        return _DEFAULT_REPORT_DEBOUNCE_SECS
+    return _read_numeric(_REPORT_DEBOUNCE_KNOB)
 
 
 def read_finalize_wait_seconds() -> float:
@@ -187,16 +201,7 @@ def read_finalize_wait_seconds() -> float:
     before marking them `Timeout`. Clamped to `[0, _MAX_FINALIZE_WAIT_SECS]`.
     Setting `CALLSTACK_FINALIZE_WAIT_SECONDS=0` preserves the pre-fix
     "seal immediately" behavior."""
-    raw = os.environ.get(ENV_FINALIZE_WAIT_SECS)
-    if raw is None:
-        return _DEFAULT_FINALIZE_WAIT_SECS
-    try:
-        v = float(raw)
-    except ValueError:
-        return _DEFAULT_FINALIZE_WAIT_SECS
-    if v < 0:
-        return _DEFAULT_FINALIZE_WAIT_SECS
-    return min(v, _MAX_FINALIZE_WAIT_SECS)
+    return _read_numeric(_FINALIZE_WAIT_KNOB)
 
 
 def read_orphan_ttl_seconds() -> float:
@@ -207,32 +212,14 @@ def read_orphan_ttl_seconds() -> float:
     Setting `CALLSTACK_ORPHAN_TTL_SECONDS=0` opts out of the TTL fallback
     entirely (relies on `_pid_alive` alone — restores the pre-fix
     behavior for tests that want to pin it)."""
-    raw = os.environ.get(ENV_ORPHAN_TTL_SECS)
-    if raw is None:
-        return _DEFAULT_ORPHAN_TTL_SECS
-    try:
-        v = float(raw)
-    except ValueError:
-        return _DEFAULT_ORPHAN_TTL_SECS
-    if v < 0:
-        return _DEFAULT_ORPHAN_TTL_SECS
-    return min(v, _MAX_ORPHAN_TTL_SECS)
+    return _read_numeric(_ORPHAN_TTL_KNOB)
 
 
 def sync_budget_secs() -> float:
     """How long synchronous `call` will block awaiting the child before
     returning a `status: "pending"` envelope. Returns 0 to disable the
     auto-fallback. Clamped to `[0, _MAX_SYNC_BUDGET_SECS]`."""
-    raw = os.environ.get(ENV_SYNC_BUDGET_SECS)
-    if raw is None:
-        return _DEFAULT_SYNC_BUDGET_SECS
-    try:
-        v = float(raw)
-    except ValueError:
-        return _DEFAULT_SYNC_BUDGET_SECS
-    if v < 0:
-        return _DEFAULT_SYNC_BUDGET_SECS
-    return min(v, _MAX_SYNC_BUDGET_SECS)
+    return _read_numeric(_SYNC_BUDGET_KNOB)
 
 
 def current_depth() -> int:
