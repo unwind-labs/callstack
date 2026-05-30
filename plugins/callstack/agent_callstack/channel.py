@@ -172,7 +172,28 @@ class Channel(Protocol):
         extra_env: Optional[dict] = None,
         on_session_id: Optional[Callable[[str], None]] = None,
         preallocated_session_id: Optional[str] = None,
-    ) -> TurnResult: ...
+    ) -> TurnResult:
+        """Run one LLM turn and return its `TurnResult`.
+
+        `on_session_id` timing contract — load-bearing, and pinned by
+        `tests/test_channel_conformance.py` for every implementation:
+
+          * It is invoked AT MOST ONCE, the first time a session id is observed
+            on the wire, and ALWAYS *before* `run_turn` returns — i.e. while the
+            turn is still in flight. `ClaudeChannel` fires it from its NDJSON
+            reader loop on the `system init` message (mid-turn); `ScriptedChannel`
+            fires it just before returning the result. Either way the observer
+            sees the new id without waiting for the full turn to finish, which is
+            what lets `TurnExecutor`'s callback propagate the id to progress
+            observers mid-turn.
+          * It is advisory: an exception raised by the callback is logged and
+            never propagated into the turn (see `_fire_on_session_id`).
+
+        An implementation that fires `on_session_id` only *after* `run_turn` has
+        returned (or more than once) is non-conformant — the contract is what
+        keeps a test double from drifting away from production timing.
+        """
+        ...
 
 
 # --------------------------------------------------------------------------
