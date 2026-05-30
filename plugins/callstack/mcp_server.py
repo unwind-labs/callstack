@@ -34,7 +34,6 @@ from agent_callstack import (
     CapReached,
     Crashed,
     Done,
-    InvocationReport,
     MultiResult,
     NotFound,
     Pending,
@@ -45,6 +44,7 @@ from agent_callstack import (
     max_fanout,
     new_invoke_id,
     root_identity,
+    sync_budget_secs,
 )
 from mcp.server.fastmcp import FastMCP
 
@@ -257,35 +257,6 @@ def _same_project(a: str, b: str) -> bool:
         return False
 
 
-def _finalize_at_boundary(log_dir, invoke_id: str, *, reason: str) -> None:
-    """Best-effort post-mortem at an MCP tool exception boundary.
-
-    Force-terminates any non-terminal frames this process owns so the
-    parent agent sees status='abandoned' rather than a stuck-running
-    spinner. Goes through `InvocationReport.finalize_own_frames` with the
-    standard "never raise, log to stderr on failure" contract.
-
-    NOT run on the happy path: `caller.call_many` already runs
-    `reporter.finalize` (which itself runs `wait_for_terminal_signals`)
-    in its own finally. The boundary cleanup only matters when an
-    exception aborts that chain — running it on success was measurable
-    I/O (glob + fcntl lock + per-frame parse) for a guaranteed no-op."""
-    try:
-        # cwd is irrelevant to finalize_own_frames (it only needs
-        # log_dir + invoke_id to locate this process's frames).
-        report = InvocationReport(
-            invoke_id=invoke_id,
-            log_dir=log_dir,
-            cwd="",
-        )
-        report.finalize_own_frames(reason=reason)
-    except Exception as e:
-        print(
-            f"[callstack] WARN finalize_own_frames raised at MCP boundary ({reason}): {type(e).__name__}: {e}",
-            file=sys.stderr,
-        )
-
-
 def _envelope_from_multi(invoke_id: str, report_path: str, multi: MultiResult) -> dict:
     envelope: dict = {
         "invoke_id": invoke_id,
@@ -343,7 +314,20 @@ async def call(
         Designed for batches whose wallclock would otherwise exceed
         Claude Code's `MCP_TOOL_TIMEOUT` (~10 min). Validation errors
         (bad tasks, bad cwd, fork+cross-project) are still surfaced
-        synchronously so the orchestrator can react without polling."""
+        synchronously so the orchestrator can react without polling.
+
+    Synchronous-mode auto-fallback: when `run_in_background=False`, the
+        sync await is bounded by `CALLSTACK_SYNC_BUDGET_SECONDS` (default
+        540s, one minute under Claude Code's default 10 min MCP cap). A
+        run that finishes inside the budget returns the full `results`
+        envelope as before. A run that's still going when the budget
+        elapses returns `{invoke_id, report_path, status: "pending"}` —
+        identical to what `await_call` returns mid-run — so the
+        orchestrator can drain it with `await_call(invoke_id)` instead
+        of being killed by the MCP client. Set the env var to 0 to
+        disable the fallback (block until done or until the client
+        kills the tool call). Calls have no inherent timeout — the
+        budget exists only to dodge the MCP client's hard cap."""
     if context not in ("fork", "fresh"):
         return json.dumps(
             {
@@ -439,30 +423,88 @@ async def call(
             indent=2,
         )
 
-    # Fix #2: when `caller.call_many` raises before its own finally clause
-    # gets to run reporter.finalize, the on-disk frames are left with
-    # non-terminal node states and the parent agent would see a stuck
-    # spinner. `_finalize_at_boundary` rewrites them to ``Abandoned``
-    # atomically. The happy path doesn't need this guard — call_many's
-    # finalize chain (driver.run -> wait_for_terminal_signals ->
-    # reporter.finalize) is already responsible for terminal state, and
-    # running this on every successful call was per-tool-call disk I/O
-    # for a guaranteed no-op.
-    try:
-        multi: MultiResult = await asyncio.to_thread(
-            caller.call_many,
-            tasks,
-            context=context,
+    # Sync path: route through the same `BackgroundRuns` machinery as
+    # `run_in_background=True`, but bound-await the result so quick
+    # tasks still return their full envelope inline. The unification
+    # buys two things over the previous `asyncio.to_thread` direct
+    # path:
+    #   1. If the await elapses without completion, we return a
+    #      `status: "pending"` envelope and leave the task parked in
+    #      the registry, so the orchestrator can `await_call` it to
+    #      drain — sidestepping Claude Code's `MCP_TOOL_TIMEOUT` hard
+    #      cap (which progress notifications do NOT extend; see env.py
+    #      `ENV_SYNC_BUDGET_SECS`).
+    #   2. `BackgroundRuns.reconcile` already owns the crash-finalize
+    #      path (`_finalize_crashed`), replacing the bespoke
+    #      `_finalize_at_boundary` guard that previously wrapped
+    #      `call_many`.
+    start_outcome = _background.start(
+        invoke_id=invoke_id,
+        caller=caller,
+        tasks=tasks,
+        context=context,
+        report_path=report_path,
+        log_dir=log_dir,
+    )
+    if isinstance(start_outcome, CapReached):
+        return json.dumps(
+            {
+                "invoke_id": "",
+                "report_path": "",
+                "results": [
+                    {
+                        "status": "error",
+                        "error": (
+                            f"background-call registry full: {start_outcome.outstanding} "
+                            f"outstanding (cap={start_outcome.cap}). Reconcile pending "
+                            f"invocations with `await_call(invoke_id)` first, or "
+                            f"widen with CALLSTACK_MAX_BACKGROUND."
+                        ),
+                    }
+                ],
+            },
+            indent=2,
         )
-    except Exception:
-        _finalize_at_boundary(
-            log_dir,
-            invoke_id,
-            reason="call_many raised before recording terminal frame state",
+    assert isinstance(start_outcome, Started)
+    outcome = await _background.reconcile(
+        invoke_id,
+        timeout=sync_budget_secs(),
+    )
+    if isinstance(outcome, Pending):
+        # Budget elapsed before the run finished. The entry stays
+        # pinned in the registry (`_Run.polled=True`); orchestrator
+        # drains it with `await_call(invoke_id)`. Same wire shape as
+        # `await_call`'s pending response so callers have one drain
+        # code path.
+        return json.dumps(
+            {
+                "invoke_id": invoke_id,
+                "report_path": outcome.report_path,
+                "status": "pending",
+            },
+            indent=2,
         )
-        raise
+    if isinstance(outcome, Crashed):
+        # `BackgroundRuns` already force-finalized the crashed run's
+        # frames; surface the structured error envelope rather than
+        # re-raising so the orchestrator sees the same shape it would
+        # for a background-mode crash.
+        return json.dumps(
+            {
+                "invoke_id": invoke_id,
+                "report_path": outcome.report_path,
+                "results": [
+                    {
+                        "status": "error",
+                        "error": f"call_many raised: {outcome.error}",
+                    }
+                ],
+            },
+            indent=2,
+        )
+    assert isinstance(outcome, Done)
     return json.dumps(
-        _envelope_from_multi(invoke_id, report_path, multi),
+        _envelope_from_multi(invoke_id, outcome.report_path, outcome.result),
         indent=2,
     )
 

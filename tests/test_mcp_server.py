@@ -399,93 +399,140 @@ def _clear_background_registry():
     mcp_server._background.clear()
 
 
-class TestFinalizeAtBoundary:
-    """REVIEW-203: `_finalize_at_boundary` is the MCP boundary's escape
-    hatch for force-terminating non-terminal frames when something went
-    wrong upstream. On the happy path it would be a guaranteed no-op
-    (the call_many → driver → reporter.finalize chain already produces
-    terminal frames) but still costs a glob + fcntl lock + per-frame
-    parse on every tool call. Restrict it to the exception path."""
+class TestSyncCrashEnvelope:
+    """Sync `call` routes through `BackgroundRuns` with a bounded await,
+    so a `call_many` that raises is caught by `reconcile` (which
+    force-finalizes the run's frames internally) and surfaced to the
+    orchestrator as a structured error envelope rather than re-raised.
+    This unifies the crash shape across sync and background modes and
+    replaces the previous `_finalize_at_boundary` raise-and-cleanup
+    path."""
 
     @pytest.mark.asyncio
-    async def test_happy_path_does_not_invoke_finalize_own_frames(
+    async def test_call_many_exception_returns_error_envelope(
         self,
         tmp_path,
         monkeypatch,
     ):
-        """Sync `call` returning normally must not call the boundary guard."""
+        """A sync `call` whose underlying `call_many` raises must return
+        a status='error' envelope — NOT re-raise into FastMCP's error
+        path — so the orchestrator gets a consistent wire shape with
+        the background-mode crash branch."""
         monkeypatch.chdir(tmp_path)
-        calls = []
-        monkeypatch.setattr(
-            mcp_server,
-            "_finalize_at_boundary",
-            lambda *a, **kw: calls.append((a, kw)),
-        )
-        monkeypatch.setattr(
-            mcp_server,
-            "_build_caller",
-            lambda *a, **kw: _StubCaller(results=[_ok_result()]),
-        )
-        env = json.loads(await mcp_server.call(tasks=["x"]))
-        assert env["results"][0]["status"] == "complete"
-        assert calls == [], (
-            "happy path must not invoke the boundary guard — the "
-            "upstream finalize chain is already responsible for terminal "
-            "state and the guard was measurable I/O for a guaranteed no-op"
-        )
-
-    @pytest.mark.asyncio
-    async def test_exception_path_invokes_finalize_own_frames(
-        self,
-        tmp_path,
-        monkeypatch,
-    ):
-        """If call_many raises, the boundary guard must fire so the parent
-        sees status='abandoned' rather than a stuck spinner."""
-        monkeypatch.chdir(tmp_path)
-        calls = []
-        monkeypatch.setattr(
-            mcp_server,
-            "_finalize_at_boundary",
-            lambda *a, **kw: calls.append((a, kw)),
-        )
 
         class _ExplodingCaller:
             def call_many(self, *_a, **_kw):
                 raise RuntimeError("boom")
 
-        monkeypatch.setattr(mcp_server, "_build_caller", lambda *a, **kw: _ExplodingCaller())
-        with pytest.raises(RuntimeError, match="boom"):
-            await mcp_server.call(tasks=["x"])
-        assert len(calls) == 1, "exception path must invoke the boundary guard exactly once"
+        monkeypatch.setattr(
+            mcp_server,
+            "_build_caller",
+            lambda *a, **kw: _ExplodingCaller(),
+        )
+        env = json.loads(await mcp_server.call(tasks=["x"]))
+        assert env["results"][0]["status"] == "error"
+        assert "boom" in env["results"][0]["error"]
+        # Crashed entry was popped from the registry by `reconcile`.
+        assert env["invoke_id"] not in mcp_server._background
+
+
+class TestSyncBudgetFallback:
+    """The sync `call` path bound-awaits via `BackgroundRuns.reconcile`
+    with `CALLSTACK_SYNC_BUDGET_SECONDS` as the budget. A run that
+    finishes inside the budget returns its full envelope inline; a
+    run still going when the budget elapses returns a `pending`
+    envelope and leaves the task parked so the orchestrator can
+    `await_call` it. This is what lets a sync `call` survive longer
+    than Claude Code's hard `MCP_TOOL_TIMEOUT` cap without changing
+    the simple-case API."""
 
     @pytest.mark.asyncio
-    async def test_await_call_happy_path_does_not_invoke_finalize(
+    async def test_fast_call_returns_full_envelope_inline(
         self,
         tmp_path,
         monkeypatch,
     ):
-        """await_call returning a normal envelope must not call the guard."""
+        """A run that finishes well inside the budget returns the
+        results envelope, not a pending one — the sync UX is
+        unchanged for the common case."""
         monkeypatch.chdir(tmp_path)
-        calls = []
-        monkeypatch.setattr(
-            mcp_server,
-            "_finalize_at_boundary",
-            lambda *a, **kw: calls.append((a, kw)),
-        )
         monkeypatch.setattr(
             mcp_server,
             "_build_caller",
-            lambda *a, **kw: _StubCaller(results=[_ok_result()]),
+            lambda *a, **kw: _StubCaller(results=[_ok_result("fast")]),
         )
-        started = json.loads(
-            await mcp_server.call(tasks=["x"], run_in_background=True),
-        )
-        env = json.loads(
-            await mcp_server.await_call(started["invoke_id"], timeout=5),
-        )
+        env = json.loads(await mcp_server.call(tasks=["x"]))
         assert env["results"][0]["status"] == "complete"
-        assert calls == []
+        assert env["results"][0]["result"] == "fast"
+        assert "status" not in env or env.get("status") != "pending"
+
+    @pytest.mark.asyncio
+    async def test_slow_call_returns_pending_envelope(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """A run still in-flight when the budget elapses must return
+        a `status: "pending"` envelope so the orchestrator can drain
+        via `await_call` instead of being killed by the MCP client's
+        wall-clock cap."""
+        monkeypatch.chdir(tmp_path)
+        gate = threading.Event()
+        monkeypatch.setattr(
+            mcp_server,
+            "_build_caller",
+            lambda *a, **kw: _StubCaller(results=[_ok_result()], gate=gate),
+        )
+        # Squeeze the budget so the test doesn't actually wait 9 minutes.
+        monkeypatch.setattr(
+            mcp_server,
+            "sync_budget_secs",
+            lambda: 0.05,
+        )
+        env = json.loads(await mcp_server.call(tasks=["x"]))
+        assert env["status"] == "pending"
+        assert env["invoke_id"]
+        assert env["report_path"]
+        # Entry stays in the registry so `await_call` can drain it —
+        # same pinning semantics as a paged background run.
+        assert env["invoke_id"] in mcp_server._background
+        # Drain so the worker thread doesn't outlive the test.
+        gate.set()
+        await mcp_server.await_call(env["invoke_id"], timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_pending_envelope_drains_via_await_call(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """End-to-end: a sync `call` that returns pending must be
+        reconcilable through `await_call` and yield the same final
+        envelope shape as a sync run that finished inline. This is
+        the contract orchestrators rely on for the indefinite-duration
+        case."""
+        monkeypatch.chdir(tmp_path)
+        gate = threading.Event()
+        monkeypatch.setattr(
+            mcp_server,
+            "_build_caller",
+            lambda *a, **kw: _StubCaller(
+                results=[_ok_result("eventually")],
+                gate=gate,
+            ),
+        )
+        monkeypatch.setattr(mcp_server, "sync_budget_secs", lambda: 0.05)
+        pending = json.loads(await mcp_server.call(tasks=["x"]))
+        assert pending["status"] == "pending"
+        invoke_id = pending["invoke_id"]
+        # Now release the worker and reconcile.
+        gate.set()
+        env = json.loads(await mcp_server.await_call(invoke_id, timeout=5))
+        assert env["invoke_id"] == invoke_id
+        assert env["results"][0]["status"] == "complete"
+        assert env["results"][0]["result"] == "eventually"
+        # Reconciled entry gets popped.
+        assert invoke_id not in mcp_server._background
 
 
 class TestRunInBackground:

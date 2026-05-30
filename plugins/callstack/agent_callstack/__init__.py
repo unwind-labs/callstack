@@ -94,6 +94,7 @@ __all__ = [
     "new_invoke_id",
     "max_fanout",
     "max_background",
+    "sync_budget_secs",
     "root_identity",
 ]
 
@@ -128,6 +129,7 @@ from .env import (  # noqa: E402
     max_depth as _default_max_depth,  # noqa: E402
     max_fanout,
     root_identity,
+    sync_budget_secs,
 )
 
 # ---------- Caller (power-user entry point) ----------

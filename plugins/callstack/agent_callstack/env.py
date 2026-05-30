@@ -84,6 +84,18 @@ ENV_FINALIZE_WAIT_SECS = "CALLSTACK_FINALIZE_WAIT_SECONDS"
 # unrelated process and the signal-0 probe falsely reports "alive."
 ENV_ORPHAN_TTL_SECS = "CALLSTACK_ORPHAN_TTL_SECONDS"
 
+# How long synchronous `call` (run_in_background=False) is willing to
+# block before returning a `status: "pending"` envelope so the
+# orchestrator can drain via `await_call`. Exists because the MCP
+# client (Claude Code) imposes a hard wall-clock cap per tool call
+# (`MCP_TOOL_TIMEOUT`, default ~10 min) that progress notifications do
+# NOT extend. Set this below the client's cap with a safety margin so
+# the sync path can degrade gracefully into the background-await path
+# instead of being killed mid-flight. 0 disables the auto-fallback
+# (sync `call` will block until the child finishes or the client
+# kills it).
+ENV_SYNC_BUDGET_SECS = "CALLSTACK_SYNC_BUDGET_SECONDS"
+
 
 # ---------- Defaults ----------
 
@@ -97,6 +109,16 @@ _MAX_FINALIZE_WAIT_SECS = 600.0
 # we declare a writer dead regardless of what `os.kill(pid, 0)` says.
 _DEFAULT_ORPHAN_TTL_SECS = 1200.0
 _MAX_ORPHAN_TTL_SECS = 24 * 60 * 60.0
+
+# 540s = 9 min — one minute under Claude Code's default 10 min
+# MCP_TOOL_TIMEOUT so the sync await unwinds cleanly into a
+# `status: "pending"` envelope before the client kills the tool call.
+# Operators with a custom MCP_TOOL_TIMEOUT should tune this to stay
+# under it. Clamp at 24h: there is no legitimate reason for a sync
+# await to exceed a day, and an absurdly large value almost certainly
+# indicates a config typo we'd rather expose than honor.
+_DEFAULT_SYNC_BUDGET_SECS = 540.0
+_MAX_SYNC_BUDGET_SECS = 24 * 60 * 60.0
 
 # SEC-103: defensive ceiling on the depth budget. A caller (or stale
 # shell env) setting `CALLSTACK_MAX_DEPTH=1_000_000` would let a runaway
@@ -195,6 +217,22 @@ def read_orphan_ttl_seconds() -> float:
     if v < 0:
         return _DEFAULT_ORPHAN_TTL_SECS
     return min(v, _MAX_ORPHAN_TTL_SECS)
+
+
+def sync_budget_secs() -> float:
+    """How long synchronous `call` will block awaiting the child before
+    returning a `status: "pending"` envelope. Returns 0 to disable the
+    auto-fallback. Clamped to `[0, _MAX_SYNC_BUDGET_SECS]`."""
+    raw = os.environ.get(ENV_SYNC_BUDGET_SECS)
+    if raw is None:
+        return _DEFAULT_SYNC_BUDGET_SECS
+    try:
+        v = float(raw)
+    except ValueError:
+        return _DEFAULT_SYNC_BUDGET_SECS
+    if v < 0:
+        return _DEFAULT_SYNC_BUDGET_SECS
+    return min(v, _MAX_SYNC_BUDGET_SECS)
 
 
 def current_depth() -> int:
