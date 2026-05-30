@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from . import state as st
+from . import sealing, state as st
 from .driver import Node, Tree
 from .protocol import Return, Yield
 from .session import envelope_from_session_record, session_record_epoch
@@ -137,10 +137,13 @@ class _NodeWaiter:
 
     def expire_to_timeout(self) -> None:
         """Force the node to `Timeout` — called once the global wait
-        budget runs out without a recoverable envelope."""
+        budget runs out without a recoverable envelope. Routes the Timeout
+        construction through the shared sealing policy so the wait-budget
+        message and session-id handling stay single-sourced."""
         sid = _session_id_of(self.node.state) or self.node.session_id
-        self.node.state = st.Timeout(
-            error="wait-for-terminal-envelope budget elapsed",
+        self.node.state = sealing.terminal_state_for(
+            sealing.TimeoutCause(),
+            prior_kind=self.node.state.kind,
             session_id=sid,
         )
 

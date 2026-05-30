@@ -29,7 +29,7 @@ from typing import Any, Iterator, Optional, Sequence
 
 import yaml
 
-from . import shutdown as _shutdown, state as _state
+from . import shutdown as _shutdown
 from .driver import Tree
 
 # Re-exports for backwards-compatible test access; the parsing policy
@@ -498,34 +498,14 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
 
 
 def _abandon_tree_nodes_in_place(tree: Tree, *, reason: str) -> int:
-    """Walk every node in `tree`; for any whose state is eligible for
-    abandonment per :func:`state.is_eligible_for_abandonment`, replace
-    it with :class:`state.Abandoned` and mirror the error onto
-    ``node.error`` so the merged-report graft surfaces it.
+    """Seal every eligible non-terminal node in an in-memory `Tree` to
+    :class:`state.Abandoned`, recursively. Thin entry point over the shared
+    `sealing.seal_tree` walk — the Tree-shape adapter and the eligibility
+    policy live there, single-sourced with the dict-shape variant in
+    `frames.py`. Returns the count of nodes sealed."""
+    from .sealing import AbandonCause, seal_tree, tree_views
 
-    Returns the number of nodes mutated. Tree-shape counterpart of
-    :func:`frames.mark_abandoned_in_dict_nodes`; both consult the same
-    eligibility predicate."""
-    from .driver import Node as _Node
-
-    changed = 0
-
-    def walk(node: _Node) -> None:
-        nonlocal changed
-        s = node.state
-        if _state.is_eligible_for_abandonment(s.kind):
-            sid = getattr(s, "session_id", None) or node.session_id
-            err = f"{reason} (state was {s.kind!r})"
-            # node.error is derived from node.state, so the Abandoned state IS
-            # the write — no separate mirror.
-            node.state = _state.Abandoned(error=err, session_id=sid)
-            changed += 1
-        for c in node.children:
-            walk(c)
-
-    for n in tree.nodes:
-        walk(n)
-    return changed
+    return seal_tree(tree_views(tree.nodes), AbandonCause(reason))
 
 
 # Backwards-compat alias for tests + external callers that pulled
