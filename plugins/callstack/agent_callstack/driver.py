@@ -1,9 +1,11 @@
 """The driver: turns Effects into real I/O and feeds Events back into step().
 
-A `Node` is a mutable wrapper that records the current `State` plus
-denormalized fields (session id, clone path, accumulated duration) for
-inspection. Transitions are still pure — the driver just performs the
-effects and feeds the resulting events back through `step()`.
+A `Node` is a mutable wrapper around the current `State`, exposing session
+id / result / error as read-through views over that state plus a few genuine
+fields (clone path, accumulated duration) for inspection. Transitions are
+still pure — the driver just performs the effects and feeds the resulting
+events back through `step()`. One `RunTurn` effect is executed end-to-end by
+`TurnExecutor`, which returns a `TurnOutcome` the driver applies to the Node.
 
 `Driver.run(parent, tasks)` executes one or more root tasks and returns the
 finished `Tree`. Multiple tasks fan out via a thread pool. Children execute
@@ -252,6 +254,167 @@ class MaxDepthExceeded(Exception):
 
 
 SessionResolver = Callable[[str, Optional[str]], Optional[Path]]
+
+
+@dataclass(frozen=True)
+class TurnOutcome:
+    """What one RunTurn produced, normalized for the driver to apply. `event`
+    is fed straight into `step()`; the rest are the Node facts the turn
+    computed (the driver assigns them in one place)."""
+
+    event: st.Event
+    duration_total: float  # prior node.duration + this turn's elapsed
+    effective_context: int  # input + cache-read tokens this turn (0 on failure)
+    clone_path: Optional[str]  # resolved session .jsonl, or None to leave unchanged
+
+
+class TurnExecutor:
+    """Runs one `RunTurn` effect end to end and returns a `TurnOutcome`.
+
+    Owns the imperative shell of a turn: timing, the channel call (incl.
+    session-UUID pre-allocation and CALLSTACK_FRAME_KEY stamping), exception ->
+    TurnFailed translation, all three trace writes (collapsed into one helper),
+    clone-path resolution, and envelope parse + upstream-error classification.
+
+    Owns no Node state: the mid-turn session-id propagation is the driver's
+    `on_session_id` callback (it rewrites node.state and notifies observers),
+    and the driver applies the returned TurnOutcome to the Node. This keeps the
+    turn logic unit-testable with a scripted channel + a trivial resolver, with
+    no Driver/Tree involved."""
+
+    def __init__(
+        self,
+        *,
+        channel: Channel,
+        trace: TraceWriter,
+        resolve_session: SessionResolver,
+        seed: Optional[int],
+        cwd: Optional[str],
+        timeout: int,
+    ) -> None:
+        self.channel = channel
+        self.trace = trace
+        self.resolve_session = resolve_session
+        self.seed = seed
+        self.cwd = cwd
+        self.timeout = timeout
+
+    def execute(
+        self,
+        effect: st.RunTurn,
+        *,
+        depth: int,
+        task: str,
+        frame_key: str,
+        prior_duration: float,
+        live_session_id: Callable[[], Optional[str]],
+        on_session_id: Callable[[str], None],
+    ) -> TurnOutcome:
+        t0 = time.time()
+        started_at = _utc_now()
+        # Both "fork" and "fresh" mint a NEW session id (reported by claude's
+        # `system init` mid-stream); "resume" continues an existing one. Only
+        # the former wire the mid-turn on_session_id callback and pre-allocate
+        # the child's session UUID (so `--session-id` pins it and the child's
+        # MCP server reads it back from CALLSTACK_OWN_SESSION).
+        produces_new_session = effect.mode in ("fork", "fresh")
+        preallocated_sid: Optional[str] = str(uuid.uuid4()) if produces_new_session else None
+        try:
+            result = self.channel.run_turn(
+                effect.source_session_id,
+                effect.prompt,
+                mode=effect.mode,
+                cwd=self.cwd,
+                timeout=self.timeout,
+                extra_env=({"CALLSTACK_FRAME_KEY": frame_key} if produces_new_session else None),
+                on_session_id=(on_session_id if produces_new_session else None),
+                preallocated_session_id=preallocated_sid,
+            )
+            # NB: the `--session-id` consistency check lives inside
+            # ClaudeChannel, not here — the executor is channel-agnostic and
+            # ScriptedChannel doesn't simulate that contract.
+        except TurnTimeout as e:
+            duration_total = prior_duration + (time.time() - t0)
+            self._trace(
+                depth, task, live_session_id() or "unknown", e.partial, duration_total, started_at, error=str(e)
+            )
+            return TurnOutcome(st.TurnFailed(error=str(e), partial=e.partial), duration_total, 0, None)
+        except Exception as e:
+            duration_total = prior_duration + (time.time() - t0)
+            self._trace(depth, task, live_session_id() or "unknown", "", duration_total, started_at, error=str(e))
+            return TurnOutcome(st.TurnFailed(error=f"Invocation failed: {e}"), duration_total, 0, None)
+
+        duration_total = prior_duration + (result.duration or (time.time() - t0))
+        # Peak effective context = uncached input + cache reads (both are tokens
+        # the model reasoned from this turn; the split is pricing, not size).
+        effective_context = result.input_tokens + result.cache_read_tokens
+        # Resolve the clone path once the new session lands. For fresh +
+        # cross-project the new session lives in the child's cwd's project dir,
+        # so the locator is given the effective cwd.
+        clone_path: Optional[str] = None
+        if produces_new_session:
+            resolved = self.resolve_session(result.session_id, self.cwd)
+            if resolved is not None:
+                clone_path = str(resolved)
+        self._trace(
+            depth,
+            task,
+            result.session_id,
+            result.text,
+            duration_total,
+            started_at,
+            api_request_id=result.api_request_id,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            cache_read_tokens=result.cache_read_tokens,
+            cache_creation_tokens=result.cache_creation_tokens,
+        )
+        envelope = parse_envelope(result.text)
+        if envelope is None:
+            # No parseable envelope — child crashed mid-thought, was cut off,
+            # or emitted an unknown opcode. See if the text is a recognized
+            # synthetic from Claude Code (e.g. upstream rate-limit) so the
+            # parent gets an actionable typed error instead of a vague one.
+            classified = _classify_upstream_failure(result.text)
+            error = classified if classified is not None else "child emitted no parseable envelope"
+            event: st.Event = st.TurnFailed(error=error, session_id=result.session_id, partial=result.text)
+        else:
+            event = st.TurnCompleted(envelope=envelope, session_id=result.session_id)
+        return TurnOutcome(event, duration_total, effective_context, clone_path)
+
+    def _trace(
+        self,
+        depth: int,
+        task: str,
+        session_id: str,
+        result: Any,
+        duration: float,
+        started_at: str,
+        *,
+        api_request_id: str = "",
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_creation_tokens: int = 0,
+        error: str = "",
+    ) -> None:
+        """The single trace-write site for a turn (timeout / error / success)."""
+        self.trace.write(
+            depth=depth,
+            task=task,
+            session_id=session_id,
+            result=result,
+            duration=duration,
+            api_request_id=api_request_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+            started_at_utc=started_at,
+            ended_at_utc=_utc_now(),
+            seed=self.seed,
+            error=error,
+        )
 
 
 @dataclass
@@ -567,150 +730,42 @@ class Driver:
         raise TypeError(f"unknown effect: {effect!r}")
 
     def _run_turn(self, effect: st.RunTurn, node: Node, depth: int, parent_file: Path) -> st.Event:
-        t0 = time.time()
-        started_at = _utc_now()
-        try:
-            # Stamp this forked subprocess with its node id so a nested
-            # MCP invoke launched from inside it can deterministically
-            # identify its own frame (beats session-id heuristics).
-            # When a forked turn (i.e. first turn for this node) reports its
-            # session_id mid-stream — typically via claude's `system init`
-            # message at the very start — propagate it to the node and fire
-            # _notify so progress observers (LiveReporter / report.yaml) see
-            # the new session id WITHOUT waiting for the full turn to finish.
-            # This matters for long first turns (e.g. /task-c which then
-            # spawns deeper children before returning).
-            # Both "fork" and "fresh" produce a NEW session id (reported by
-            # claude's `system init`). "resume" continues an existing one and
-            # the id is already set on the node.
-            produces_new_session = effect.mode in ("fork", "fresh")
+        # The mid-turn session-id callback is the one Node mutation a turn
+        # performs. node.session_id is derived from node.state, so the single
+        # write is the AwaitingTurn rewrite and the derived property follows it.
+        # This fires when a fork/fresh turn reports its new session id mid-stream
+        # (claude's `system init`), so progress observers (LiveReporter /
+        # report.yaml) see it WITHOUT waiting for the full turn to finish.
+        def _early_session(sid: str) -> None:
+            if node.session_id == sid:
+                return
+            if isinstance(node.state, st.AwaitingTurn) and node.state.session_id != sid:
+                node.state = st.AwaitingTurn(session_id=sid)
+            self._notify()
 
-            # Pre-allocate the child's session UUID for fork/fresh so the
-            # child claude is told (via `--session-id`) exactly which
-            # UUID to use, and its MCP server can read the same value
-            # back from CALLSTACK_OWN_SESSION env. Removes the
-            # SessionLocator mtime-fallback race on concurrent siblings.
-            preallocated_sid: Optional[str] = str(uuid.uuid4()) if produces_new_session else None
-
-            def _early_session(sid: str) -> None:
-                if not produces_new_session:
-                    return
-                if node.session_id == sid:
-                    return
-                # node.session_id is now derived from node.state, so the
-                # single write is the AwaitingTurn rewrite — the derived
-                # property follows it. (Previously this set node.session_id
-                # AND node.state, the desync the property migration removes.)
-                if isinstance(node.state, st.AwaitingTurn) and node.state.session_id != sid:
-                    node.state = st.AwaitingTurn(session_id=sid)
-                self._notify()
-
-            result = self.channel.run_turn(
-                effect.source_session_id,
-                effect.prompt,
-                mode=effect.mode,
-                cwd=self.cwd,
-                timeout=self.timeout,
-                extra_env=({"CALLSTACK_FRAME_KEY": node.id} if produces_new_session else None),
-                on_session_id=_early_session,
-                preallocated_session_id=preallocated_sid,
-            )
-            # NB: the consistency check (claude must honor --session-id)
-            # lives inside ClaudeChannel itself, NOT here. The Driver
-            # is channel-agnostic and ScriptedChannel doesn't simulate
-            # the --session-id contract — enforcing it at the Driver
-            # would break every scripted test that returns a stable
-            # known session id like "child-1". See `_run_one_turn` in
-            # channel.py for the production-only check.
-        except TurnTimeout as e:
-            node.duration += time.time() - t0
-            self.trace.write(
-                depth=depth,
-                task=node.task,
-                session_id=node.session_id or "unknown",
-                result=e.partial,
-                duration=node.duration,
-                api_request_id="",
-                input_tokens=0,
-                output_tokens=0,
-                cache_read_tokens=0,
-                cache_creation_tokens=0,
-                started_at_utc=started_at,
-                ended_at_utc=_utc_now(),
-                seed=self.seed,
-                error=str(e),
-            )
-            return st.TurnFailed(error=str(e), partial=e.partial)
-        except Exception as e:
-            node.duration += time.time() - t0
-            self.trace.write(
-                depth=depth,
-                task=node.task,
-                session_id=node.session_id or "unknown",
-                result="",
-                duration=node.duration,
-                api_request_id="",
-                input_tokens=0,
-                output_tokens=0,
-                cache_read_tokens=0,
-                cache_creation_tokens=0,
-                started_at_utc=started_at,
-                ended_at_utc=_utc_now(),
-                seed=self.seed,
-                error=str(e),
-            )
-            return st.TurnFailed(error=f"Invocation failed: {e}")
-
-        node.duration += result.duration or (time.time() - t0)
-        # Peak effective context = uncached input + cache reads. Both are
-        # tokens the model reasoned from this turn; the split is pricing,
-        # not context size. Fig 2 plots this quantity.
-        effective_context = result.input_tokens + result.cache_read_tokens
-        if effective_context > node.max_context_tokens_seen:
-            node.max_context_tokens_seen = effective_context
-        # Resolve the clone path right after the new session lands (fork or
-        # fresh). For fresh + cross-project, the new session lives in the
-        # child's cwd's project dir — pass the effective cwd so the locator
-        # looks in the right place.
-        if produces_new_session:
-            resolved = self.resolve_session(result.session_id, self.cwd)
-            if resolved is not None:
-                node.clone_path = str(resolved)
-        self.trace.write(
+        executor = TurnExecutor(
+            channel=self.channel,
+            trace=self.trace,
+            resolve_session=self.resolve_session,
+            seed=self.seed,
+            cwd=self.cwd,
+            timeout=self.timeout,
+        )
+        outcome = executor.execute(
+            effect,
             depth=depth,
             task=node.task,
-            session_id=result.session_id,
-            result=result.text,
-            duration=node.duration,
-            api_request_id=result.api_request_id,
-            input_tokens=result.input_tokens,
-            output_tokens=result.output_tokens,
-            cache_read_tokens=result.cache_read_tokens,
-            cache_creation_tokens=result.cache_creation_tokens,
-            started_at_utc=started_at,
-            ended_at_utc=_utc_now(),
-            seed=self.seed,
+            frame_key=node.id,
+            prior_duration=node.duration,
+            live_session_id=lambda: node.session_id,
+            on_session_id=_early_session,
         )
-        envelope = parse_envelope(result.text)
-        if envelope is None:
-            # No parseable envelope — child crashed mid-thought, was cut off,
-            # or emitted an unknown opcode. Before surfacing the generic
-            # failure, see if the text is a recognized synthetic from Claude
-            # Code (e.g. upstream rate-limit) so the parent agent gets an
-            # actionable typed error instead of a vague "no envelope".
-            classified = _classify_upstream_failure(result.text)
-            if classified is not None:
-                return st.TurnFailed(
-                    error=classified,
-                    session_id=result.session_id,
-                    partial=result.text,
-                )
-            return st.TurnFailed(
-                error="child emitted no parseable envelope",
-                session_id=result.session_id,
-                partial=result.text,
-            )
-        return st.TurnCompleted(envelope=envelope, session_id=result.session_id)
+        node.duration = outcome.duration_total
+        if outcome.effective_context > node.max_context_tokens_seen:
+            node.max_context_tokens_seen = outcome.effective_context
+        if outcome.clone_path is not None:
+            node.clone_path = outcome.clone_path
+        return outcome.event
 
     def _spawn_child(self, effect: st.SpawnChild, node: Node, depth: int) -> Optional[st.Event]:
         # SpawnChild is only emitted by the state machine from the AwaitingChild
