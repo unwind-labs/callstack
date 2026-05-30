@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Optional, Sequence
 
@@ -76,11 +77,11 @@ class _LiveReporter:
         self._thread_lock = threading.Lock()
         self._merge_timer: Optional[threading.Timer] = None
         self._latest_ended_at: Optional[str] = None
-        # SHA-256 of the last merged-report payload we actually wrote. Used
-        # to skip the atomic write when the rebuilt document is identical
-        # to what's already on disk (common when notifies arrive during a
-        # quiet period where only `ended_at` would change).
-        self._last_merged_hash: Optional[bytes] = None
+        # The merged-report pipeline (load + build + hash-skip + lock + atomic
+        # write). One engine per reporter so the per-writer content-hash skip
+        # state (which skips the write when only `ended_at` would change) lives
+        # with the writer.
+        self._merge = MergeEngine(ctx)
         self._finalized = False
         self._debounce = _report_debounce_secs()
         # Most recent Tree handed to __call__. Captured so the
@@ -202,35 +203,10 @@ class _LiveReporter:
         write when the document is identical to what we last wrote (and
         ``force`` is False). Must be called with ``self._thread_lock``.
 
-        The skip-hash is computed over the doc WITHOUT ``ended_at`` —
-        ``ended_at`` is recomputed from ``_utc_now_iso()`` on every tick,
-        so including it would perturb the hash on every quiet tick and
-        defeat the skip (PERF-101)."""
-        with _interprocess_lock(self._ctx.lock_path):
-            frames = _load_frames(self._ctx.frames_dir)
-            root_frames = frames.get(_ROOT_FRAME_KEY)
-            if not root_frames:
-                # Nested wrote first and root hasn't written yet — skip;
-                # the root's next progress tick will rewrite the report.
-                return
-            doc = _build_merged_report(
-                invoke_id=self._ctx.invoke_id,
-                frames=frames,
-                root_frame=root_frames[0],
-                ended_at=ended_at,
-            )
-            new_hash = _content_hash_ignoring_ended_at(doc)
-            if not force and new_hash == self._last_merged_hash:
-                return
-            payload = yaml.safe_dump(
-                doc,
-                sort_keys=False,
-                default_flow_style=False,
-                width=120,
-                allow_unicode=True,
-            ).encode("utf-8")
-            _atomic_write_bytes(self._ctx.report_path, payload)
-            self._last_merged_hash = new_hash
+        Delegates to the per-reporter `MergeEngine`, which owns the lock +
+        no-root guard + content-hash skip (the skip-hash excludes ``ended_at``
+        since it changes every tick; PERF-101)."""
+        self._merge.merge_to_disk(ended_at=ended_at, force=force)
 
     def _write_partial_if_no_root(self, tree: Tree, *, ended_at: str) -> None:
         """Write `report.partial.yaml` for a nested invocation when no root
@@ -242,38 +218,9 @@ class _LiveReporter:
         the root reporter never ticked again to merge it. ``report.yaml``
         itself is left to the root reporter — a stale partial would
         otherwise mask a later real merge."""
-        if self._ctx.report_path.is_file():
-            return
-        with _interprocess_lock(self._ctx.lock_path):
-            frames = _load_frames(self._ctx.frames_dir)
-            if frames.get(_ROOT_FRAME_KEY):
-                # A root frame landed between our root-check above and the
-                # lock acquisition — let `_do_merge` handle it on the next
-                # tick (or it already did).
-                return
-            doc = {
-                "invoke_id": self._ctx.invoke_id,
-                "kind": self._kind,
-                "cwd": self._ctx.cwd,
-                "started_at": self._started_at,
-                "ended_at": ended_at,
-                "status": "partial",
-                "partial_reason": (
-                    "root frame not on disk at nested-invocation finalize; "
-                    "the root reporter never ticked again to merge this nested tree"
-                ),
-                "nested_frame_key": self._ctx.frame_key,
-                "tree": tree.to_dict(),
-            }
-            payload = yaml.safe_dump(
-                doc,
-                sort_keys=False,
-                default_flow_style=False,
-                width=120,
-                allow_unicode=True,
-            ).encode("utf-8")
-            partial_path = self._ctx.invocation_dir / "report.partial.yaml"
-            _atomic_write_bytes(partial_path, payload)
+        self._merge.write_partial_if_no_root(
+            tree.to_dict(), ended_at=ended_at, kind=self._kind, started_at=self._started_at
+        )
 
     # ---- shared append-only log ----
 
@@ -480,6 +427,129 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp_name)
         raise
+
+
+# ---------- merged-report pipeline (RFC #2) ----------
+#
+# `MergeEngine` is the single owner of the frames -> merged document ->
+# report.yaml pipeline that `report.py` and `_LiveReporter` used to each
+# re-assemble (load + no-root guard + build + content-hash skip + cross-process
+# lock + atomic write, with serialize params duplicated in three places). It
+# lives in THIS module — not a separate one — deliberately: the lock + atomic
+# write primitives live here, and the merge path must keep calling the
+# reporter-module-global `_atomic_write_bytes` / `_load_frames` /
+# `_content_hash_ignoring_ended_at` names so the white-box PERF tests that
+# monkeypatch `reporter._atomic_write_bytes` still observe the writes. A
+# separate module would both invert that monkeypatch surface and create an
+# import cycle with the lock/atomic-write helpers.
+
+
+@dataclass(frozen=True)
+class MergeResult:
+    """Outcome of one merge attempt. `wrote` distinguishes a real write from a
+    skip; `skipped_reason` names the two legitimate no-write cases so callers
+    (and tests) assert on intent rather than inferring from `path is None`."""
+
+    wrote: bool
+    skipped_reason: Optional[str]  # "no-root-frame" | "hash-unchanged" | None
+    document: Optional[dict]
+    path: Optional[Path]
+
+
+class _MergeFileStore:
+    """The filesystem boundary of the merge pipeline: frame reads, the
+    cross-process merge lock, and atomic doc writes. All funnel through the
+    reporter-module-global helpers so monkeypatch-based tests keep working."""
+
+    def __init__(self, ctx: _InvocationContext):
+        self._ctx = ctx
+
+    def read_frames(self) -> dict:
+        return _load_frames(self._ctx.frames_dir)
+
+    def merge_lock(self):
+        return _interprocess_lock(self._ctx.lock_path)
+
+    def write_doc(self, path: Path, doc: dict) -> None:
+        _atomic_yaml_write(path, doc)
+
+    def report_exists(self) -> bool:
+        return self._ctx.report_path.is_file()
+
+
+class MergeEngine:
+    """Single owner of the frames -> merged document -> report.yaml pipeline.
+
+    One engine per writer: the per-writer content-hash skip state lives on the
+    instance. It is the *only* writer of report.yaml, so the cross-process lock
+    can no longer be bypassed — closing the latent race where `write_report`
+    wrote without the lock."""
+
+    def __init__(self, ctx: _InvocationContext, *, store: Optional[_MergeFileStore] = None):
+        self._ctx = ctx
+        self._store = store or _MergeFileStore(ctx)
+        self._last_written_hash: Optional[bytes] = None
+
+    def build_document(self, *, ended_at: str) -> Optional[dict]:
+        """The merged document from current frames, or None when no root frame
+        has landed yet (a nested writer raced ahead of the root). Pure read —
+        no lock, no write, no hash state touched."""
+        frames = self._store.read_frames()
+        root_frames = frames.get(_ROOT_FRAME_KEY)
+        if not root_frames:
+            return None
+        return _build_merged_report(
+            invoke_id=self._ctx.invoke_id, frames=frames, root_frame=root_frames[0], ended_at=ended_at
+        )
+
+    def merge_to_disk(self, *, ended_at: str, force: bool = False) -> MergeResult:
+        """Under the cross-process merge lock: load + reconcile (via
+        `read_frames`) + no-root guard + build + content-hash skip (unless
+        `force`) + atomic write. Advances the owned hash on a real write."""
+        with self._store.merge_lock():
+            frames = self._store.read_frames()
+            root_frames = frames.get(_ROOT_FRAME_KEY)
+            if not root_frames:
+                # Nested wrote first and root hasn't written yet — skip; the
+                # root's next progress tick will rewrite the report.
+                return MergeResult(False, "no-root-frame", None, None)
+            doc = _build_merged_report(
+                invoke_id=self._ctx.invoke_id, frames=frames, root_frame=root_frames[0], ended_at=ended_at
+            )
+            new_hash = _content_hash_ignoring_ended_at(doc)
+            if not force and new_hash == self._last_written_hash:
+                return MergeResult(False, "hash-unchanged", doc, None)
+            self._store.write_doc(self._ctx.report_path, doc)
+            self._last_written_hash = new_hash
+            return MergeResult(True, None, doc, self._ctx.report_path)
+
+    def write_partial_if_no_root(self, tree_dict: dict, *, ended_at: str, kind: str, started_at: str) -> Optional[Path]:
+        """Nested fallback: when report.yaml is still absent and no root frame
+        exists, write report.partial.yaml so the nested tree is recoverable
+        post-mortem. Re-checks for a root frame under the lock (it may have
+        landed between the outside check and the acquire)."""
+        if self._store.report_exists():
+            return None
+        with self._store.merge_lock():
+            if self._store.read_frames().get(_ROOT_FRAME_KEY):
+                return None
+            doc = {
+                "invoke_id": self._ctx.invoke_id,
+                "kind": kind,
+                "cwd": self._ctx.cwd,
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "status": "partial",
+                "partial_reason": (
+                    "root frame not on disk at nested-invocation finalize; "
+                    "the root reporter never ticked again to merge this nested tree"
+                ),
+                "nested_frame_key": self._ctx.frame_key,
+                "tree": tree_dict,
+            }
+            partial_path = self._ctx.invocation_dir / "report.partial.yaml"
+            self._store.write_doc(partial_path, doc)
+            return partial_path
 
 
 # ---------- abandonment helpers (fix #2 + #3) ----------

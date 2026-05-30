@@ -18,7 +18,6 @@ lookup lives in `session.most_recent_session`.
 from __future__ import annotations
 
 import copy
-import os
 import re
 import threading
 import time
@@ -31,6 +30,7 @@ import yaml
 
 from .driver import Node, Tree
 from .env import read_orphan_ttl_seconds
+from .liveness import SYSTEM_LIVENESS, Liveness, OrphanPolicy
 
 _ROOT_FRAME_KEY = "root"
 
@@ -90,24 +90,12 @@ def _cache_put_dir(path: Path, value: tuple[int, dict]) -> None:
 
 
 def _pid_alive(pid: int) -> bool:
-    """True if signal 0 reaches `pid`. False on ESRCH (process gone) or
-    invalid pid; True on EPERM (process exists but we lack permission).
-
-    Only a liveness probe — does not verify process identity. A reused PID
-    is treated as "alive," which is the safe direction (we'd skip
-    reconciliation rather than falsely mark a live invocation as
-    abandoned)."""
-    if not isinstance(pid, int) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
+    """Back-compat module-level liveness probe, delegating to the shared
+    `liveness` seam (`SYSTEM_LIVENESS`). Kept as a module name so the env-edge
+    `_reconcile_orphan_states` wrapper (via `_ModuleLiveness`) and its tests can
+    route through / monkeypatch it. New code takes an injected `Liveness`
+    instead — see `reconcile_orphans`."""
+    return SYSTEM_LIVENESS.pid_alive(pid)
 
 
 def _frame_age_seconds(frame: dict, *, now: Optional[float] = None) -> Optional[float]:
@@ -135,59 +123,78 @@ def _frame_age_seconds(frame: dict, *, now: Optional[float] = None) -> Optional[
     return wall_now - dt.timestamp()
 
 
-def _frame_writer_is_dead(frame: dict, *, ttl_seconds: float, now: Optional[float] = None) -> bool:
-    """True iff the frame's `writer_pid` is no longer alive OR its
-    wall-clock age exceeds ``ttl_seconds``.
-
-    The TTL fallback is the defense against PID reuse: macOS recycles
-    PIDs within a few thousand spawns, so a writer that died and had its
-    PID reclaimed by an unrelated process would otherwise stay
-    "alive-looking" forever. Setting ``ttl_seconds=0`` opts out of the
-    TTL check entirely (PID liveness alone)."""
+def _writer_is_dead(frame: dict, *, liveness: Liveness, now: float, ttl_seconds: float) -> bool:
+    """True iff the frame's `writer_pid` is no longer alive per `liveness`, OR
+    its wall-clock age exceeds `ttl_seconds` (PID-reuse defense). `now` is read
+    once by the caller so a slow walk sees a stable clock."""
     pid = frame.get("writer_pid")
     if not isinstance(pid, int):
         return False
-    if not _pid_alive(pid):
+    if not liveness.pid_alive(pid):
         return True
     if ttl_seconds <= 0:
         return False
     age = _frame_age_seconds(frame, now=now)
-    if age is None:
-        return False
-    return age > ttl_seconds
+    return age is not None and age > ttl_seconds
 
 
-def _reconcile_orphan_states(frames_by_key: dict[str, list[dict]]) -> None:
-    """Walk every frame; if its `writer_pid` field names a process that is
-    no longer alive (or the frame is older than the orphan TTL, defense
-    against PID reuse), promote any non-terminal node state inside that
-    frame to the synthetic terminal kind ``"abandoned"``.
+def reconcile_orphans(
+    frames_by_key: dict[str, list[dict]],
+    *,
+    liveness: Liveness,
+    policy: OrphanPolicy,
+) -> int:
+    """Walk every frame; if its `writer_pid` names a process that is no longer
+    alive per `liveness` (or the frame is older than `policy.ttl_seconds`,
+    defense against PID reuse), seal any non-terminal node inside that frame to
+    the synthetic terminal kind ``"abandoned"``. Returns the count of nodes
+    sealed.
 
-    Mutates the frame dicts in place. Idempotent — once a frame is
-    reconciled, subsequent passes are no-ops (dead pids stay dead;
-    "abandoned" kinds are already terminal).
-
-    Frames with no `writer_pid` field (older runs, externally-produced
-    frames) are skipped: we can't decide liveness, so we leave the frame
-    alone."""
-    ttl_seconds = read_orphan_ttl_seconds()
-    now = time.time()
+    Pure over the injected `liveness` + `policy`: no `os.kill`, no `time.time`,
+    no env read — unit-testable with a `FakeLiveness` and no monkeypatching.
+    Mutates the frame dicts in place; idempotent (dead pids stay dead,
+    "abandoned" is already terminal). Reads the clock once at the top so a slow
+    walk sees a stable `now`."""
+    now = liveness.now()
+    sealed = 0
     for frames in frames_by_key.values():
         for frame in frames:
-            if not _frame_writer_is_dead(frame, ttl_seconds=ttl_seconds, now=now):
+            if not _writer_is_dead(frame, liveness=liveness, now=now, ttl_seconds=policy.ttl_seconds):
                 continue
             pid = frame.get("writer_pid")
-            assert isinstance(pid, int)  # _frame_writer_is_dead enforces this
             tree = frame.get("tree")
             if not isinstance(tree, dict):
                 continue
             nodes = tree.get("nodes")
             if not isinstance(nodes, list):
                 continue
-            mark_abandoned_in_dict_nodes(
-                nodes,
-                reason=f"writer pid {pid} is no longer alive",
-            )
+            sealed += mark_abandoned_in_dict_nodes(nodes, reason=f"writer pid {pid} is no longer alive")
+    return sealed
+
+
+class _ModuleLiveness:
+    """Back-compat `Liveness` that defers to the module-level `_pid_alive`
+    name (so existing tests monkeypatching `frames._pid_alive` keep working)
+    and the system clock. Used only by `_reconcile_orphan_states`, the
+    env-edge wrapper; new code injects a real `Liveness` directly."""
+
+    def pid_alive(self, pid: int) -> bool:
+        return _pid_alive(pid)
+
+    def now(self) -> float:
+        return time.time()
+
+
+def _reconcile_orphan_states(frames_by_key: dict[str, list[dict]]) -> None:
+    """Env-edge wrapper over `reconcile_orphans`: resolves the orphan TTL from
+    the environment and uses the system liveness probe. The single call site is
+    `_load_frames`, which must reconcile on every load (including dir-mtime
+    cache hits)."""
+    reconcile_orphans(
+        frames_by_key,
+        liveness=_ModuleLiveness(),
+        policy=OrphanPolicy(ttl_seconds=read_orphan_ttl_seconds()),
+    )
 
 
 def mark_abandoned_in_dict_nodes(nodes: list, *, reason: str) -> int:

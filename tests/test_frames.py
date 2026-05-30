@@ -49,21 +49,21 @@ class TestPidAlive:
         def raise_perm(_pid, _sig):
             raise PermissionError()
 
-        monkeypatch.setattr(fr.os, "kill", raise_perm)
+        monkeypatch.setattr(os, "kill", raise_perm)
         assert fr._pid_alive(99999) is True
 
     def test_generic_oserror_means_dead(self, monkeypatch):
         def raise_os(_pid, _sig):
             raise OSError("boom")
 
-        monkeypatch.setattr(fr.os, "kill", raise_os)
+        monkeypatch.setattr(os, "kill", raise_os)
         assert fr._pid_alive(99999) is False
 
     def test_process_lookup_means_dead(self, monkeypatch):
         def raise_lookup(_pid, _sig):
             raise ProcessLookupError()
 
-        monkeypatch.setattr(fr.os, "kill", raise_lookup)
+        monkeypatch.setattr(os, "kill", raise_lookup)
         assert fr._pid_alive(99999) is False
 
 
@@ -95,39 +95,6 @@ class TestFrameAgeSeconds:
         now = dt.datetime(2026, 1, 1, 0, 1, 0, tzinfo=dt.timezone.utc).timestamp()
         age = fr._frame_age_seconds({"started_at": "2026-01-01T00:00:00"}, now=now)
         assert age == pytest.approx(60.0, abs=0.01)
-
-
-# ---------- _frame_writer_is_dead ----------
-
-
-class TestFrameWriterIsDead:
-    def test_no_writer_pid_is_not_dead(self):
-        assert fr._frame_writer_is_dead({}, ttl_seconds=10) is False
-
-    def test_non_int_writer_pid_is_not_dead(self):
-        assert fr._frame_writer_is_dead({"writer_pid": "x"}, ttl_seconds=10) is False
-
-    def test_dead_pid_is_dead(self, monkeypatch):
-        monkeypatch.setattr(fr, "_pid_alive", lambda _pid: False)
-        assert fr._frame_writer_is_dead({"writer_pid": 1234}, ttl_seconds=10) is True
-
-    def test_alive_pid_zero_ttl_opts_out(self, monkeypatch):
-        """ttl_seconds=0 disables the age fallback — liveness alone."""
-        monkeypatch.setattr(fr, "_pid_alive", lambda _pid: True)
-        assert fr._frame_writer_is_dead({"writer_pid": 1234}, ttl_seconds=0) is False
-
-    def test_alive_pid_unknown_age_is_not_dead(self, monkeypatch):
-        monkeypatch.setattr(fr, "_pid_alive", lambda _pid: True)
-        # No started_at → age unknown → not declared dead.
-        assert fr._frame_writer_is_dead({"writer_pid": 1234}, ttl_seconds=10) is False
-
-    def test_alive_pid_past_ttl_is_dead(self, monkeypatch):
-        """PID reuse defense: an alive-looking pid whose frame is older than
-        the TTL is treated as a reclaimed pid → dead."""
-        monkeypatch.setattr(fr, "_pid_alive", lambda _pid: True)
-        now = dt.datetime(2026, 1, 1, 1, 0, 0, tzinfo=dt.timezone.utc).timestamp()
-        frame = {"writer_pid": 1234, "started_at": "2026-01-01T00:00:00Z"}
-        assert fr._frame_writer_is_dead(frame, ttl_seconds=60, now=now) is True
 
 
 # ---------- mark_abandoned_in_dict_nodes ----------
@@ -291,7 +258,7 @@ class TestLoadFrames:
                 raise OSError("file vanished mid-scan")
             return real_stat(path, *args, **kwargs)
 
-        monkeypatch.setattr(fr.os, "stat", flaky_stat)
+        monkeypatch.setattr(os, "stat", flaky_stat)
         out = fr._load_frames(d)
         assert set(out.keys()) == {"root"}
 
@@ -329,7 +296,7 @@ class TestLoadFrames:
             return real_stat(path, *args, **kwargs)
 
         # Path.stat() funnels through os.stat.
-        monkeypatch.setattr(fr.os, "stat", flaky_stat)
+        monkeypatch.setattr(os, "stat", flaky_stat)
         out = fr._load_frames(d)
         assert set(out.keys()) == {"root"}
 

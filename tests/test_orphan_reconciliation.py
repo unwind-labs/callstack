@@ -410,3 +410,106 @@ def test_writer_pid_is_stamped_on_live_frame_writes(tmp_path):
 
     written = yaml.safe_load(report.frame_path().read_text())
     assert written.get("writer_pid") == os.getpid()
+
+
+# ---------- reconcile_orphans: pure, FakeLiveness-driven (no monkeypatching) ----------
+
+
+class FakeLiveness:
+    """In-memory Liveness: a controlled set of live pids and a fixed clock.
+    Lets reconcile_orphans be exercised with no real PIDs and no monkeypatching
+    of frames._pid_alive."""
+
+    def __init__(self, *, alive: set[int], clock: float = 1000.0):
+        self._alive = alive
+        self._clock = clock
+        self.now_calls = 0
+
+    def pid_alive(self, pid: int) -> bool:
+        return pid in self._alive
+
+    def now(self) -> float:
+        self.now_calls += 1
+        return self._clock
+
+
+def _frame(pid: int, *, kind: str = "awaiting_turn", started_at: str | None = None) -> dict:
+    f: dict = {"writer_pid": pid, "tree": {"nodes": [{"id": "n1", "state": {"kind": kind, "session_id": "s1"}}]}}
+    if started_at is not None:
+        f["started_at"] = started_at
+    return f
+
+
+def test_reconcile_orphans_seals_dead_writer():
+    from agent_callstack.frames import reconcile_orphans
+    from agent_callstack.liveness import OrphanPolicy
+
+    frames = {"root": [_frame(4242)]}
+    sealed = reconcile_orphans(frames, liveness=FakeLiveness(alive=set()), policy=OrphanPolicy(ttl_seconds=0))
+    assert sealed == 1
+    assert frames["root"][0]["tree"]["nodes"][0]["state"]["kind"] == "abandoned"
+    assert frames["root"][0]["tree"]["nodes"][0]["state"]["session_id"] == "s1"
+
+
+def test_reconcile_orphans_live_writer_is_noop():
+    from agent_callstack.frames import reconcile_orphans
+    from agent_callstack.liveness import OrphanPolicy
+
+    frames = {"root": [_frame(7)]}
+    sealed = reconcile_orphans(frames, liveness=FakeLiveness(alive={7}), policy=OrphanPolicy(ttl_seconds=0))
+    assert sealed == 0
+    assert frames["root"][0]["tree"]["nodes"][0]["state"]["kind"] == "awaiting_turn"
+
+
+def test_reconcile_orphans_ttl_defeats_pid_reuse():
+    # pid reads ALIVE (reuse), but the frame is ancient -> TTL declares it dead.
+    from agent_callstack.frames import reconcile_orphans
+    from agent_callstack.liveness import OrphanPolicy
+
+    frames = {"root": [_frame(7, started_at="1970-01-01T00:00:00Z")]}
+    live = FakeLiveness(alive={7}, clock=10_000.0)
+    sealed = reconcile_orphans(frames, liveness=live, policy=OrphanPolicy(ttl_seconds=60))
+    assert sealed == 1
+    assert frames["root"][0]["tree"]["nodes"][0]["state"]["kind"] == "abandoned"
+
+
+def test_reconcile_orphans_ttl_zero_keeps_old_live_frame():
+    # ttl_seconds=0 opts out of the TTL fallback: an ancient but pid-alive frame
+    # stays running.
+    from agent_callstack.frames import reconcile_orphans
+    from agent_callstack.liveness import OrphanPolicy
+
+    frames = {"root": [_frame(7, started_at="1970-01-01T00:00:00Z")]}
+    live = FakeLiveness(alive={7}, clock=10_000.0)
+    sealed = reconcile_orphans(frames, liveness=live, policy=OrphanPolicy(ttl_seconds=0))
+    assert sealed == 0
+
+
+def test_reconcile_orphans_reads_clock_once():
+    # A slow walk must see a stable `now`: liveness.now() is called exactly once
+    # regardless of frame count.
+    from agent_callstack.frames import reconcile_orphans
+    from agent_callstack.liveness import OrphanPolicy
+
+    frames = {"root": [_frame(1), _frame(2)], "k": [_frame(3, started_at="1970-01-01T00:00:00Z")]}
+    live = FakeLiveness(alive={1, 2, 3}, clock=10_000.0)
+    reconcile_orphans(frames, liveness=live, policy=OrphanPolicy(ttl_seconds=60))
+    assert live.now_calls == 1
+
+
+def test_reconcile_orphans_frame_without_pid_skipped():
+    from agent_callstack.frames import reconcile_orphans
+    from agent_callstack.liveness import OrphanPolicy
+
+    frames = {"root": [{"tree": {"nodes": [{"id": "n", "state": {"kind": "awaiting_turn"}}]}}]}
+    sealed = reconcile_orphans(frames, liveness=FakeLiveness(alive=set()), policy=OrphanPolicy(ttl_seconds=0))
+    assert sealed == 0
+
+
+def test_os_liveness_probe_matches_reality():
+    from agent_callstack.liveness import OsLiveness
+
+    live = OsLiveness()
+    assert live.pid_alive(os.getpid()) is True
+    assert live.pid_alive(0) is False
+    assert live.pid_alive(-1) is False

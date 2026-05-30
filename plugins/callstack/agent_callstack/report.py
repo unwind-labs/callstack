@@ -29,11 +29,11 @@ from typing import Optional, Sequence
 from .env import read_finalize_wait_seconds
 from .frames import (
     _ROOT_FRAME_KEY,
-    _build_merged_report,
     _load_frames,
 )
 from .invocation_ctx import _InvocationContext, _utc_now_iso
 from .reporter import (
+    MergeEngine,
     _atomic_yaml_write,
     _finalize_own_frames,
     _LiveReporter,
@@ -180,16 +180,7 @@ class InvocationReport:
         `None` when no root frame has landed yet (a nested writer raced ahead
         of the root). Pure read — does not write."""
         ts = _utc_now_iso() if ended_at is None else ended_at
-        frames = self.load_frames()
-        root_frames = frames.get(ROOT_FRAME_KEY)
-        if not root_frames:
-            return None
-        return _build_merged_report(
-            invoke_id=self._ctx.invoke_id,
-            frames=frames,
-            root_frame=root_frames[0],
-            ended_at=ts,
-        )
+        return MergeEngine(self._ctx).build_document(ended_at=ts)
 
     def write_frame(self, frame: dict, *, key: Optional[str] = None) -> Path:
         """Atomically write a raw frame dict to `_frames/{key}.yaml` (defaults
@@ -201,14 +192,13 @@ class InvocationReport:
         return path
 
     def write_report(self, *, ended_at: Optional[str] = None) -> Optional[Path]:
-        """Build the merged document and atomically write it to `report.yaml`.
-        Returns the path, or `None` if there's no root frame to merge yet."""
-        doc = self.merged_document(ended_at=ended_at)
-        if doc is None:
-            return None
-        self._ctx.invocation_dir.mkdir(parents=True, exist_ok=True)
-        _atomic_yaml_write(self._ctx.report_path, doc)
-        return self._ctx.report_path
+        """Build the merged document and atomically write it to `report.yaml`,
+        under the cross-process merge lock (previously this wrote without the
+        lock, racing the live reporter — now fixed by routing through the same
+        `MergeEngine`). Returns the path, or `None` if there's no root frame to
+        merge yet."""
+        ts = _utc_now_iso() if ended_at is None else ended_at
+        return MergeEngine(self._ctx).merge_to_disk(ended_at=ts, force=True).path
 
     # ---- boundary finalize (MCP) ----
 
