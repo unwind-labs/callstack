@@ -60,6 +60,7 @@ from .channel_pool import (  # noqa: F401
     _PooledProcess,
     shutdown_pool,
 )
+from .invocation_ctx import _InvocationContext
 
 
 def _process_log_path(stem: str) -> str:
@@ -74,7 +75,12 @@ def _process_log_path(stem: str) -> str:
     root = _env.root_identity()
     if root is not None:
         invoke_id, root_dir = root
-        proc_dir = Path(root_dir) / invoke_id / "process_logs"
+        # _InvocationContext owns the {log_dir}/{invoke_id} layout; frame_key is
+        # irrelevant to this dir path. The literal "root" avoids importing
+        # frames._ROOT_FRAME_KEY, which would form a
+        # channel -> frames -> driver -> channel import cycle.
+        ctx = _InvocationContext(invoke_id=invoke_id, log_dir=Path(root_dir), cwd="", frame_key="root", is_nested=False)
+        proc_dir = ctx.invocation_dir / "process_logs"
         proc_dir.mkdir(parents=True, exist_ok=True)
         return str(proc_dir / f"callstack_{stem}_{uuid.uuid4().hex[:8]}.log")
     # NamedTemporaryFile(delete=False) creates the file with mode 0600,

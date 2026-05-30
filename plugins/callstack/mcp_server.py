@@ -25,8 +25,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 from agent_callstack import (
-    ENV_ROOT_INVOKE_ID,
-    ENV_ROOT_LOG_DIR,
     BackgroundRuns,
     Caller,
     CallFailed,
@@ -37,13 +35,13 @@ from agent_callstack import (
     MultiResult,
     NotFound,
     Pending,
+    ResolvedIdentity,
     Result,
     SessionLocator,
     Started,
     YieldToken,
+    identity_for_boundary,
     max_fanout,
-    new_invoke_id,
-    root_identity,
     sync_budget_secs,
 )
 from mcp.server.fastmcp import FastMCP
@@ -104,57 +102,24 @@ def _validate_tasks(tasks: Any) -> Optional[str]:
     return None
 
 
-def _log_dir(cwd: str) -> Path:
-    return Path(cwd or os.getcwd()) / ".claude" / "callstack" / "log"
+def _resolve_identity(cwd: str) -> ResolvedIdentity:
+    """Boundary-side single root-vs-nested decision; prints any warning to
+    stderr and returns the result.
 
-
-def _report_path(log_dir: Path, invoke_id: str) -> str:
-    return str(log_dir / invoke_id / "report.yaml")
-
-
-def _resolve_invocation_identity(cwd: str) -> tuple[str, Path]:
-    """Resolve the (invoke_id, log_dir) this MCP call will write to.
-
-    NOT a pure accessor: on stale-env rejection this MUTATES os.environ
-    (pops CALLSTACK_ROOT_*) as a normalization side effect — see DRY-102
-    below. Named `_resolve_*` (like `_resolve_cwd`) to signal that it
-    actively computes-and-normalizes rather than just reads.
-
-    If the process env carries `CALLSTACK_ROOT_*` it means we're running
-    inside an already-live invocation (nested MCP call) — reuse that root's
-    identity so our work merges into its report.yaml rather than spawning
-    a fresh top-level invocation. Otherwise mint a new id.
-
-    Validation: an env-supplied root must point at a real, writable invocation
-    directory. A stale shell that leaked these vars from a prior run would
-    otherwise silently misroute the new top-level call into a nonexistent
-    or unrelated dir. On validation failure we fall through to minting a
-    fresh id and log a warning to stderr."""
-    root = root_identity()
-    if root is not None:
-        root_id, root_dir = root
-        root_dir_path = Path(root_dir)
-        invocation_dir = root_dir_path / root_id
-        # The invocation subdir is created at root start-up by the reporter;
-        # its presence proves these env vars came from a live parent rather
-        # than a stale shell export.
-        if root_dir_path.is_dir() and invocation_dir.is_dir():
-            return root_id, root_dir_path
-        print(
-            f"[callstack] WARN: ignoring inherited "
-            f"{ENV_ROOT_INVOKE_ID}={root_id!r} / "
-            f"{ENV_ROOT_LOG_DIR}={root_dir!r} — invocation dir "
-            f"{invocation_dir!s} does not exist; minting a fresh invoke_id",
-            file=sys.stderr,
-        )
-        # DRY-102: clear the stale env so the downstream Caller's
-        # `_resolve_invocation_context` (which reads env directly)
-        # agrees with our decision. Otherwise Caller would treat the
-        # invocation as nested under the dead root and try to write
-        # frames into a nonexistent dir.
-        os.environ.pop(ENV_ROOT_INVOKE_ID, None)
-        os.environ.pop(ENV_ROOT_LOG_DIR, None)
-    return new_invoke_id(), _log_dir(cwd)
+    Replaces the old `_resolve_invocation_identity` + its `os.environ.pop`
+    (DRY-102). The stale-env validation (an inherited `CALLSTACK_ROOT_*` must
+    point at a real invocation dir) now lives INSIDE the one `resolve_identity`,
+    so the downstream Caller re-derives the SAME decision deterministically —
+    there is no second reader of `os.environ` to keep in sync, hence no mutation.
+    The boundary reads `ctx.invoke_id` / `ctx.log_dir` / `ctx.report_path` off
+    the result and threads `ctx.invoke_id` into the Caller (via `_build_caller`)
+    so the run reuses this exact identity. Stale-env rejection and
+    explicit-id-ignored-when-nested ride back as `warning` data, printed here at
+    the edge rather than from the core."""
+    ident = identity_for_boundary(cwd)
+    if ident.warning:
+        print(f"[callstack] WARN: {ident.warning}", file=sys.stderr)
+    return ident
 
 
 def _build_caller(session: str, model: str, cwd: str, timeout: int, invoke_id: str, log_dir: Path) -> Caller:
@@ -378,9 +343,11 @@ async def call(
             indent=2,
         )
 
-    invoke_id, log_dir = _resolve_invocation_identity(resolved_cwd)
+    ident = _resolve_identity(resolved_cwd)
+    ctx = ident.context
+    invoke_id, log_dir = ctx.invoke_id, ctx.log_dir
     caller = _build_caller(session_id, model, resolved_cwd, timeout, invoke_id, log_dir)
-    report_path = _report_path(log_dir, invoke_id)
+    report_path = str(ctx.report_path)
 
     if run_in_background:
         # `BackgroundRuns.start` reaps finished-unreconciled runs, enforces the
@@ -585,7 +552,9 @@ async def resume(resume_session: str, user_reply: str, timeout: int = 300, cwd: 
                 "error": cwd_err,
             }
         )
-    invoke_id, log_dir = _resolve_invocation_identity(resolved_cwd)
+    ident = _resolve_identity(resolved_cwd)
+    ctx = ident.context
+    invoke_id, log_dir = ctx.invoke_id, ctx.log_dir
     caller = _build_caller("", "", resolved_cwd, timeout, invoke_id, log_dir)
     # Locate the clone path so we can construct a YieldToken. Pass None when
     # the caller gave no explicit cwd: SessionLocator.resolve only does the
@@ -594,7 +563,7 @@ async def resume(resume_session: str, user_reply: str, timeout: int = 300, cwd: 
     # cwd stays caller-scoped, now canonicalized to match call()'s contract.
     locate_cwd = resolved_cwd if cwd else None
     clone = SessionLocator().resolve(resume_session, cwd=locate_cwd)
-    envelope = {"invoke_id": invoke_id, "report_path": _report_path(log_dir, invoke_id)}
+    envelope = {"invoke_id": invoke_id, "report_path": str(ctx.report_path)}
     if clone is None:
         envelope.update({"status": "error", "error": f"Cannot find session file for {resume_session}"})
         return json.dumps(envelope)

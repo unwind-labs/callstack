@@ -11,6 +11,8 @@ same factory through the preserved `Caller._driver_for` seam.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from agent_callstack import session
 from agent_callstack.env import (
@@ -21,7 +23,7 @@ from agent_callstack.env import (
     ENV_ROOT_INVOKE_ID,
     ENV_ROOT_LOG_DIR,
 )
-from agent_callstack.invocation import InvocationFactory
+from agent_callstack.invocation import IdentityInputs, InvocationFactory, resolve_identity
 
 # Every CALLSTACK_*/CLAUDE_* var the factory consults. The test process may be
 # launched from inside a live callstack invocation (a /call fork), which would
@@ -89,6 +91,10 @@ class TestNestedContext:
         monkeypatch.setenv(ENV_ROOT_INVOKE_ID, "root-iv")
         monkeypatch.setenv(ENV_ROOT_LOG_DIR, str(root_log))
         monkeypatch.setenv(ENV_FRAME_KEY, "node-7")
+        # A *live* root has created its invocation dir; the resolver now
+        # validates that dir exists (the stale-env check moved out of the MCP
+        # boundary into the single decision), so a nested result requires it.
+        (root_log / "root-iv").mkdir(parents=True)
 
         ctx = _factory(explicit_cwd=str(tmp_path)).context(parent_cwd=str(tmp_path))
 
@@ -103,6 +109,7 @@ class TestNestedContext:
         # per-Caller invoke_id — the inherited root identity wins.
         monkeypatch.setenv(ENV_ROOT_INVOKE_ID, "root-iv")
         monkeypatch.setenv(ENV_ROOT_LOG_DIR, str(tmp_path / "rl"))
+        (tmp_path / "rl" / "root-iv").mkdir(parents=True)
         ctx = _factory(explicit_invoke_id="should-be-ignored").context(parent_cwd=str(tmp_path))
         assert ctx.invoke_id == "root-iv"
 
@@ -117,6 +124,7 @@ class TestNestedContext:
     def test_each_nested_call_gets_a_distinct_instance_id(self, tmp_path, monkeypatch):
         monkeypatch.setenv(ENV_ROOT_INVOKE_ID, "root-iv")
         monkeypatch.setenv(ENV_ROOT_LOG_DIR, str(tmp_path / "rl"))
+        (tmp_path / "rl" / "root-iv").mkdir(parents=True)
         f = _factory(explicit_cwd=str(tmp_path))
         a = f.context(parent_cwd=str(tmp_path))
         b = f.context(parent_cwd=str(tmp_path))
@@ -131,6 +139,8 @@ class TestFrameKeyFallback:
     def _nested(self, monkeypatch, tmp_path):
         monkeypatch.setenv(ENV_ROOT_INVOKE_ID, "root-iv")
         monkeypatch.setenv(ENV_ROOT_LOG_DIR, str(tmp_path / "rl"))
+        # Resolver validates the live root's invocation dir exists.
+        (tmp_path / "rl" / "root-iv").mkdir(parents=True)
 
     def test_prefers_claude_session_when_no_frame_key(self, tmp_path, monkeypatch):
         self._nested(monkeypatch, tmp_path)
@@ -183,20 +193,6 @@ class TestParentProjectCwd:
         assert _factory().parent_project_cwd() == str(tmp_path)
 
 
-# ---------- effective_log_dir ----------
-
-
-class TestEffectiveLogDir:
-    def test_default_layout(self, tmp_path):
-        f = _factory()
-        assert f.effective_log_dir(str(tmp_path)) == (tmp_path / ".claude" / "callstack" / "log")
-
-    def test_explicit_overrides_layout(self, tmp_path):
-        log = tmp_path / "elsewhere"
-        f = _factory(explicit_log_dir=log)
-        assert f.effective_log_dir(str(tmp_path)) == log
-
-
 # ---------- child_env(): propagation to spawned children ----------
 
 
@@ -225,3 +221,120 @@ class TestChildEnv:
 
     def test_depth_base_zero_yields_depth_one(self, tmp_path):
         assert self._factory_env(tmp_path)[ENV_DEPTH] == "1"
+
+
+# ---------- resolve_identity(): the pure decision ----------
+
+
+def _inputs(**overrides) -> IdentityInputs:
+    """An IdentityInputs snapshot with sensible defaults — overridden per test.
+    No env, no cwd, no real dirs: the snapshot IS the input."""
+    base = dict(
+        explicit_cwd="/proj",
+        explicit_log_dir=None,
+        explicit_invoke_id=None,
+        parent_cwd=None,
+        root=None,
+        frame_key=None,
+        claude_code_session=None,
+        process_cwd="/proc",
+        process_pid=4242,
+    )
+    base.update(overrides)
+    return IdentityInputs(**base)
+
+
+class TestResolveIdentity:
+    """The single root-vs-nested decision as a pure function: env/cwd/pid are the
+    injected `IdentityInputs` snapshot and the filesystem is the injected
+    `dir_exists` — no setenv, no chdir, no real directories."""
+
+    def test_no_root_env_is_fresh_root(self):
+        r = resolve_identity(_inputs(root=None), dir_exists=lambda p: False)
+        assert r.context.is_nested is False
+        assert r.context.frame_key == "root"
+        assert r.warning is None
+
+    def test_nested_under_live_root(self):
+        r = resolve_identity(_inputs(root=("root-iv", "/log"), frame_key="node-7"), dir_exists=lambda p: True)
+        assert r.context.is_nested is True
+        assert r.context.invoke_id == "root-iv"
+        assert r.context.log_dir == Path("/log")
+        assert r.context.frame_key == "node-7"
+        assert r.context.instance_id != ""
+        assert r.warning is None
+
+    def test_stale_root_falls_through_to_fresh_with_warning(self):
+        r = resolve_identity(_inputs(root=("stale-iv", "/gone")), dir_exists=lambda p: False)
+        assert r.context.is_nested is False
+        assert r.context.invoke_id != "stale-iv"
+        assert r.warning is not None and "ignoring inherited" in r.warning.lower()
+
+    def test_explicit_invoke_id_ignored_when_nested_is_surfaced(self):
+        r = resolve_identity(
+            _inputs(root=("root-iv", "/log"), explicit_invoke_id="mine", frame_key="k"),
+            dir_exists=lambda p: True,
+        )
+        assert r.context.invoke_id == "root-iv"  # inherited identity wins
+        assert r.warning is not None and "ignored" in r.warning.lower()
+
+    def test_explicit_id_equal_to_root_is_not_warned(self):
+        # The boundary threads the resolved root id back in as explicit; that's
+        # agreement, not an override, so no spurious warning.
+        r = resolve_identity(
+            _inputs(root=("root-iv", "/log"), explicit_invoke_id="root-iv", frame_key="k"),
+            dir_exists=lambda p: True,
+        )
+        assert r.warning is None
+
+    def test_fresh_root_honors_explicit_id(self):
+        r = resolve_identity(_inputs(root=None, explicit_invoke_id="mine"), dir_exists=lambda p: False)
+        assert r.context.invoke_id == "mine"
+        assert r.context.is_nested is False
+
+    def test_frame_key_prefers_claude_session(self):
+        r = resolve_identity(
+            _inputs(root=("r", "/l"), claude_code_session="claude-sid"),
+            dir_exists=lambda p: True,
+        )
+        assert r.context.frame_key == "claude-sid"
+
+    def test_frame_key_falls_back_to_most_recent_session(self):
+        r = resolve_identity(
+            _inputs(root=("r", "/l")),
+            dir_exists=lambda p: True,
+            most_recent_session=lambda cwd: "mru-sid",
+        )
+        assert r.context.frame_key == "mru-sid"
+
+    def test_frame_key_falls_back_to_pid(self):
+        r = resolve_identity(
+            _inputs(root=("r", "/l"), process_pid=999),
+            dir_exists=lambda p: True,
+            most_recent_session=lambda cwd: None,
+        )
+        assert r.context.frame_key == "pid-999"
+
+    def test_effective_cwd_precedence(self):
+        # explicit > parent > process
+        assert (
+            resolve_identity(
+                _inputs(explicit_cwd="/explicit", parent_cwd="/parent", process_cwd="/proc"),
+                dir_exists=lambda p: False,
+            ).context.cwd
+            == "/explicit"
+        )
+        assert (
+            resolve_identity(
+                _inputs(explicit_cwd=None, parent_cwd="/parent", process_cwd="/proc"),
+                dir_exists=lambda p: False,
+            ).context.cwd
+            == "/parent"
+        )
+        assert (
+            resolve_identity(
+                _inputs(explicit_cwd=None, parent_cwd=None, process_cwd="/proc"),
+                dir_exists=lambda p: False,
+            ).context.cwd
+            == "/proc"
+        )

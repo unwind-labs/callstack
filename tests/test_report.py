@@ -493,6 +493,9 @@ def test_nested_detection_uses_mtime_fallback(tmp_path, monkeypatch):
     monkeypatch.setattr("agent_callstack.PROJECTS_DIR", projects)
     monkeypatch.setenv(ENV_ROOT_INVOKE_ID, "inv-nest-fallback")
     monkeypatch.setenv(ENV_ROOT_LOG_DIR, str(tmp_path / "log"))
+    # The resolver now validates the live root's invocation dir exists (stale-env
+    # check moved into the single decision); create it so this is genuinely nested.
+    (tmp_path / "log" / "inv-nest-fallback").mkdir(parents=True)
     monkeypatch.delenv(ENV_CLAUDE_SESSION, raising=False)
     # If we're running under a callstack-forked test process, our own
     # CALLSTACK_FRAME_KEY would otherwise short-circuit the mtime fallback

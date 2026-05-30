@@ -598,11 +598,16 @@ def _finalize_own_frames(log_dir: Path, invoke_id: str, *, reason: str) -> bool:
 
     Returns True iff at least one frame was rewritten. Safe to call
     when the invocation directory does not yet exist (no-op)."""
-    invocation_dir = Path(log_dir) / invoke_id
-    frames_dir = invocation_dir / "_frames"
+    # Route the {log_dir}/{invoke_id}/... layout through _InvocationContext so
+    # the path grammar lives in exactly one place (frame_key/is_nested are
+    # irrelevant to the dir/lock paths this function needs).
+    ctx = _InvocationContext(
+        invoke_id=invoke_id, log_dir=Path(log_dir), cwd="", frame_key=_ROOT_FRAME_KEY, is_nested=False
+    )
+    frames_dir = ctx.frames_dir
     if not frames_dir.is_dir():
         return False
-    lock_path = invocation_dir / ".report.lock"
+    lock_path = ctx.lock_path
     own_pid = os.getpid()
     rewrote_any = False
     with _interprocess_lock(lock_path):

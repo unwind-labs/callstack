@@ -259,7 +259,7 @@ class TestFix4ReportWarning:
         assert "does not exist" in envelope["report_warning"]
 
 
-# ---------- Fix #5 — _resolve_invocation_identity validates inherited env ----------
+# ---------- Fix #5 — the single identity decision validates inherited env ----------
 
 
 class TestFix5EnvValidation:
@@ -267,18 +267,20 @@ class TestFix5EnvValidation:
         import mcp_server  # type: ignore
 
         # Plant env vars that look like an active root, but pointing at a
-        # nonexistent directory. The identity helper must reject them.
+        # nonexistent directory. The single decision must reject them.
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("CALLSTACK_ROOT_INVOKE_ID", "20300101T000000-deadbeef")
         monkeypatch.setenv("CALLSTACK_ROOT_LOG_DIR", str(tmp_path / "no-such-dir"))
 
-        invoke_id, log_dir = mcp_server._resolve_invocation_identity(str(tmp_path))
+        ident = mcp_server._resolve_identity(str(tmp_path))
 
-        # We must have minted a fresh id, NOT reused the stale one.
-        assert invoke_id != "20300101T000000-deadbeef"
-        assert "no-such-dir" not in str(log_dir)
+        # A fresh top-level id was minted, NOT the stale one reused.
+        assert ident.context.invoke_id != "20300101T000000-deadbeef"
+        assert "no-such-dir" not in str(ident.context.log_dir)
+        assert ident.context.is_nested is False
 
-        # And the warning must be visible on stderr.
+        # The rejection rides back as `warning` data and is printed at the edge.
+        assert ident.warning is not None and "ignoring inherited" in ident.warning.lower()
         captured = capsys.readouterr()
         assert "ignoring inherited" in captured.err.lower()
 
@@ -292,28 +294,45 @@ class TestFix5EnvValidation:
         monkeypatch.setenv("CALLSTACK_ROOT_INVOKE_ID", live_invoke_id)
         monkeypatch.setenv("CALLSTACK_ROOT_LOG_DIR", str(live_root))
 
-        invoke_id, log_dir = mcp_server._resolve_invocation_identity(str(tmp_path))
+        ident = mcp_server._resolve_identity(str(tmp_path))
 
-        assert invoke_id == live_invoke_id
-        assert log_dir == live_root
+        assert ident.context.invoke_id == live_invoke_id
+        assert ident.context.log_dir == live_root
+        assert ident.context.is_nested is True
 
-    def test_stale_env_is_cleared_so_caller_agrees(self, tmp_path, monkeypatch):
-        """DRY-102: when _resolve_invocation_identity rejects stale env and mints a
-        fresh id, it must also clear the stale env vars. Otherwise the
-        downstream `Caller._resolve_invocation_context` (which reads env
-        directly) would still treat the invocation as nested under the
-        dead root and try to write frames into a nonexistent dir."""
+    def test_stale_env_is_not_mutated_yet_run_still_agrees(self, tmp_path, monkeypatch):
+        """DRY-102 REMOVED: the boundary no longer pops CALLSTACK_ROOT_* to keep
+        the downstream Caller in sync. Instead the dir-exists validation lives in
+        the single `resolve_identity`, so the run re-derives the SAME decision
+        deterministically. This pins both halves: (a) the env is left untouched,
+        and (b) the Caller's factory — reading the still-present stale env —
+        independently resolves to a fresh root (not nested under the dead root),
+        reusing the boundary's minted id."""
         import mcp_server  # type: ignore
+        from agent_callstack.invocation import InvocationFactory
 
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("CALLSTACK_ROOT_INVOKE_ID", "stale-id")
         monkeypatch.setenv("CALLSTACK_ROOT_LOG_DIR", str(tmp_path / "gone"))
 
-        mcp_server._resolve_invocation_identity(str(tmp_path))
+        ident = mcp_server._resolve_identity(str(tmp_path))
 
-        # After rejection, the env must be cleared so Caller agrees.
-        assert "CALLSTACK_ROOT_INVOKE_ID" not in os.environ
-        assert "CALLSTACK_ROOT_LOG_DIR" not in os.environ
+        # (a) Env is NOT mutated (no os.environ.pop).
+        assert os.environ["CALLSTACK_ROOT_INVOKE_ID"] == "stale-id"
+        assert os.environ["CALLSTACK_ROOT_LOG_DIR"] == str(tmp_path / "gone")
+
+        # (b) The run's factory, reading the same stale env, still agrees: it
+        # validates the (nonexistent) invocation dir and falls through to a
+        # fresh root, reusing the boundary's minted id (threaded as explicit).
+        factory = InvocationFactory(
+            explicit_cwd=str(tmp_path),
+            explicit_log_dir=None,
+            explicit_invoke_id=ident.context.invoke_id,
+            max_depth=10,
+        )
+        run_ctx = factory.context(parent_cwd=str(tmp_path))
+        assert run_ctx.is_nested is False
+        assert run_ctx.invoke_id == ident.context.invoke_id
 
 
 # ---------- Fix #7 — partial report when nested has no root ----------

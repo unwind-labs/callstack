@@ -39,7 +39,7 @@ from .frames import (
     _frames_cache_clear,
     _load_frames,
 )
-from .invocation import InvocationFactory
+from .invocation import InvocationFactory, ResolvedIdentity, identity_for_boundary
 from .invocation_ctx import _InvocationContext, _new_invoke_id, _utc_now_iso
 from .report import ROOT_FRAME_KEY, InvocationReport
 from .reporter import (
@@ -96,6 +96,9 @@ __all__ = [
     "max_background",
     "sync_budget_secs",
     "root_identity",
+    # Single root-vs-nested identity decision (RFC #4).
+    "ResolvedIdentity",
+    "identity_for_boundary",
 ]
 
 
