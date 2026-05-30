@@ -271,7 +271,7 @@ def step(state: State, event: Event) -> tuple[State, list[Effect]]:
         case (Pending(parent_session_id=psid, task=task, task_id=tid, context_mode=cmode), Start()):
             return (
                 AwaitingTurn(session_id=None),
-                [RunTurn(source_session_id=psid, prompt=starting_prompt(task, tid), mode=cmode)],
+                [RunTurn(source_session_id=psid, prompt=starting_prompt(task, tid, cmode), mode=cmode)],
             )
 
         # ---- AwaitingTurn: an envelope arrived ----

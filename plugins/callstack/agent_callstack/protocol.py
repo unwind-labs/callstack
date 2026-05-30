@@ -16,15 +16,32 @@ import re
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 
-SYSTEM_INSTRUCTION = """\
-You are running in a forked session — a child process that inherited the full \
-context of your parent agent. When finished with the task, end your turn by \
+# The envelope grammar is identical for every child; only the opening
+# sentence — how the child came to exist — differs by context mode.
+_ENVELOPE_PROTOCOL = """\
+When finished with the task, end your turn by \
 emitting EXACTLY ONE JSON envelope wrapped in a fenced ```json code block.
 
 - {"op": "call", "task": "<what to accomplish>"}
 - {"op": "yield", "question": "<question for user>"}
 - {"op": "return", "result": ..., "summary": "...", "next": "..."}
 """
+
+# context_mode="fork": child inherited the parent transcript via --fork-session.
+FORK_SYSTEM_INSTRUCTION = (
+    "You are running in a forked session — a child process that inherited the "
+    "full context of your parent agent. " + _ENVELOPE_PROTOCOL
+)
+
+# context_mode="fresh": brand-new session, no inherited context.
+FRESH_SYSTEM_INSTRUCTION = (
+    "You are running in a fresh session — a child process spawned by a parent "
+    "agent to handle one task in isolation, with no inherited context. "
+    + _ENVELOPE_PROTOCOL
+)
+
+# Backward-compatible alias: the original single instruction was the fork variant.
+SYSTEM_INSTRUCTION = FORK_SYSTEM_INSTRUCTION
 
 
 # ---------- Envelope value types ----------
@@ -143,9 +160,10 @@ def parse_envelope(output: str) -> Optional[Envelope]:
 # ---------- Prompt construction ----------
 
 
-def starting_prompt(task: str, task_id: Optional[str] = None) -> str:
+def starting_prompt(task: str, task_id: Optional[str] = None, context_mode: str = "fork") -> str:
     tag = f" [{task_id}]" if task_id else ""
-    return f"## Starting Task{tag}\n\n" + SYSTEM_INSTRUCTION + f"\nTask: {task}"
+    instruction = FRESH_SYSTEM_INSTRUCTION if context_mode == "fresh" else FORK_SYSTEM_INSTRUCTION
+    return f"## Starting Task{tag}\n\n" + instruction + f"\nTask: {task}"
 
 
 def child_returned_prompt(child_result: Any) -> str:

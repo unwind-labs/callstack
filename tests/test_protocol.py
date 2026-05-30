@@ -123,6 +123,24 @@ class TestPromptHelpers:
         assert "## Starting Task [abc12345]" in p
         assert p.endswith("Task: do X")
 
+    def test_fork_prompt_says_forked_not_fresh(self):
+        p = starting_prompt("do X", context_mode="fork")
+        assert "forked session" in p
+        assert "fresh session" not in p
+
+    def test_fresh_prompt_says_fresh_not_forked(self):
+        # A fresh child has no inherited context — telling it that it
+        # "inherited the full context of your parent agent" is a lie that
+        # invites it to reference context it cannot see.
+        p = starting_prompt("do X", context_mode="fresh")
+        assert "fresh session" in p
+        assert "no inherited context" in p
+        assert "forked session" not in p
+        assert "inherited the full" not in p
+
+    def test_starting_prompt_default_mode_is_fork(self):
+        assert starting_prompt("x") == starting_prompt("x", context_mode="fork")
+
     def test_starting_prompt_no_task_id(self):
         p = starting_prompt("just do it")
         assert "## Starting Task\n\n" in p
