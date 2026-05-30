@@ -713,7 +713,6 @@ class TestTimeoutState:
             id="abc123ef0000000000000000000000aa",
             task="t",
             state=st.Timeout(error="elapsed", session_id="sess-x"),
-            session_id="sess-x",
         )
         d = node.to_dict()
         round = Node.from_dict(d)

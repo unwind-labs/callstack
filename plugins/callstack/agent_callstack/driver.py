@@ -110,13 +110,35 @@ class Node:
     # the parent node's session via fork semantics, so they're always "fork".
     call_type: str = "fork"
 
-    # ---- denormalized for serialization / public API ----
-    session_id: Optional[str] = None
+    # clone_path is a genuine on-disk fact (the resolved session JSONL), not
+    # derivable from `state` — so it stays a real field.
     clone_path: Optional[str] = None
-    result: Any = None
-    summary: Optional[str] = None
-    suggested_next: Optional[str] = None
-    error: Optional[str] = None
+
+    # ---- read-through views over `state` (single source of truth) ----
+    # These were previously denormalized flat fields kept in sync by
+    # `_denormalize`. Deriving them from `state` removes the second source of
+    # truth (and the desync the old `_early_session` callback could cause):
+    # `step()` is the only writer of `state`, so these can never drift.
+    @property
+    def session_id(self) -> Optional[str]:
+        return getattr(self.state, "session_id", None)
+
+    @property
+    def result(self) -> Any:
+        return self.state.result if isinstance(self.state, st.Done) else None
+
+    @property
+    def summary(self) -> Optional[str]:
+        return self.state.summary if isinstance(self.state, st.Done) else None
+
+    @property
+    def suggested_next(self) -> Optional[str]:
+        return self.state.suggested_next if isinstance(self.state, st.Done) else None
+
+    @property
+    def error(self) -> Optional[str]:
+        # Failed / Timeout / Abandoned all carry `error`.
+        return getattr(self.state, "error", None)
 
     @property
     def status(self) -> str:
@@ -164,12 +186,12 @@ class Node:
             duration=d.get("duration", 0.0),
             max_context_tokens_seen=d.get("max_context_tokens_seen", 0),
             call_type=d.get("call_type", "fork"),
-            session_id=d.get("session_id"),
+            # session_id/result/summary/suggested_next/error are now derived
+            # from `state` (see the read-through properties above); the dict
+            # still carries them for human/UI consumers, but we reconstruct
+            # them from `state` on load — making the serialized flat fields
+            # advisory, not authoritative.
             clone_path=d.get("clone_path"),
-            result=d.get("result"),
-            summary=d.get("summary"),
-            suggested_next=d.get("suggested_next"),
-            error=d.get("error"),
             children=[cls.from_dict(c) for c in d.get("children", [])],
         )
 
@@ -308,7 +330,6 @@ class Driver:
         if base_depth + 1 > self.max_depth:
             for n in nodes:
                 n.state = st.Failed(error=f"Max call depth ({self.max_depth}) exceeded")
-                n.error = n.state.error
             self._notify()
             return tree
 
@@ -336,7 +357,6 @@ class Driver:
                 # overwriting non-terminal states.
                 if not st.is_terminal(n.state):
                     n.state = st.Failed(error=err_msg)
-                    n.error = err_msg
                 if not self._sibling_exception_logged:
                     import sys as _sys
                     import traceback as _tb
@@ -525,7 +545,6 @@ class Driver:
         while event is not None:
             new_state, effects = st.step(node.state, event)
             node.state = new_state
-            _denormalize(node)
             self._notify()
 
             if st.is_terminal(new_state) or st.is_suspended(new_state):
@@ -578,7 +597,10 @@ class Driver:
                     return
                 if node.session_id == sid:
                     return
-                node.session_id = sid
+                # node.session_id is now derived from node.state, so the
+                # single write is the AwaitingTurn rewrite — the derived
+                # property follows it. (Previously this set node.session_id
+                # AND node.state, the desync the property migration removes.)
                 if isinstance(node.state, st.AwaitingTurn) and node.state.session_id != sid:
                     node.state = st.AwaitingTurn(session_id=sid)
                 self._notify()
@@ -792,28 +814,6 @@ def _state_from_dict(d: dict) -> st.State:
 def _status_label(s: st.State) -> str:
     """Back-compat one-liner. Canonical mapping lives in state.status_label."""
     return st.status_label(s)
-
-
-def _denormalize(node: Node) -> None:
-    """Mirror the state's session id/result/error onto the Node's flat fields."""
-    s = node.state
-    if isinstance(s, st.AwaitingTurn) and s.session_id:
-        node.session_id = s.session_id
-    elif isinstance(s, (st.AwaitingChild, st.AwaitingUser)):
-        node.session_id = s.session_id
-    elif isinstance(s, st.Done):
-        if s.session_id:
-            node.session_id = s.session_id
-        node.result = s.result
-        node.summary = s.summary
-        node.suggested_next = s.suggested_next
-    elif isinstance(s, (st.Failed, st.Timeout, st.Abandoned)):
-        # All three carry `error` + optional `session_id` and denormalize
-        # identically; they differ only in how they were produced (LLM
-        # error / wait-budget expiry / external seal).
-        if s.session_id:
-            node.session_id = s.session_id
-        node.error = s.error
 
 
 def _find(root: Node, session_id: str) -> Optional[Node]:

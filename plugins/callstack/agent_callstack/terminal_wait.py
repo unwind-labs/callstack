@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import state as st
-from .driver import Node, Tree, _denormalize
+from .driver import Node, Tree
 from .protocol import Return, Yield
 from .session import envelope_from_session_record, session_record_epoch
 
@@ -143,7 +143,6 @@ class _NodeWaiter:
             error="wait-for-terminal-envelope budget elapsed",
             session_id=sid,
         )
-        _denormalize(self.node)
 
     # ---- envelope reading ----
 
@@ -205,5 +204,4 @@ class _NodeWaiter:
         # 0.2s into the wait must record ~200s, not 0.2s.
         if isinstance(new_state, st.Done) and self._session_start_epoch is not None and end_epoch is not None:
             node.duration = max(0.0, end_epoch - self._session_start_epoch)
-        _denormalize(node)
         return True

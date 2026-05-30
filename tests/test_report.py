@@ -40,9 +40,6 @@ def _done_node(
         id=nid,
         task=task,
         state=st.Done(session_id=sid, result=result, summary=summary),
-        session_id=sid,
-        result=result,
-        summary=summary,
         duration=duration,
         children=list(children or []),
     )
@@ -163,7 +160,6 @@ def test_report_overall_status_reflects_leaves(tmp_path):
         id="ff000000",
         task="b",
         state=st.Failed(error="nope"),
-        error="nope",
     )
     tree = Tree(root_session=parent, nodes=[ok, failed], base_depth=0)
 

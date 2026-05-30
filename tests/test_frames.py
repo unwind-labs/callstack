@@ -481,13 +481,13 @@ class TestFormatLogLine:
         return Node(id="a" * 32, task="t", state=kw.pop("state", st.Done(result="r")), **kw)
 
     def test_complete_shows_result(self):
-        n = self._node(state=st.Done(result="the answer"), result="the answer")
+        n = self._node(state=st.Done(result="the answer"))
         line = fr._format_log_line("12:00", n, 1, chain=[])
         assert 'result="the answer"' in line
 
     def test_error_shows_error(self):
         """The error branch (line 484) renders the error detail."""
-        n = self._node(state=st.Failed(error="it broke"), error="it broke")
+        n = self._node(state=st.Failed(error="it broke"))
         line = fr._format_log_line("12:00", n, 1, chain=[])
         assert 'error="it broke"' in line
 

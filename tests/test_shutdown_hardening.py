@@ -64,7 +64,6 @@ def _running_node(nid: str, task: str = "t", *, session_id: str | None = None) -
         id=nid,
         task=task,
         state=st.AwaitingTurn(session_id=sid),
-        session_id=sid,
     )
 
 
@@ -176,8 +175,6 @@ class TestAbandonTreeInPlace:
             id="dddddddd",
             task="t",
             state=st.Done(session_id="s", result="kept"),
-            session_id="s",
-            result="kept",
         )
         tree = Tree(root_session=parent, nodes=[done], base_depth=0)
 
@@ -196,7 +193,6 @@ class TestAbandonTreeInPlace:
             id="yyyyyyyy",
             task="t",
             state=st.AwaitingUser(session_id="s", question="who?"),
-            session_id="s",
         )
         tree = Tree(root_session=parent, nodes=[yielded], base_depth=0)
 
@@ -372,8 +368,6 @@ class TestFinalizeOwnFrames:
             id="ffff4444",
             task="t",
             state=st.Done(session_id="s", result="ok"),
-            session_id="s",
-            result="ok",
         )
         tree = Tree(root_session=parent, nodes=[done], base_depth=0)
         _write_frame_with(
@@ -520,8 +514,6 @@ class TestActiveReporterRegistry:
             id="ddddeeee",
             task="t",
             state=st.Done(session_id="s", result="ok"),
-            session_id="s",
-            result="ok",
         )
         tree = Tree(root_session=parent, nodes=[done], base_depth=0)
         r.finalize(tree)
@@ -579,8 +571,6 @@ class TestEmergencyFinalizeOnShutdown:
             id="bbbb8888",
             task="t",
             state=st.Done(session_id="s", result="real"),
-            session_id="s",
-            result="real",
         )
         tree = Tree(root_session=parent, nodes=[done], base_depth=0)
         r.finalize(tree)  # this sets _finalized + unregisters
@@ -1094,7 +1084,6 @@ parent = SessionRef(session_id='p', file=Path({str(tmp_path)!r}) / 'p.jsonl')
 node = Node(
     id='a' * 32, task='t',
     state=st.AwaitingTurn(session_id='sess-x'),
-    session_id='sess-x',
 )
 tree = Tree(root_session=parent, nodes=[node], base_depth=0)
 r(tree)  # one tick so _latest_tree is set

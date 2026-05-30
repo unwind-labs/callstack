@@ -38,7 +38,6 @@ def _make_node(*, clone_path: Path, session_id: str = "sess-x") -> Node:
         id=nid,
         task="do thing",
         state=st.AwaitingTurn(session_id=session_id),
-        session_id=session_id,
         clone_path=str(clone_path),
     )
 
@@ -206,7 +205,6 @@ class TestTimeoutOnBudgetExhaustion:
             id="x" * 32,
             task="t",
             state=st.AwaitingTurn(session_id="sess-y"),
-            session_id="sess-y",
             clone_path=None,
         )
         tree = _make_tree(node, tmp_path)

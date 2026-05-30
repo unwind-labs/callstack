@@ -39,7 +39,6 @@ def _running_node(nid: str, task: str, *, session_id: str | None = None) -> Node
         id=nid,
         task=task,
         state=st.AwaitingTurn(session_id=sid),
-        session_id=sid,
     )
 
 
@@ -170,8 +169,6 @@ def test_reconcile_leaves_terminal_nodes_alone(tmp_path):
         id="ddddeeee",
         task="completed",
         state=st.Done(session_id="sess-done", result="ok"),
-        session_id="sess-done",
-        result="ok",
     )
     tree = Tree(root_session=parent, nodes=[done_node], base_depth=0)
     _write_frame(report, frame_key=ROOT_FRAME_KEY, tree=tree, writer_pid=_dead_pid())
@@ -245,7 +242,6 @@ def test_reconcile_preserves_awaiting_user_nodes(tmp_path, monkeypatch):
         id="yyyyyyyy",
         task="ask user",
         state=st.AwaitingUser(session_id="sess-yielded", question="ok?"),
-        session_id="sess-yielded",
     )
     tree = Tree(root_session=parent, nodes=[yielded], base_depth=0)
 

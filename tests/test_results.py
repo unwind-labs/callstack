@@ -59,7 +59,7 @@ def test_timeout_node_surfaces_real_error_not_unexpected_state():
     # caller learns WHY the call ended, not a misleading "unexpected state:
     # timeout" that drops the real reason.
     state = st.Timeout()  # default error: "wait-for-terminal-envelope budget elapsed"
-    node = Node(id="n1", task="t", state=state, error=state.error)  # error mirrored by _denormalize
+    node = Node(id="n1", task="t", state=state)  # node.error is derived from state
     out = _result_from_node(node)
     assert isinstance(out, CallFailed)
     assert out.error == "wait-for-terminal-envelope budget elapsed"
@@ -72,18 +72,18 @@ def test_abandoned_node_surfaces_abandon_reason():
     # in-flight nodes that are then read out as results. The abandon reason
     # carries the only diagnostic the caller will ever get about the seal.
     state = st.Abandoned(error="writer pid 4242 no longer alive")
-    node = Node(id="n2", task="t", state=state, error=state.error)
+    node = Node(id="n2", task="t", state=state)
     out = _result_from_node(node)
     assert isinstance(out, CallFailed)
     assert out.error == "writer pid 4242 no longer alive"
 
 
-def test_terminal_error_falls_back_to_state_when_node_error_unset():
-    # Defensive: even if denormalization hasn't mirrored s.error onto
-    # node.error, the state's own error is the source of truth and must still
-    # reach the caller rather than collapsing to None.
+def test_terminal_error_derives_from_state():
+    # node.error is a read-through view over node.state, so the state's own
+    # error is always visible without any mirroring step — and it reaches the
+    # caller rather than collapsing to None.
     node = Node(id="n3", task="t", state=st.Abandoned(error="sealed at shutdown"))
-    assert node.error is None
+    assert node.error == "sealed at shutdown"
     out = _result_from_node(node)
     assert isinstance(out, CallFailed)
     assert out.error == "sealed at shutdown"

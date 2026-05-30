@@ -516,8 +516,9 @@ def _abandon_tree_nodes_in_place(tree: Tree, *, reason: str) -> int:
         if _state.is_eligible_for_abandonment(s.kind):
             sid = getattr(s, "session_id", None) or node.session_id
             err = f"{reason} (state was {s.kind!r})"
+            # node.error is derived from node.state, so the Abandoned state IS
+            # the write — no separate mirror.
             node.state = _state.Abandoned(error=err, session_id=sid)
-            node.error = err
             changed += 1
         for c in node.children:
             walk(c)
