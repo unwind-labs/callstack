@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "callstack"
-version = "0.1.1"
+version = "0.3.0"
 description = "A call stack for AI agents to run deeply nested workflows reliably."
 requires-python = ">=3.10"
 dependencies = [
