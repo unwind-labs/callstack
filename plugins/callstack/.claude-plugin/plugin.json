@@ -1,7 +1,7 @@
 {
   "name": "callstack",
   "description": "Call stack for agents. Useful for long-horizon and deeply nested tasks. Keeps agent context small; avoids context rot and saves on tokens.",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "author": {
     "name": "Amol Kelkar",
     "url": "https://github.com/amolk"
