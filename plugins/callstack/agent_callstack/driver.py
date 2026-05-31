@@ -557,9 +557,12 @@ class Driver:
         self.last_tree = tree
         self._notify()
 
-        # Walk up to find this leaf's depth.
-        depth = self._depth_of(tree, leaf)
-        parent_file = self._parent_file_for(tree, leaf)
+        # The leaf's depth and parent session file come from the same one-shot
+        # `_TreeIndex` `_propagate_up` uses — no separate hand-rolled ancestor
+        # walks (the index was built to replace them).
+        index = _TreeIndex.build(tree)
+        depth = index.depth_of[id(leaf)]
+        parent_file = index.parent_file_of[id(leaf)]
 
         # Step the leaf forward with UserReplied, then continue driving until
         # it terminates or yields again. If it terminates, propagate up.
@@ -601,42 +604,6 @@ class Driver:
             call_type=call_type,
             state=st.Pending(parent_session_id="", task=task, task_id=nid[:8], context_mode=cmode),
         )
-
-    def _depth_of(self, tree: Tree, target: Node) -> int:
-        def walk(n: Node, d: int) -> Optional[int]:
-            if n is target:
-                return d
-            for c in n.children:
-                hit = walk(c, d + 1)
-                if hit is not None:
-                    return hit
-            return None
-
-        for root in tree.nodes:
-            d = walk(root, tree.base_depth + 1)
-            if d is not None:
-                return d
-        return tree.base_depth + 1
-
-    def _parent_file_for(self, tree: Tree, target: Node) -> Path:
-        """Session file of `target`'s parent (or root session for top-level)."""
-
-        def find_parent(n: Node) -> Optional[Node]:
-            for c in n.children:
-                if c is target:
-                    return n
-                found = find_parent(c)
-                if found is not None:
-                    return found
-            return None
-
-        for root in tree.nodes:
-            if root is target:
-                return tree.root_session.file
-            p = find_parent(root)
-            if p and p.clone_path:
-                return Path(p.clone_path)
-        return tree.root_session.file
 
     def _propagate_up(self, tree: Tree, leaf: Node) -> None:
         """Walk up from a just-completed leaf, feeding ChildDone/ChildFailed

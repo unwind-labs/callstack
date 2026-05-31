@@ -9,15 +9,17 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from agent_callstack.analysis import (  # noqa: E402
     SessionAnalyzer,
-    format_duration,
+    SessionPrefixError,
+    format_timing_table,
     format_tree,
+    per_session_timing,
+    resolve_session_prefix,
 )
 
 
@@ -36,7 +38,10 @@ def main():
     if not events:
         sys.exit("no events in trace")
 
-    root = _resolve_prefix(events, args.root)
+    try:
+        root = resolve_session_prefix({e.session_id for e in events}, args.root)
+    except SessionPrefixError as exc:
+        sys.exit(str(exc))
     tree = analyzer.build_tree(trace, root_session=root)
 
     print("=" * 70)
@@ -49,33 +54,7 @@ def main():
     print("=" * 70)
     print("PER-SESSION BREAKDOWN")
     print("=" * 70)
-    dur: dict[str, float] = defaultdict(float)
-    turns: dict[str, int] = defaultdict(int)
-    errors: dict[str, int] = defaultdict(int)
-    for e in events:
-        dur[e.session_id] += e.duration
-        turns[e.session_id] += 1
-        if e.error:
-            errors[e.session_id] += 1
-
-    total = sum(dur.values())
-    print(f"{'session':14s}  {'turns':>6s}  {'errors':>7s}  {'duration':>10s}  pct")
-    for sid, d in sorted(dur.items(), key=lambda kv: -kv[1]):
-        pct = 100.0 * d / total if total else 0.0
-        print(f"{sid[:14]:14s}  {turns[sid]:>6d}  {errors[sid]:>7d}  {format_duration(d):>10s}  {pct:5.1f}%")
-    print(f"{'TOTAL':14s}  {sum(turns.values()):>6d}  {sum(errors.values()):>7d}  {format_duration(total):>10s}")
-
-
-def _resolve_prefix(events: list, prefix: str | None) -> str | None:
-    if prefix is None:
-        return None
-    sids = {e.session_id for e in events}
-    matches = [s for s in sids if s.startswith(prefix)]
-    if len(matches) == 1:
-        return matches[0]
-    if not matches:
-        sys.exit(f"no session id starting with {prefix!r}")
-    sys.exit(f"ambiguous prefix {prefix!r}: {sorted(matches)}")
+    print(format_timing_table(per_session_timing(events), id_width=14))
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterable, Iterator, Optional
 
 from .session import PROJECTS_DIR
 
@@ -71,6 +71,16 @@ class SessionStats:
     duration: float
     first_timestamp: Optional[datetime]
     last_timestamp: Optional[datetime]
+
+
+@dataclass(frozen=True)
+class SessionTiming:
+    """Per-session roll-up of trace events: one row of the breakdown table."""
+
+    session_id: str
+    turns: int
+    errors: int
+    duration: float
 
 
 # ---------- Analyzer ----------
@@ -242,6 +252,64 @@ def format_duration(seconds: float) -> str:
 
 def format_size(nbytes: int) -> str:
     return f"{nbytes}B" if nbytes < 1024 else f"{nbytes / 1024:.0f}KB"
+
+
+def per_session_timing(events: list[TraceEvent]) -> list[SessionTiming]:
+    """Aggregate trace events into per-session rows, sorted by descending
+    duration. Shared by `full_report.py` and `timing_breakdown.py`, which
+    previously each re-derived the same three accumulators inline."""
+    dur: dict[str, float] = defaultdict(float)
+    turns: dict[str, int] = defaultdict(int)
+    errors: dict[str, int] = defaultdict(int)
+    for e in events:
+        dur[e.session_id] += e.duration
+        turns[e.session_id] += 1
+        if e.error:
+            errors[e.session_id] += 1
+    rows = [SessionTiming(sid, turns[sid], errors[sid], d) for sid, d in dur.items()]
+    rows.sort(key=lambda r: -r.duration)
+    return rows
+
+
+def format_timing_table(rows: list[SessionTiming], *, id_width: int = 14) -> str:
+    """Render per-session timing rows as a fixed-width table with a TOTAL row.
+
+    `id_width` controls the session-id column (full_report uses 14,
+    timing_breakdown 12); every other column matches across both callers."""
+    total = sum(r.duration for r in rows)
+    lines = [f"{'session':{id_width}s}  {'turns':>6s}  {'errors':>7s}  {'duration':>10s}  pct"]
+    for r in rows:
+        pct = 100.0 * r.duration / total if total else 0.0
+        lines.append(
+            f"{r.session_id[:id_width]:{id_width}s}  {r.turns:>6d}  {r.errors:>7d}  "
+            f"{format_duration(r.duration):>10s}  {pct:5.1f}%"
+        )
+    total_turns = sum(r.turns for r in rows)
+    total_errors = sum(r.errors for r in rows)
+    lines.append(f"{'TOTAL':{id_width}s}  {total_turns:>6d}  {total_errors:>7d}  {format_duration(total):>10s}")
+    return "\n".join(lines)
+
+
+class SessionPrefixError(LookupError):
+    """A `--root` prefix matched zero or multiple session ids. Carries the
+    operator-facing message; CLI scripts turn it into a `sys.exit`."""
+
+
+def resolve_session_prefix(session_ids: Iterable[str], prefix: Optional[str]) -> Optional[str]:
+    """Resolve a session-id prefix to the single matching id.
+
+    Returns None when `prefix` is None (caller auto-picks a root). Raises
+    `SessionPrefixError` when the prefix matches nothing or is ambiguous —
+    shared by `full_report.py` and `trace_tree.py`, which previously copied
+    this matching + error wording verbatim."""
+    if prefix is None:
+        return None
+    matches = [s for s in session_ids if s.startswith(prefix)]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise SessionPrefixError(f"no session id starting with {prefix!r}")
+    raise SessionPrefixError(f"ambiguous prefix {prefix!r}: {sorted(matches)}")
 
 
 def format_tree(root: CallNode, *, indent: int = 0) -> str:

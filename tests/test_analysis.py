@@ -8,11 +8,16 @@ from pathlib import Path
 import pytest
 from agent_callstack.analysis import (
     SessionAnalyzer,
+    SessionPrefixError,
+    TraceEvent,
     _content_preview,
     _parse_ts,
     format_duration,
     format_size,
+    format_timing_table,
     format_tree,
+    per_session_timing,
+    resolve_session_prefix,
 )
 
 
@@ -366,3 +371,78 @@ class TestFormatHelpers:
         assert "child123" in out
         assert "Main task" in out
         assert "2.5s" in out
+
+
+def _ev(session_id: str, duration: float, error: str | None = None) -> TraceEvent:
+    return TraceEvent(
+        timestamp=None,
+        depth=0,
+        session_id=session_id,
+        task="t",
+        duration=duration,
+        result_length=0,
+        error=error,
+    )
+
+
+class TestPerSessionTiming:
+    """`per_session_timing` is the single source both CLI breakdown tables
+    aggregate through — it must group by session, count turns/errors, and
+    rank by total duration so the heaviest session leads the table."""
+
+    def test_groups_counts_and_sorts_by_duration(self):
+        rows = per_session_timing(
+            [
+                _ev("a", 1.0),
+                _ev("a", 2.0, error="boom"),
+                _ev("b", 5.0),
+            ]
+        )
+        # b (5.0s) outranks a (3.0s total) — descending duration.
+        assert [r.session_id for r in rows] == ["b", "a"]
+        a = next(r for r in rows if r.session_id == "a")
+        assert a.turns == 2
+        assert a.errors == 1
+        assert a.duration == 3.0
+
+    def test_empty_events(self):
+        assert per_session_timing([]) == []
+
+
+class TestFormatTimingTable:
+    def test_has_header_total_and_pct(self):
+        out = format_timing_table(per_session_timing([_ev("sess", 4.0)]))
+        lines = out.splitlines()
+        assert lines[0].startswith("session")
+        assert "pct" in lines[0]
+        # Single session owns 100% of the time.
+        assert "100.0%" in out
+        assert lines[-1].startswith("TOTAL")
+
+    def test_id_width_controls_column(self):
+        rows = per_session_timing([_ev("x", 1.0)])
+        narrow = format_timing_table(rows, id_width=12).splitlines()[0]
+        wide = format_timing_table(rows, id_width=14).splitlines()[0]
+        # The header's session column widens with id_width.
+        assert narrow.index("turns") < wide.index("turns")
+
+    def test_zero_total_duration_no_div_by_zero(self):
+        # All-zero durations must render 0.0% rather than crashing.
+        out = format_timing_table(per_session_timing([_ev("a", 0.0)]))
+        assert "0.0%" in out
+
+
+class TestResolveSessionPrefix:
+    def test_none_prefix_returns_none(self):
+        assert resolve_session_prefix(["abc", "def"], None) is None
+
+    def test_unique_match(self):
+        assert resolve_session_prefix(["abc123", "def456"], "abc") == "abc123"
+
+    def test_no_match_raises(self):
+        with pytest.raises(SessionPrefixError, match="no session id starting with"):
+            resolve_session_prefix(["abc", "def"], "zzz")
+
+    def test_ambiguous_raises(self):
+        with pytest.raises(SessionPrefixError, match="ambiguous prefix"):
+            resolve_session_prefix(["abc1", "abc2"], "abc")

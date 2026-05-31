@@ -222,6 +222,66 @@ def _same_project(a: str, b: str) -> bool:
         return False
 
 
+def _call_error(error: str, *, invoke_id: str = "", report_path: str = "") -> str:
+    """Serialize the `call`-tool error envelope.
+
+    Every `call` failure path (bad context, bad tasks, bad cwd,
+    fork+cross-project, registry full, sync crash) returns the same shape: a
+    `results` array holding one `status="error"` entry. Centralizing it keeps
+    that shape identical across all of them. `await_call`/`resume` use the flat
+    top-level `status="error"` shape instead and deliberately do NOT route
+    through here."""
+    return json.dumps(
+        {
+            "invoke_id": invoke_id,
+            "report_path": report_path,
+            "results": [{"status": "error", "error": error}],
+        },
+        indent=2,
+    )
+
+
+def _cap_reached_message(outcome: CapReached) -> str:
+    """The operator-facing message for a full background-call registry. Shared
+    by both `call` paths (background and sync) so the guidance stays in one
+    place."""
+    return (
+        f"background-call registry full: {outcome.outstanding} "
+        f"outstanding (cap={outcome.cap}). Reconcile pending "
+        f"invocations with `await_call(invoke_id)` first, or "
+        f"widen with CALLSTACK_MAX_BACKGROUND."
+    )
+
+
+def _start_or_cap(
+    *,
+    invoke_id: str,
+    caller: Caller,
+    tasks: list[str],
+    context: str,
+    report_path: str,
+    log_dir: Path,
+) -> tuple[Optional[Started], Optional[str]]:
+    """Schedule the run via `BackgroundRuns.start`, mapping its typed outcome.
+
+    Returns `(Started, None)` on success or `(None, error_envelope_json)` when
+    the registry is full — the caller returns the envelope directly. Both the
+    background and sync `call` paths schedule identically, so this is their one
+    shared entry point."""
+    outcome = _background.start(
+        invoke_id=invoke_id,
+        caller=caller,
+        tasks=tasks,
+        context=context,
+        report_path=report_path,
+        log_dir=log_dir,
+    )
+    if isinstance(outcome, CapReached):
+        return None, _call_error(_cap_reached_message(outcome))
+    assert isinstance(outcome, Started)
+    return outcome, None
+
+
 def _envelope_from_multi(invoke_id: str, report_path: str, multi: MultiResult) -> dict:
     envelope: dict = {
         "invoke_id": invoke_id,
@@ -294,53 +354,20 @@ async def call(
         kills the tool call). Calls have no inherent timeout — the
         budget exists only to dodge the MCP client's hard cap."""
     if context not in ("fork", "fresh"):
-        return json.dumps(
-            {
-                "invoke_id": "",
-                "report_path": "",
-                "results": [{"status": "error", "error": f"invalid context: {context!r} (must be 'fork' or 'fresh')"}],
-            },
-            indent=2,
-        )
+        return _call_error(f"invalid context: {context!r} (must be 'fork' or 'fresh')")
     tasks_err = _validate_tasks(tasks)
     if tasks_err:
-        return json.dumps(
-            {
-                "invoke_id": "",
-                "report_path": "",
-                "results": [{"status": "error", "error": tasks_err}],
-            },
-            indent=2,
-        )
+        return _call_error(tasks_err)
     resolved_cwd, cwd_err = _resolve_cwd(cwd)
     if cwd_err:
-        return json.dumps(
-            {
-                "invoke_id": "",
-                "report_path": "",
-                "results": [{"status": "error", "error": cwd_err}],
-            },
-            indent=2,
-        )
+        return _call_error(cwd_err)
     parent_dir = _parent_project_folder()
     if context == "fork" and not _same_project(resolved_cwd, parent_dir):
-        return json.dumps(
-            {
-                "invoke_id": "",
-                "report_path": "",
-                "results": [
-                    {
-                        "status": "error",
-                        "error": (
-                            f"context='fork' cannot be combined with a cwd "
-                            f"different from the parent's project folder "
-                            f"(parent={parent_dir}, requested={resolved_cwd}); "
-                            f"use context='fresh' instead"
-                        ),
-                    }
-                ],
-            },
-            indent=2,
+        return _call_error(
+            f"context='fork' cannot be combined with a cwd "
+            f"different from the parent's project folder "
+            f"(parent={parent_dir}, requested={resolved_cwd}); "
+            f"use context='fresh' instead"
         )
 
     ident = _resolve_identity(resolved_cwd)
@@ -352,8 +379,8 @@ async def call(
     if run_in_background:
         # `BackgroundRuns.start` reaps finished-unreconciled runs, enforces the
         # cap, and schedules `caller.call_many` on a worker thread — returning
-        # a typed outcome we translate to the wire envelope here.
-        outcome = _background.start(
+        # a typed outcome `_start_or_cap` translates to the wire envelope.
+        started, cap_err = _start_or_cap(
             invoke_id=invoke_id,
             caller=caller,
             tasks=tasks,
@@ -361,30 +388,13 @@ async def call(
             report_path=report_path,
             log_dir=log_dir,
         )
-        if isinstance(outcome, CapReached):
-            return json.dumps(
-                {
-                    "invoke_id": "",
-                    "report_path": "",
-                    "results": [
-                        {
-                            "status": "error",
-                            "error": (
-                                f"background-call registry full: {outcome.outstanding} "
-                                f"outstanding (cap={outcome.cap}). Reconcile pending "
-                                f"invocations with `await_call(invoke_id)` first, or "
-                                f"widen with CALLSTACK_MAX_BACKGROUND."
-                            ),
-                        }
-                    ],
-                },
-                indent=2,
-            )
-        assert isinstance(outcome, Started)
+        if cap_err:
+            return cap_err
+        assert started is not None
         return json.dumps(
             {
-                "invoke_id": outcome.invoke_id,
-                "report_path": outcome.report_path,
+                "invoke_id": started.invoke_id,
+                "report_path": started.report_path,
                 "status": "started",
             },
             indent=2,
@@ -405,7 +415,9 @@ async def call(
     #      path (`_finalize_crashed`), replacing the bespoke
     #      `_finalize_at_boundary` guard that previously wrapped
     #      `call_many`.
-    start_outcome = _background.start(
+    # The sync path only needs the cap check — it awaits the result below
+    # rather than returning the `Started` handle.
+    _, cap_err = _start_or_cap(
         invoke_id=invoke_id,
         caller=caller,
         tasks=tasks,
@@ -413,26 +425,8 @@ async def call(
         report_path=report_path,
         log_dir=log_dir,
     )
-    if isinstance(start_outcome, CapReached):
-        return json.dumps(
-            {
-                "invoke_id": "",
-                "report_path": "",
-                "results": [
-                    {
-                        "status": "error",
-                        "error": (
-                            f"background-call registry full: {start_outcome.outstanding} "
-                            f"outstanding (cap={start_outcome.cap}). Reconcile pending "
-                            f"invocations with `await_call(invoke_id)` first, or "
-                            f"widen with CALLSTACK_MAX_BACKGROUND."
-                        ),
-                    }
-                ],
-            },
-            indent=2,
-        )
-    assert isinstance(start_outcome, Started)
+    if cap_err:
+        return cap_err
     outcome = await _background.reconcile(
         invoke_id,
         timeout=sync_budget_secs(),
@@ -456,18 +450,10 @@ async def call(
         # frames; surface the structured error envelope rather than
         # re-raising so the orchestrator sees the same shape it would
         # for a background-mode crash.
-        return json.dumps(
-            {
-                "invoke_id": invoke_id,
-                "report_path": outcome.report_path,
-                "results": [
-                    {
-                        "status": "error",
-                        "error": f"call_many raised: {outcome.error}",
-                    }
-                ],
-            },
-            indent=2,
+        return _call_error(
+            f"call_many raised: {outcome.error}",
+            invoke_id=invoke_id,
+            report_path=outcome.report_path,
         )
     assert isinstance(outcome, Done)
     return json.dumps(

@@ -35,7 +35,7 @@ dev = [
     # must stay in lockstep — older or newer versions disagree on
     # formatting decisions, which silently leaves files dirty in one env
     # but clean in the other. Bump both this pin and the hook rev together.
-    "ruff==0.9.0",
+    "ruff==0.15.14",
 ]
 
 [tool.pytest.ini_options]

@@ -20,7 +20,6 @@ For power users (custom session, model, permission handler, etc.):
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -122,12 +121,12 @@ def new_invoke_id() -> str:
 # parsing policy in env.py).
 from .env import (  # noqa: E402
     ENV_CLAUDE_SESSION,
-    ENV_DEPTH,
     ENV_FRAME_KEY,
     ENV_MAX_DEPTH,
     ENV_OWN_SESSION,
     ENV_ROOT_INVOKE_ID,
     ENV_ROOT_LOG_DIR,
+    current_depth,
     max_background,
     max_depth as _default_max_depth,  # noqa: E402
     max_fanout,
@@ -245,7 +244,7 @@ class Caller:
         # parent project, not the (possibly redirected) child cwd.
         parent_cwd = self._parent_project_cwd()
         parent = locator.locate(explicit=self._explicit_session, cwd=parent_cwd)
-        depth = int(os.environ.get(ENV_DEPTH, "0"))
+        depth = current_depth()
         ctx = self._resolve_invocation_context(parent)
         driver = self._driver_for(parent, ctx=ctx, depth_base=depth)
         started_at = _utc_now_iso()
