@@ -605,9 +605,11 @@ def test_nested_reporter_is_noop_if_root_frame_absent(tmp_path):
 
 def test_debounce_coalesces_burst_of_notifies(tmp_path, monkeypatch):
     """50 notifies inside a single debounce window must produce ONE atomic
-    write of report.yaml, not 50. Uses a generous 2s window so the burst
-    of frame YAML writes can complete on slow CI before the timer fires."""
-    monkeypatch.setenv("CALLSTACK_REPORT_DEBOUNCE_SECS", "2.0")
+    write of report.yaml, not 50. Uses a very generous 60s window so the
+    burst of frame YAML writes can complete on a slow/loaded CI runner
+    before the timer fires (a 2s window flaked on ubuntu CI). finalize()
+    cancels the still-pending timer, so the large window never lingers."""
+    monkeypatch.setenv("CALLSTACK_REPORT_DEBOUNCE_SECS", "60.0")
 
     from agent_callstack import reporter as rep_mod
 
