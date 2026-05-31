@@ -53,7 +53,7 @@ from hypothesis import given, settings, strategies as st
 # Dict keys are text because JSON object keys are always strings.
 _json = st.recursive(
     st.none() | st.booleans() | st.integers() | st.text(),
-    lambda children: (st.lists(children, max_size=3) | st.dictionaries(st.text(max_size=5), children, max_size=3)),
+    lambda children: st.lists(children, max_size=3) | st.dictionaries(st.text(max_size=5), children, max_size=3),
     max_leaves=5,
 )
 

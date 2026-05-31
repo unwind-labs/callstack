@@ -36,8 +36,7 @@ FORK_SYSTEM_INSTRUCTION = (
 # context_mode="fresh": brand-new session, no inherited context.
 FRESH_SYSTEM_INSTRUCTION = (
     "You are running in a fresh session — a child process spawned by a parent "
-    "agent to handle one task in isolation, with no inherited context. "
-    + _ENVELOPE_PROTOCOL
+    "agent to handle one task in isolation, with no inherited context. " + _ENVELOPE_PROTOCOL
 )
 
 # Backward-compatible alias: the original single instruction was the fork variant.
