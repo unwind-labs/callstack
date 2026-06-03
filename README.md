@@ -1,6 +1,6 @@
-![agent callstack](assets/callstack.gif)
-
 # callstack
+
+https://github.com/unwind-labs/callstack/raw/main/assets/callstack-explainer.mp4
 
 Call stacks let humans build complex software by **scoping complexity** and **scoping memory and variables**. No matter how deep execution goes, the code runs with the full context of the program, and the language runtime guarantees the call stack unwinds deterministically as functions return.
 
