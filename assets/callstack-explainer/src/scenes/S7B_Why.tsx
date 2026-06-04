@@ -8,10 +8,9 @@ const POP = Easing.bezier(0.34, 1.56, 0.64, 1);
 // Columns: subagents, graph-based agents, callstack.
 const COLS = ["subagents", "graph-based agents", "callstack"];
 const ROWS: { cap: string; vals: [boolean, boolean, boolean] }[] = [
-  { cap: "Dynamically-orchestrated workflows", vals: [true, false, true] },
+  { cap: "Dynamic — decided at runtime", vals: [true, false, true] },
   { cap: "Arbitrarily deep nesting", vals: [false, true, true] },
-  { cap: "Interactive from any level", vals: [false, true, true] },
-  { cap: "Reliable execution", vals: [true, true, true] },
+  { cap: "Interactive at any level", vals: [false, false, true] },
 ];
 
 const CAP_W = 540;

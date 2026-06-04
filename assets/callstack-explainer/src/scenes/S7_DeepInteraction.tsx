@@ -1,6 +1,6 @@
 import React from "react";
 import { AbsoluteFill, Sequence, useCurrentFrame, interpolate, Easing } from "remotion";
-import { Background, ramp, Caption } from "../ui";
+import { Background, ramp, Caption, MotifBadge } from "../ui";
 import { COLOR, MONO, SANS } from "../theme";
 
 const EASE_IN = Easing.in(Easing.cubic);
@@ -40,23 +40,23 @@ const PILLS: Record<string, Pill[]> = {
   auth: [{ text: "MFA verified", ok: true, at: 608 }],
 };
 
-type Line = { kind: "prompt" | "user" | "sys"; text: string; start: number; cps: number; color?: string };
-const LINES: Line[] = [
-  { kind: "prompt", text: "Enter the 6-digit MFA code:", start: 66, cps: 0.5 },
-  { kind: "user", text: "000000", start: 132, cps: 0.45 },
-  { kind: "sys", text: "✕ Code rejected.", start: 290, cps: 0.5, color: COLOR.danger },
-  { kind: "prompt", text: "That code was incorrect. Re-enter:", start: 334, cps: 0.5 },
-  { kind: "user", text: "847291", start: 414, cps: 0.45 },
-  { kind: "sys", text: "✓ Code accepted.", start: 540, cps: 0.5, color: COLOR.ok },
+type Msg = { kind: "agent" | "user" | "sys"; text: string; start: number; ok?: boolean };
+const MESSAGES: Msg[] = [
+  { kind: "agent", text: "Please enter the 6-digit code we just texted you.", start: 66 },
+  { kind: "user", text: "000000", start: 132 },
+  { kind: "sys", text: "Code rejected", ok: false, start: 290 },
+  { kind: "agent", text: "That code didn’t match. Try again.", start: 334 },
+  { kind: "user", text: "847291", start: 414 },
+  { kind: "sys", text: "Verified", ok: true, start: 540 },
 ];
 
 const ROW_X = 96;
 const ROW_TOP = 250;
 const ROW_GAP = 100;
 const ROW_W = 470;
-const TERM_X = 1146;
-const TERM_Y = 286;
-const TERM_W = 680;
+const CHAT_X = 1166;
+const CHAT_Y = 244;
+const CHAT_W = 600;
 
 // Ask windows: verify-mfa is awaiting the user (arrow to terminal is live).
 const askActive = (f: number): boolean => (f >= 60 && f < 172) || (f >= 320 && f < 452);
@@ -157,11 +157,91 @@ const FramePanel: React.FC<{ f: Frame; frame: number; deepest: number }> = ({ f,
   );
 };
 
-const tw = (line: Line, frame: number): string => {
-  const n = Math.floor((frame - line.start) * line.cps);
-  if (n <= 0) return "";
-  return line.text.slice(0, n);
+const Bubble: React.FC<{ m: Msg; frame: number }> = ({ m, frame }) => {
+  const ap = ramp(frame, m.start, 12);
+  if (ap <= 0) return null;
+  const y = (1 - ap) * 8;
+  if (m.kind === "sys") {
+    const c = m.ok ? COLOR.ok : COLOR.danger;
+    return (
+      <div style={{ display: "flex", justifyContent: "center", opacity: ap, transform: `translateY(${y}px)` }}>
+        <span
+          style={{
+            fontFamily: MONO,
+            fontSize: 14,
+            color: c,
+            background: m.ok ? "rgba(45,212,167,0.14)" : COLOR.dangerSoft,
+            border: `1px solid ${c}55`,
+            borderRadius: 20,
+            padding: "4px 14px",
+          }}
+        >
+          {m.ok ? "✓" : "✕"} {m.text}
+        </span>
+      </div>
+    );
+  }
+  const isUser = m.kind === "user";
+  const c = isUser ? COLOR.user : COLOR.agent;
+  const soft = isUser ? COLOR.userSoft : COLOR.agentSoft;
+  return (
+    <div
+      style={{
+        display: "flex",
+        justifyContent: isUser ? "flex-end" : "flex-start",
+        opacity: ap,
+        transform: `translateY(${y}px)`,
+      }}
+    >
+      <div
+        style={{
+          maxWidth: "74%",
+          background: soft,
+          border: `1px solid ${c}55`,
+          borderRadius: 16,
+          borderBottomRightRadius: isUser ? 5 : 16,
+          borderBottomLeftRadius: isUser ? 16 : 5,
+          padding: "10px 15px",
+          fontFamily: SANS,
+          fontSize: 20,
+          color: COLOR.text,
+          lineHeight: 1.35,
+        }}
+      >
+        {m.text}
+      </div>
+    </div>
+  );
 };
+
+const TypingDots: React.FC<{ frame: number }> = ({ frame }) => (
+  <div style={{ display: "flex", justifyContent: "flex-start" }}>
+    <div
+      style={{
+        background: COLOR.agentSoft,
+        border: `1px solid ${COLOR.agent}55`,
+        borderRadius: 16,
+        borderBottomLeftRadius: 5,
+        padding: "13px 16px",
+        display: "flex",
+        gap: 6,
+      }}
+    >
+      {[0, 1, 2].map((i) => (
+        <div
+          key={i}
+          style={{
+            width: 7,
+            height: 7,
+            borderRadius: 7,
+            background: COLOR.agent,
+            opacity: 0.35 + 0.65 * Math.abs(Math.sin((frame + i * 4) / 6)),
+          }}
+        />
+      ))}
+    </div>
+  </div>
+);
 
 export const S7_DeepInteraction: React.FC = () => {
   const frame = useCurrentFrame();
@@ -187,6 +267,10 @@ export const S7_DeepInteraction: React.FC = () => {
         <div style={{ fontFamily: MONO, fontSize: 18, color: COLOR.textDim, marginTop: 8 }}>
           the agent decides to call deeper — callstack pushes &amp; pops each frame for it
         </div>
+      </div>
+
+      <div style={{ position: "absolute", top: 86, left: 96, opacity: head }}>
+        <MotifBadge state="harness" />
       </div>
 
       {/* connectors between live adjacent frames + the yield arrow */}
@@ -215,13 +299,13 @@ export const S7_DeepInteraction: React.FC = () => {
         {yieldOn > 0 ? (
           <g opacity={yieldOn}>
             <path
-              d={`M ${vmfaRight} ${vmfaMid} C ${vmfaRight + 120} ${vmfaMid}, ${TERM_X - 120} ${TERM_Y + 150}, ${TERM_X - 12} ${TERM_Y + 150}`}
+              d={`M ${vmfaRight} ${vmfaMid} C ${vmfaRight + 120} ${vmfaMid}, ${CHAT_X - 120} ${CHAT_Y + 150}, ${CHAT_X - 12} ${CHAT_Y + 150}`}
               stroke={COLOR.call}
               strokeWidth={2.5}
               strokeDasharray="3 6"
               fill="none"
             />
-            <circle cx={TERM_X - 12} cy={TERM_Y + 150} r={5} fill={COLOR.call} />
+            <circle cx={CHAT_X - 12} cy={CHAT_Y + 150} r={5} fill={COLOR.call} />
           </g>
         ) : null}
       </svg>
@@ -250,72 +334,116 @@ export const S7_DeepInteraction: React.FC = () => {
         <FramePanel key={f.id} f={f} frame={frame} deepest={deepest} />
       ))}
 
-      {/* user terminal */}
-      <div style={{ position: "absolute", left: TERM_X, top: TERM_Y, width: TERM_W, opacity: head }}>
+      {/* customer chat widget */}
+      <div style={{ position: "absolute", left: CHAT_X, top: CHAT_Y, width: CHAT_W, opacity: head }}>
+        {/* header */}
         <div
           style={{
-            background: "#0a0d15",
-            borderRadius: "12px 12px 0 0",
+            background: COLOR.panel,
+            borderRadius: "14px 14px 0 0",
             border: `1px solid ${COLOR.panelEdge}`,
+            padding: "12px 16px",
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+          }}
+        >
+          <div
+            style={{
+              width: 40,
+              height: 40,
+              borderRadius: 20,
+              background: COLOR.callSoft,
+              border: `1px solid ${COLOR.call}66`,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontSize: 18,
+            }}
+          >
+            🎧
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+            <div style={{ fontFamily: SANS, fontSize: 18, fontWeight: 700, color: COLOR.text }}>
+              Acme Support
+            </div>
+            <div
+              style={{
+                fontFamily: MONO,
+                fontSize: 12,
+                color: COLOR.ok,
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+              }}
+            >
+              <span style={{ width: 7, height: 7, borderRadius: 7, background: COLOR.ok }} />
+              online
+            </div>
+          </div>
+        </div>
+        {/* messages */}
+        <div
+          style={{
+            background: COLOR.bg1,
+            border: `1px solid ${COLOR.panelEdge}`,
+            borderTop: "none",
+            padding: 18,
+            minHeight: 348,
+            display: "flex",
+            flexDirection: "column",
+            gap: 12,
+          }}
+        >
+          {MESSAGES.map((m) => (
+            <Bubble key={m.start} m={m} frame={frame} />
+          ))}
+          {MESSAGES.some((m) => m.kind === "agent" && frame >= m.start - 14 && frame < m.start) ? (
+            <TypingDots frame={frame} />
+          ) : null}
+        </div>
+        {/* input bar */}
+        <div
+          style={{
+            background: COLOR.panel,
+            borderRadius: "0 0 14px 14px",
+            border: `1px solid ${COLOR.panelEdge}`,
+            borderTop: "none",
             padding: "10px 14px",
             display: "flex",
             alignItems: "center",
-            gap: 8,
+            gap: 10,
           }}
         >
-          {[COLOR.danger, COLOR.call, COLOR.ok].map((c) => (
-            <div key={c} style={{ width: 11, height: 11, borderRadius: 11, background: c, opacity: 0.7 }} />
-          ))}
-          <span style={{ fontFamily: MONO, fontSize: 14, color: COLOR.textDim, marginLeft: 8 }}>
-            user terminal
-          </span>
-        </div>
-        <div
-          style={{
-            background: "#0a0d15",
-            border: `1px solid ${COLOR.panelEdge}`,
-            borderTop: "none",
-            borderRadius: "0 0 12px 12px",
-            padding: 22,
-            minHeight: 300,
-            fontFamily: MONO,
-            fontSize: 19,
-            lineHeight: 1.75,
-            display: "flex",
-            flexDirection: "column",
-            gap: 4,
-          }}
-        >
-          {LINES.map((l) => {
-            if (frame < l.start) return null;
-            const text = tw(l, frame);
-            const done = text.length >= l.text.length;
-            const cursor = !done && Math.floor(frame / 8) % 2 === 0 ? "▌" : "";
-            if (l.kind === "user") {
-              return (
-                <div key={l.start} style={{ color: COLOR.user }}>
-                  <span style={{ color: COLOR.textFaint }}>$ </span>
-                  {text}
-                  {cursor}
-                </div>
-              );
-            }
-            if (l.kind === "sys") {
-              return (
-                <div key={l.start} style={{ color: l.color }}>
-                  {text}
-                  {cursor}
-                </div>
-              );
-            }
-            return (
-              <div key={l.start} style={{ color: COLOR.text }}>
-                <span style={{ color: COLOR.call }}>🔒 </span>
-                {text}
-                {cursor}
-              </div>
-            );
-          })}
+          <div
+            style={{
+              flex: 1,
+              fontFamily: SANS,
+              fontSize: 15,
+              color: COLOR.textFaint,
+              background: "rgba(255,255,255,0.04)",
+              borderRadius: 18,
+              padding: "9px 16px",
+            }}
+          >
+            Type a message…
+          </div>
+          <div
+            style={{
+              width: 36,
+              height: 36,
+              borderRadius: 18,
+              background: COLOR.call,
+              color: COLOR.bg0,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontSize: 16,
+              fontWeight: 700,
+            }}
+          >
+            ➤
+          </div>
         </div>
       </div>
 

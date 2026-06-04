@@ -1,6 +1,6 @@
 import React from "react";
 import { AbsoluteFill, Sequence, useCurrentFrame } from "remotion";
-import { Background, Caption, ramp } from "../ui";
+import { Background, Caption, ramp, MotifBadge } from "../ui";
 import { COLOR, MONO, SANS } from "../theme";
 import { simulate, Op } from "../sim";
 import { StackView } from "../StackView";
@@ -65,6 +65,10 @@ export const S5_WithCallstack: React.FC = () => {
         </div>
       </div>
 
+      <div style={{ position: "absolute", top: 84, right: 96, opacity: head }}>
+        <MotifBadge state="harness" />
+      </div>
+
       <StackView sim={SIM} frame={frame} />
 
       <Sequence from={70} durationInFrames={120} layout="none">
@@ -75,8 +79,7 @@ export const S5_WithCallstack: React.FC = () => {
       </Sequence>
       <Sequence from={196} durationInFrames={120} layout="none">
         <Caption total={120} accent={COLOR.call}>
-          Copied context stays <span style={{ color: COLOR.textDim }}>dim</span>. The frame only adds
-          the new turns it generates.
+          Each frame adds only the new turns it generates.
         </Caption>
       </Sequence>
       <Sequence from={316} durationInFrames={130} layout="none">

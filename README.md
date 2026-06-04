@@ -4,7 +4,7 @@ https://github.com/user-attachments/assets/a9ee9935-99d4-4564-a604-c9f9889afeab
 
 Call stacks let humans build complex software by **scoping complexity** and **scoping memory and variables**. No matter how deep execution goes, the code runs with the full context of the program, and the language runtime guarantees the call stack unwinds deterministically as functions return.
 
-No equivalent capability exists for ReAct-loop based agents — and Claude Code is a ReAct-loop based agent harness. These agents accumulate context linearly, and as the conversation grows, important early details get crowded out and the agent loses track. Subagents are available to execute side tasks in a fresh context and return results back, keeping execution detail out of the main context — but a subagent must be sent every piece of context it needs, which wastes token generation. Recently, Claude Code shipped an experimental subagent mode called [`/fork`](https://docs.claude.com/en/docs/claude-code) where forked subagents run in a forked session and inherit the parent's context. But as of today, forked agents cannot themselves fork (no deep call stacks), and no user interaction is allowed inside a forked subagent — both limits constrain real use.
+No equivalent capability exists for ReAct-loop based agents — and Claude Code is a ReAct-loop based agent harness. These agents accumulate context linearly, and as the conversation grows, important early details get crowded out and the agent loses track. Subagents are available to execute side tasks in a fresh context and return results back, keeping execution detail out of the main context — but a subagent must be sent every piece of context it needs, which wastes token generation, and a subagent can neither spawn its own subagents nor pause to ask the user. (Claude Code's interactive [`/fork`](https://docs.claude.com/en/docs/claude-code) command is a separate tool: it branches *your* current conversation into a copy you drive by hand — handy for exploring an alternative without losing your place, but not a programmatic way to delegate and unwind work. See [How does `/call` relate to `/fork`?](#how-does-call-relate-to-fork) below.)
 
 ## Why are deep call stacks necessary?
 
@@ -354,29 +354,16 @@ plugins/callstack/agent_callstack/
 
 `channel.py` is the live subprocess seam; `testing.py` provides a scripted in-memory channel so the driver and state machine can be tested without spawning `claude`.
 
-## How is `/call` better than `/fork`?
+## How does `/call` relate to `/fork`?
 
-Both `/call` and Anthropic's experimental `/fork` are built on the same underlying CLI primitive — `claude --session-id <uuid> --fork-session`, which copies a named session and resumes the forked copy with the parent's full context. They are sibling runtimes on that primitive, not parent/child. Here is how they compare:
+Both `/call` and Claude Code's `/fork` are built on the same underlying CLI primitive — `claude --session-id <uuid> --fork-session`, which copies a named session and resumes the forked copy with the parent's full context. But they put that primitive to **orthogonal** uses, so this isn't a head-to-head comparison:
 
-| Capability   | Claude Code `/fork`                                        | callstack `/call`                                                      |
-|--------------|------------------------------------------------------------|------------------------------------------------------------------------|
-| Fork depth   | Single level — forks cannot fork                           | Arbitrary depth — full recursive call stack                            |
-| Interactivity| Background only; result returns as a message               | Interactive at every level; user can drop into any frame               |
-| Runtime mode | Interactive sessions only; disabled in non-interactive use | Works headless via `claude -p`                                         |
-| Observability| None — fork runs in a side panel                           | [unwind](https://pypi.org/project/unwind-labs/): live web UI of the call tree across all sessions |
-| Concurrency  | Implicit                                                   | Fan-out bounded by `CALLSTACK_MAX_FANOUT` at the MCP boundary           |
+- **`/fork` is an interactive command.** It branches *your* current conversation into a copy that *you* continue by hand — useful for exploring an alternative direction without losing your place. It's a session-management convenience for a human at the keyboard, not a mechanism for delegating work programmatically.
+- **`/call` is programmatic delegation.** Your agent invokes it to run a task in a child session and get back a compact result. Unlike `/fork`, a `/call` can nest arbitrarily deep (a full recursive call stack — default cap 10 levels, widenable via `CALLSTACK_MAX_DEPTH` up to a hard ceiling of 32), pause mid-execution with `{"op": "yield", "question": "..."}` to ask the user from *any* frame, fan out to many tasks at once (bounded per-call by `CALLSTACK_MAX_FANOUT`, default 64), and unwind results deterministically back to the exact caller that asked. It works headless via `claude -p`, and the [unwind](https://pypi.org/project/unwind-labs/) web UI renders the live call tree across all sessions.
 
-**Depth.** `/fork` is one level deep — a fork cannot itself fork. Real workflows nest: "implement app" calls "implement auth module" calls "write JWT middleware". `/call` is recursive (default cap 10 levels, widenable via `CALLSTACK_MAX_DEPTH` up to a hard ceiling of 32), so the whole tree runs as a proper call stack instead of being flattened into the parent.
+In short: `/fork` is for a human branching their own chat; `/call` is for an agent building and unwinding a tree of work. They share a primitive, not a purpose.
 
-**Interactivity at every level.** A `/fork` runs in the background and returns a message when done. A `/call` can pause mid-execution with `{"op": "yield", "question": "..."}` and ask the user — at any depth. Auth flows that need an MFA code, refund flows that need a damage assessment, deployments that need a confirmation: the user drops into the exact frame that needs them, then control returns to the stack.
-
-**Headless.** `/fork` is explicitly disabled in non-interactive runs and the Agent SDK. `/call` uses the same `claude --resume … --fork-session` plumbing but drives it over stdin/stdout NDJSON, so it works headless via `claude -p`. Same primitive, no harness gate.
-
-**Observability.** `/fork` runs in a side panel with no external view. unwind-labs ships [unwind](https://pypi.org/project/unwind-labs/), a Python web UI that tails `~/.claude/projects/*.jsonl` and the runtime's `call_trace.jsonl` files to render a live call tree across all sessions, with each frame's conversation expandable in a side pane.
-
-**Fan-out, not bounded concurrency.** Each forked `claude` subprocess takes ~0.5–2 GB RSS. There is **no global cap on live `claude` processes** — a previous design (filesystem-token semaphore) was removed because sync-blocked parents held slots forever, which caused tree-wide deadlocks under depth. The only bound is per-`/call` fan-out via `CALLSTACK_MAX_FANOUT` (default 64). A future "harvest-on-demand" design (see `dev/RFC-harvest-on-demand.md`) may reintroduce a tree-wide live-process bound; for now, size your trees against your RAM budget.
-
-`/fork` validated the primitive. `/call` ships the call stack.
+> **A note on process footprint.** Each forked `claude` subprocess takes ~0.5–2 GB RSS, and there is **no global cap on live `claude` processes** — a previous design (filesystem-token semaphore) was removed because sync-blocked parents held slots forever, causing tree-wide deadlocks under depth. The only bound is per-`/call` fan-out via `CALLSTACK_MAX_FANOUT`. A future "harvest-on-demand" design (see `dev/RFC-harvest-on-demand.md`) may reintroduce a tree-wide live-process bound; for now, size your trees against your RAM budget.
 
 ## Configuration
 

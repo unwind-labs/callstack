@@ -1,38 +1,38 @@
 [
   {
     "id": "s1",
-    "seconds": 11.95
+    "seconds": 24.63
   },
   {
     "id": "s2",
-    "seconds": 15.71
+    "seconds": 29.85
   },
   {
     "id": "s3",
-    "seconds": 15.45
-  },
-  {
-    "id": "s4",
-    "seconds": 17.75
+    "seconds": 27.79
   },
   {
     "id": "s5",
-    "seconds": 24.19
+    "seconds": 26.83
+  },
+  {
+    "id": "s5b",
+    "seconds": 16.85
   },
   {
     "id": "s6",
-    "seconds": 10.07
+    "seconds": 20.41
   },
   {
     "id": "s7",
-    "seconds": 19.33
+    "seconds": 18.87
   },
   {
     "id": "s7b",
-    "seconds": 13.73
+    "seconds": 14.93
   },
   {
     "id": "s8",
-    "seconds": 4.21
+    "seconds": 4.87
   }
 ]

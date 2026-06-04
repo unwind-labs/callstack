@@ -6,8 +6,8 @@ import voManifest from "./vo-manifest.json";
 import { S1_Problem } from "./scenes/S1_Problem";
 import { S2_Solution } from "./scenes/S2_Solution";
 import { S3_Results } from "./scenes/S3_Results";
-import { S4_WithoutCallstack } from "./scenes/S4_WithoutCallstack";
 import { S5_WithCallstack } from "./scenes/S5_WithCallstack";
+import { S5b_Parallel } from "./scenes/S5b_Parallel";
 import { S6_ForkFresh } from "./scenes/S6_ForkFresh";
 import { S7_DeepInteraction } from "./scenes/S7_DeepInteraction";
 import { S7B_Why } from "./scenes/S7B_Why";
@@ -33,8 +33,8 @@ const SCENES: { id: string; Comp: React.FC; design: number }[] = [
   { id: "s1", Comp: S1_Problem, design: 200 },
   { id: "s2", Comp: S2_Solution, design: 165 },
   { id: "s3", Comp: S3_Results, design: 270 },
-  { id: "s4", Comp: S4_WithoutCallstack, design: 575 },
   { id: "s5", Comp: S5_WithCallstack, design: 730 },
+  { id: "s5b", Comp: S5b_Parallel, design: 430 },
   { id: "s6", Comp: S6_ForkFresh, design: 165 },
   { id: "s7", Comp: S7_DeepInteraction, design: 640 },
   { id: "s7b", Comp: S7B_Why, design: 200 },

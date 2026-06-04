@@ -2,6 +2,7 @@ import React from "react";
 import {
   AbsoluteFill,
   interpolate,
+  interpolateColors,
   useCurrentFrame,
   useVideoConfig,
   Easing,
@@ -291,5 +292,288 @@ export const TitleBlock: React.FC<{
         </div>
       ) : null}
     </AbsoluteFill>
+  );
+};
+
+// ── Cross-cutting motif ──────────────────────────────────────────────────────
+// "1.2.2 is done — what do I resume?" — the recurring control-flow indicator,
+// built around the *return* problem (where LLMs actually fail).
+//   flip = 0 → MODEL / flat context: every task sits at the same indent with no
+//             parent links. The model holds a probability over which caller to
+//             resume (1.2 highest, but < 100%), the %s shimmer, and the highlight
+//             is a SAMPLE from that distribution — resting on 1.2 most often and
+//             landing on a wrong task (red) proportionally to its probability.
+//   flip = 1 → HARNESS / call stack: completed siblings have popped; only the
+//             live chain (1 → 1.2 → 1.2.2) remains, nested. The parent is simply
+//             the frame above — resume 1.2. One answer, steady. Ok green.
+// Sampling/shimmer use hash01 (deterministic, render-stable).
+export type StackTask = { id: string; depth: number; status: "done" | "active" | "current" };
+
+const RESUME_TASKS: StackTask[] = [
+  { id: "1", depth: 0, status: "active" },
+  { id: "1.1", depth: 1, status: "done" },
+  { id: "1.1.1", depth: 2, status: "done" },
+  { id: "1.2", depth: 1, status: "active" },
+  { id: "1.2.1", depth: 2, status: "done" },
+  { id: "1.2.2", depth: 2, status: "current" },
+];
+// The model's resume-target distribution: every task except the just-finished
+// 1.2.2 is a candidate caller. 1.2 (the true parent) is likeliest — but not 1,
+// so sampling from it lands elsewhere periodically.
+const RESUME_CANDS = [
+  { id: "1", p: 0.11 },
+  { id: "1.1", p: 0.03 },
+  { id: "1.1.1", p: 0.04 },
+  { id: "1.2", p: 0.67 },
+  { id: "1.2.1", p: 0.15 },
+];
+
+const RED_BORDER = "rgba(242,84,91,0.34)";
+const GREEN_BORDER = "rgba(45,212,167,0.34)";
+const RED_BG = "rgba(242,84,91,0.06)";
+const GREEN_BG = "rgba(45,212,167,0.06)";
+
+export const StackPointer: React.FC<{ frame: number; flip: number; width?: number }> = ({
+  frame,
+  flip,
+  width = 580,
+}) => {
+  const ROW_H = 30;
+  // Per-frame display probabilities — they shimmer to show the model's shifting
+  // uncertainty — normalized to sum ~100%.
+  const rawP = RESUME_CANDS.map((c, i) =>
+    Math.max(0.02, c.p + (hash01(frame * 0.4 + i * 13) - 0.5) * 0.05),
+  );
+  const sumP = rawP.reduce((s, v) => s + v, 0);
+  const pctById: Record<string, number> = {};
+  RESUME_CANDS.forEach((c, i) => {
+    pctById[c.id] = (rawP[i] / sumP) * 100;
+  });
+  // The highlight is a SAMPLE from the (base) distribution, redrawn every ~10
+  // frames — proportional to probability, so it rests on the likeliest caller
+  // (1.2) most often but lands elsewhere periodically. The harness locks on 1.2.
+  const bucket = Math.floor(frame / 10);
+  let guessId = RESUME_CANDS[0].id;
+  if (flip > 0.5) {
+    guessId = "1.2";
+  } else {
+    const r = hash01(bucket * 1.37);
+    let acc = 0;
+    for (const c of RESUME_CANDS) {
+      acc += c.p;
+      if (r <= acc) {
+        guessId = c.id;
+        break;
+      }
+    }
+  }
+  const correct = guessId === "1.2";
+  const hlColor = correct ? COLOR.ok : COLOR.danger;
+  const jx = (1 - flip) * (hash01(frame * 1.7) - 0.5) * 5;
+  const curColor = interpolateColors(flip, [0, 1], [COLOR.danger, COLOR.ok]);
+
+  return (
+    <div style={{ width, fontFamily: MONO, textAlign: "left" }}>
+      {/* header crossfade */}
+      <div style={{ position: "relative", height: 30, marginBottom: 16 }}>
+        <span
+          style={{
+            position: "absolute",
+            left: 0,
+            whiteSpace: "nowrap",
+            fontFamily: SANS,
+            fontSize: 23,
+            fontWeight: 700,
+            color: COLOR.danger,
+            opacity: 1 - flip,
+          }}
+        >
+          ◆ Without callstack — unreliable control flow
+        </span>
+        <span
+          style={{
+            position: "absolute",
+            left: 0,
+            whiteSpace: "nowrap",
+            fontFamily: SANS,
+            fontSize: 23,
+            fontWeight: 700,
+            color: COLOR.ok,
+            opacity: flip,
+          }}
+        >
+          ■ With callstack — reliable control flow
+        </span>
+      </div>
+
+      {/* task list (flat) → live stack (nested) */}
+      <div
+        style={{
+          border: `1px solid ${interpolateColors(flip, [0, 1], [RED_BORDER, GREEN_BORDER])}`,
+          background: interpolateColors(flip, [0, 1], [RED_BG, GREEN_BG]),
+          borderRadius: 12,
+          padding: "12px 16px",
+          display: "flex",
+          flexDirection: "column",
+          gap: 5,
+        }}
+      >
+        {RESUME_TASKS.map((t) => {
+          const live = t.status !== "done"; // ancestors + current stay on the stack
+          const collapse = live ? 0 : flip; // completed siblings pop away
+          const h = ROW_H * (1 - collapse);
+          if (1 - collapse <= 0.01) return null;
+          const indent = t.depth * 30 * flip; // flat at 0, nested at 1
+          const rowColor = live
+            ? interpolateColors(flip, [0, 1], [COLOR.textDim, COLOR.ok])
+            : COLOR.textFaint;
+          const hot = t.id === guessId; // the (wandering) resume target
+          return (
+            <div
+              key={t.id}
+              style={{
+                height: h,
+                overflow: "hidden",
+                opacity: 1 - collapse,
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                marginLeft: indent,
+                paddingLeft: 8,
+                borderLeft: `3px solid ${hot ? hlColor : "transparent"}`,
+                borderRadius: 6,
+                background: hot
+                  ? correct
+                    ? "rgba(45,212,167,0.14)"
+                    : COLOR.dangerSoft
+                  : "transparent",
+                transform: hot && flip < 0.5 ? `translateX(${jx}px)` : "none",
+              }}
+            >
+              <span style={{ width: 14, flexShrink: 0, color: COLOR.ok, opacity: flip }}>
+                {t.depth > 0 ? "└" : ""}
+              </span>
+              <span
+                style={{
+                  fontSize: 16,
+                  whiteSpace: "nowrap",
+                  flexShrink: 0,
+                  color: rowColor,
+                  fontWeight: t.status === "current" ? 700 : 400,
+                }}
+              >
+                task {t.id}
+              </span>
+              <span
+                style={{
+                  fontSize: 13,
+                  whiteSpace: "nowrap",
+                  flexShrink: 0,
+                  color:
+                    t.status === "done"
+                      ? COLOR.textFaint
+                      : t.status === "current"
+                        ? curColor
+                        : COLOR.textDim,
+                }}
+              >
+                {t.status === "done"
+                  ? "✓ done"
+                  : t.status === "current"
+                    ? "← just finished"
+                    : "in progress"}
+              </span>
+              <span
+                style={{
+                  marginLeft: "auto",
+                  flexShrink: 0,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 12,
+                }}
+              >
+                {t.id !== "1.2.2" ? (
+                  <span
+                    style={{ display: "flex", alignItems: "center", gap: 8, opacity: 1 - flip }}
+                  >
+                    <span
+                      style={{
+                        width: 58,
+                        height: 5,
+                        borderRadius: 5,
+                        background: "rgba(255,255,255,0.08)",
+                        overflow: "hidden",
+                      }}
+                    >
+                      <span
+                        style={{
+                          display: "block",
+                          height: "100%",
+                          width: `${pctById[t.id]}%`,
+                          background: t.id === "1.2" ? COLOR.ok : COLOR.textDim,
+                          borderRadius: 5,
+                        }}
+                      />
+                    </span>
+                    <span
+                      style={{
+                        width: 32,
+                        textAlign: "right",
+                        fontSize: 12,
+                        color: t.id === "1.2" ? COLOR.ok : COLOR.textFaint,
+                      }}
+                    >
+                      {Math.round(pctById[t.id])}%
+                    </span>
+                  </span>
+                ) : null}
+                <span
+                  style={{
+                    width: 78,
+                    textAlign: "right",
+                    whiteSpace: "nowrap",
+                    fontSize: 13,
+                    fontWeight: 700,
+                    color: hlColor,
+                    opacity: hot ? 1 : 0,
+                  }}
+                >
+                  {flip > 0.5 ? "↩ resume ✓" : "↩ resume?"}
+                </span>
+              </span>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* the question the highlight answers */}
+      <div style={{ marginTop: 12, fontSize: 14, color: COLOR.textDim }}>
+        task 1.2.2 just finished — where does control return?
+      </div>
+    </div>
+  );
+};
+
+// A compact echo of the motif's two states, for scenes that already render a
+// full stack (S5/S7) and just need the one-line callback in the shared language.
+export const MotifBadge: React.FC<{ state: "model" | "harness" }> = ({ state }) => {
+  const harness = state === "harness";
+  const color = harness ? COLOR.ok : COLOR.danger;
+  return (
+    <span
+      style={{
+        fontFamily: MONO,
+        fontSize: 15,
+        fontWeight: 700,
+        color,
+        background: harness ? "rgba(45,212,167,0.12)" : COLOR.dangerSoft,
+        border: `1px solid ${color}66`,
+        borderRadius: 8,
+        padding: "6px 13px",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {harness ? "■ harness tracks the stack" : "◆ model is guessing"}
+    </span>
   );
 };
